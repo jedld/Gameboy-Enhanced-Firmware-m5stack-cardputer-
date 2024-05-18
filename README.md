@@ -1,3 +1,6 @@
+![image](https://github.com/Mr-PauI/gb_cardputer_mod/assets/169319235/5a9bf85b-0a44-4f37-931b-c06ac70d62a3)
+
+
 Updates are more frequent on m5burner than github, but I'm trying to drop a binary here now and then.
 
 Gameboy Emulator; has no limit on rom file size and provides savegame support. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including some borders. Extended 12 colour mode, along with all official/original GBC palettes. Forked from original gb_cardputer implementation. Read the instructions at the bottom for controls.
