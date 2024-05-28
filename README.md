@@ -4,16 +4,44 @@
 
 Updates are more frequent on m5burner than github, but I'm trying to drop a binary here now and then.
 
-Gameboy Emulator; Now with configurable controls. Has no limit on ROM file size and provides savegame support. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including some borders. Extended 12 colour mode, along with all official/original GBC palettes.
-ROM files must be placed in the root directory of your compatible SD card (fat32/sdhc). Read the instructions at the bottom for controls. Forked from original gb_cardputer implementation, which deserves everlasting credit for providing me simultaneously with a conceptual understanding of peanut_gb and a renewed passion for some well crafted logic. At this point there are only 3 short code segments that havent been replaced, and I doubt there will be ever need to for those to be altered.
+Gameboy Emulator; Now with sound. Has configurable controls, no limit on ROM file size and provides savegame support. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including some borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 community Analogue Pocket 12-color palettes with automatic mapping of games to AP profiles partially implemented.
 
-22.05.2024:v0.52
-* Integrated audio with peanut_gb hooks on PC version of emulator to verify APU core functionality, it works.
-* Integrated audio with peanut_gb hooks on ESP32 version of emulator, thread/core choices will need to be tweaked, learning audio playback quirks firsthand.
+ROM files must be placed in the root directory of your compatible SD card (fat32/sdhc). Read the instructions at the bottom for controls. Forked from original gb_cardputer implementation, which deserves everlasting credit for providing me simultaneously with a conceptual understanding of peanut_gb and a renewed passion for some well crafted logic.
+
+27.05.2024:v0.6
+* Audio is fully implemented. Inaccuratley, built for speed. Hardly any impact of rendering.
+Note: While the tones will not change pitch as a title slows down, music will speed up and slow down along with frame rates.
+* Implemented volume up/down controls attached to Fn+up/down arrows. If these are mapped to controls, at this time, it will respond to both.
+Further Note: I put no limits on control configuration. Make everything a single button if you want.
+* Added cessation of audio rendering when volume is set to 0.
+
+26.05.2024:v0.57
+* alterered APU to allow variable amounts of time between calls
+* Tuned APU performance to get first recognizable gameplay sounds out of the emulator.
+
+25.05.2024:v0.56
+* Added 12color AP palette mapping for Links Awakening
+* Added SGB border for Pokemon Red
+* Added SGB border for Links Awakening
+* Added notification for titles with Analogue Pocket profile, but no SGB profile
+* Work on audio playback engine has begun, core 0 continusoly feeds audio from a buffer to the speaker; a test 1000hz sine wave shows little to no stuttering while emulator runs, needs tuning. Disabled until apu work complete.
+
+23.05.2024:v0.53
+* Required memory for pokemon +5k just incase has been made available
+* Implemented 12-color Analogue Pocket palettes for Pokemon Red/Blue
+* Implemented preset SGB and GBC palettes for Pokemon Red/Blue
+* Implemented SGB borders for Pokemon Blue
+* disabled audio for this release; exported to wav file to examine and while its the same code
+it is not generating the same output as the PC test version. Will take further research.
+
+22.05.2025:v0.52
+* Implemented audio with peanut_gb hooks on PC (version for debugging); verified APU core and waveforms
+* Integrated Audio with peanut_gb hooks on ESP32; audio waveforms are now being generated, needs balancing with CPU and speaker playback still
 
 21.05.2024:v0.51
-* Discovered reason for differences in compatibility with PeanutGB on PC vs ESP32; it all came down to stack space.
-* Implemented RTOS thread for the APU and CPU assigned to seperate cores in preparation for Audio
+* implemented main emulator function as a task on core 1 and a second persistent task on core 0 via RTOS; this is in preparation to acommodate the APU engine
+core 0 thread must call vTaskDelay as there are vital threads on that core, which if not attented to, will cause a restart. I dont have full use of this core.
+discovered pokemon starts working if I have more free memory so I suspect I run out of stack space. 180k paging it works 200 it doesn't will calculate requied amount
 
 20.05.2024:v0.5
 * added bottom menu bar with instructions to the main rom selection menu, pres ESC or ' key (same thing) to enter the settings menu either from the main menu or while playing a game
