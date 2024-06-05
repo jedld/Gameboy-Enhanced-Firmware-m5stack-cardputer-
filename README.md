@@ -18,6 +18,7 @@ ROM files must be placed in the root directory of your compatible SD card (fat32
 * Added Final Fantasy Legends SGB Palette and Border, added 12 colour Analogue Pocket palette
 * Pokemon Blue border is now scaled using simple pixel scaling method (same as all other borders) to preserve pixelized look
 * Gameboy border left border has been adjusted
+  
 03.05.2024:v0.63
 * Added audio quality setting (high,med,low, update intervals of 12,24 and 36 audio samples)
 * Added startup audio volume setting (default is mute)
@@ -25,15 +26,19 @@ ROM files must be placed in the root directory of your compatible SD card (fat32
 * Added new settings to configuration files; old configuration files are always supported, and will be upgraded to the newest version when the settings are saved for the first time.
 * Squished another bug; timed events weren't taking into account time for border drawing/clearing
 * Fixed crash from settings menu when accessed from main menu, settings are saved on game launch or if changed mid game. Crash was related to saving within the file picker.
+  
 02.05.2024:v0.622
 * Added mute and volume half/max contols to Fn+Left/Right keys
+  
 01.05.2024:v0.621
 * Experimented with an inline version of the ganeboy CPU its various functions but they yeilded no performance gain
 * CPU step loop moved inside of peanut_gb to reduce function calls, essentially the same as inline but with no memory penalty
+  
 30.05.2024.v0.62
 * Audio rendering has been made faster updating every 24 by default samples, was twelve; 24 will be the default (a.k.a. medium quality) sligt reduction in quality when frame rate dips low can be noticed at 36; may make option for audio quality. Updating every 36 samples seems
 to be the minimum(clicking becomes more likely beyond this update interval), so 12,24,36 seem to be appropriate settings; every 12 sameples was used in 6.0 may added higher and lower quality settings in future
 * Adjusted TTL logic to run seperately from the page retrieval so that retrieving data is as fast as possible when in memory.
+  
 29.05.2024:v0.61
 * Memory solution devised was based on two ideas: Assume stastically random access patterns, and place no limits on addressable space.
 The reality is that the gameboy games never exceed 8megabits (1megabyte); Taking advantage of the limitations of the gameboy, I have removed the generalized nature of the	previous solution in favor of one that provides a deterministic approach to page seeking, with the tradeoff that no games larger than a real game boy game can be loaded any longer. This should not pose an issue for any (valid) title. This has increased frame rates slightly all around and made them much steadier; page location has no bearing on access times. Page seek times are fixed, and a minor amount of page maintenance is done at these intervals, distributed across successive calls still. This would be deterministic page seeking mixed with the previous progressive pruning.
