@@ -1,12 +1,49 @@
-*Note: There has been some confusion regarding my releases on Github and source code. I have not uploaded any source code as plans have changed along the way. Originally I was going to polish the implementation and release it to be finished by the community, but just as I begun the project was archived by the original author. This resulted in a very low-effort release of the same firmware without credit to the original author for their implementation landing on m5burner at approximately the same time as my version. As this is my return to coding after a 14 year hiatus, I've decided that rather than have my additions copied with no meaningful contributions or acknowledgement, that I'd just finish the entire emulator myself and release source code after I have finished my work and had my fun with this project. This seems preferable to having my passion for the project deflated. I've been sharing detailed change logs, and under /rCardputer on reddit I am always willing to go into further detail of the specifics of the solutions I have employed in the interest of helping the budding developer.
+![image](https://github.com/Mr-PauI/gb_cardputer_mod/assets/169319235/ba5d2219-3865-4764-b7f6-fcb9f9ff9c56)*Note: There has been some confusion regarding my releases on Github and source code. I have not uploaded any source code as plans have changed along the way. Originally I was going to polish the implementation and release it to be finished by the community, but just as I begun the project was archived by the original author. This resulted in a very low-effort release of the same firmware without credit to the original author for their implementation landing on m5burner at approximately the same time as my version. As this is my return to coding after a 14 year hiatus, I've decided that rather than have my additions copied with no meaningful contributions or acknowledgement, that I'd just finish the entire emulator myself and release source code after I have finished my work and had my fun with this project. This seems preferable to having my passion for the project deflated. I've been sharing detailed change logs, and under /rCardputer on reddit I am always willing to go into further detail of the specifics of the solutions I have employed in the interest of helping the budding developer.
 
 ![image](https://github.com/Mr-PauI/gb_cardputer_mod/assets/169319235/5a9bf85b-0a44-4f37-931b-c06ac70d62a3)
 
 Updates are more frequent on m5burner than github, but I'm trying to drop a binary here now and then.
 
-Gameboy Emulator; Now with sound. Has configurable controls, no limit on ROM file size and provides savegame support. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including some borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 community Analogue Pocket 12-color palettes with automatic mapping of games to AP profiles partially implemented.
+Gameboy Emulator; complete with audio, configurable controls and performance options, savegames and no .gb rom file size limits.  Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including some borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented.
 
-ROM files must be placed in the root directory of your compatible SD card (fat32/sdhc). Read the instructions at the bottom for controls. Forked from original gb_cardputer implementation, which deserves everlasting credit for providing me simultaneously with a conceptual understanding of peanut_gb and a renewed passion for some well crafted logic.
+ROM files must be placed in the root directory of your compatible SD card (fat32/sdhc). Read the instructions at the bottom for controls. Forked from original gb_cardputer implementation. No bootloader has been merged with this firmware (at this time), so if you are having issues try using m5launcher to install.
+
+![image](https://github.com/Mr-PauI/gb_cardputer_mod/assets/169319235/8d616067-d996-413b-b172-e01933060a7b)
+
+04.05.2024:v0.64
+* Fixed bug with setting initial super gameboy palettes
+* Added Pokemon Yellow SGB Border and AP Community Palette
+* Added Supermario land 2 SGB border
+* Added Tetris SGB border
+* Added Final Fantasy Legends SGB Palette and Border, added 12 colour Analogue Pocket palette
+* Pokemon Blue border is now scaled using simple pixel scaling method (same as all other borders) to preserve pixelized look
+* Gameboy border left border has been adjusted
+03.05.2024:v0.63
+* Added audio quality setting (high,med,low, update intervals of 12,24 and 36 audio samples)
+* Added startup audio volume setting (default is mute)
+* Added interlacing setting
+* Added new settings to configuration files; old configuration files are always supported, and will be upgraded to the newest version when the settings are saved for the first time.
+* Squished another bug; timed events weren't taking into account time for border drawing/clearing
+* Fixed crash from settings menu when accessed from main menu, settings are saved on game launch or if changed mid game. Crash was related to saving within the file picker.
+02.05.2024:v0.622
+* Added mute and volume half/max contols to Fn+Left/Right keys
+01.05.2024:v0.621
+* Experimented with an inline version of the ganeboy CPU its various functions but they yeilded no performance gain
+* CPU step loop moved inside of peanut_gb to reduce function calls, essentially the same as inline but with no memory penalty
+30.05.2024.v0.62
+* Audio rendering has been made faster updating every 24 by default samples, was twelve; 24 will be the default (a.k.a. medium quality) sligt reduction in quality when frame rate dips low can be noticed at 36; may make option for audio quality. Updating every 36 samples seems
+to be the minimum(clicking becomes more likely beyond this update interval), so 12,24,36 seem to be appropriate settings; every 12 sameples was used in 6.0 may added higher and lower quality settings in future
+* Adjusted TTL logic to run seperately from the page retrieval so that retrieving data is as fast as possible when in memory.
+29.05.2024:v0.61
+* Memory solution devised was based on two ideas: Assume stastically random access patterns, and place no limits on addressable space.
+The reality is that the gameboy games never exceed 8megabits (1megabyte); Taking advantage of the limitations of the gameboy, I have removed the generalized nature of the	previous solution in favor of one that provides a deterministic approach to page seeking, with the tradeoff that no games larger than a real game boy game can be loaded any longer. This should not pose an issue for any (valid) title. This has increased frame rates slightly all around and made them much steadier; page location has no bearing on access times. Page seek times are fixed, and a minor amount of page maintenance is done at these intervals, distributed across successive calls still. This would be deterministic page seeking mixed with the previous progressive pruning.
+* Added Error messages with regards to writing save game files, attempts to do so when there is no cart ram
+* Added Error messages specific to the case of being unable to open a file vs. file size 0 (was ambiguous before)
+* Removed pause associated with automatic savegames; bars operate on a timer now and will disappear 1second after pending write is completed
+
+28.05.2024:v0.601
+* No longer will create save files or allow save files to be created for titles without cart ram(0b files no more)
+
 
 27.05.2024:v0.6
 * Audio is fully implemented. Inaccuratley, built for speed. Hardly any impact of rendering.
