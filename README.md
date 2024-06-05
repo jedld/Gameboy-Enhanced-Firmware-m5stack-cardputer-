@@ -8,6 +8,8 @@ Gameboy Emulator; complete with audio, configurable controls and performance opt
 
 ROM files must be placed in the root directory of your compatible SD card (fat32/sdhc). Read the instructions at the bottom for controls. Forked from original gb_cardputer implementation. No bootloader has been merged with this firmware (at this time), so if you are having issues try using m5launcher to install.
 
+![image](https://github.com/Mr-PauI/gb_cardputer_mod/assets/169319235/3f9b6801-0802-4e20-ab0e-7f8d1d3ead21)
+
 ![image](https://github.com/Mr-PauI/gb_cardputer_mod/assets/169319235/8d616067-d996-413b-b172-e01933060a7b)
 
 04.05.2024:v0.64
