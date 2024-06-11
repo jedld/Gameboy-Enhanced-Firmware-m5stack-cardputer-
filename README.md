@@ -13,26 +13,26 @@ ROM files must be placed in the root directory of your compatible SD card (fat32
 ![image](https://github.com/Mr-PauI/Gameboy-Enhanced-Firmware-m5stack-cardputer-/assets/169319235/e6c14e53-2d70-4172-9664-9099ce6bf767)
 
 List of SGB and Analogue Pocket enhanced titles:
-Arcade Classics No 1: Missle Command & Asteroids
-Balloon kid
-Donkey Kong
-Donkey Kong Land
-F1 race
-Final Fantasy Legend
-Final Fantasy Legend II
-Golf
-Kirbys pinball land
-Zelda Links Awakening
-Mario Land
-Mario land 2
-Metroid II
-Pokemon Red
-Pokemon Blue
-Pokemon Yellow
-Solar Striker
-Space Invaders
-Tetris
-Wario Land
+* Arcade Classics No 1: Missle Command & Asteroids
+* Balloon kid
+* Donkey Kong
+* Donkey Kong Land
+* F1 race
+* Final Fantasy Legend
+* Final Fantasy Legend II
+* Golf
+* Kirbys pinball land
+* Zelda Links Awakening
+* Mario Land
+* Mario land 2
+* Metroid II
+* Pokemon Red
+* Pokemon Blue
+* Pokemon Yellow
+* Solar Striker
+* Space Invaders
+* Tetris
+* Wario Land
 
 11.06.2024(pm):v0.68
 * Control A and Control Start will now also navigate into directories
