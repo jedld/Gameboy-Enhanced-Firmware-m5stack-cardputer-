@@ -10,7 +10,8 @@ ROM files must be placed in the root directory of your compatible SD card (fat32
 
 ![image](https://github.com/Mr-PauI/gb_cardputer_mod/assets/169319235/3f9b6801-0802-4e20-ab0e-7f8d1d3ead21)
 
-![image](https://github.com/Mr-PauI/gb_cardputer_mod/assets/169319235/8d616067-d996-413b-b172-e01933060a7b)
+![image](https://github.com/Mr-PauI/Gameboy-Enhanced-Firmware-m5stack-cardputer-/assets/169319235/e6c14e53-2d70-4172-9664-9099ce6bf767)
+
 
 04.05.2024:v0.64
 * Fixed bug with setting initial super gameboy palettes
