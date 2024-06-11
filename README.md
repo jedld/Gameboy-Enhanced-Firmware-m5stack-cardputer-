@@ -4,7 +4,7 @@
 
 Updates are more frequent on m5burner than github, but I'm trying to drop a binary here now and then.
 
-Gameboy Emulator; complete with audio, configurable controls and performance options, savegames and no .gb rom file size limits.  Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented.
+Gameboy Emulator; complete with audio, configurable controls and performance options, savegames and no .gb rom file size limits.  Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. Pokemon Silver/Gold are the only supported .gbc titles, backwards compatible with the original gameboy and run in that mode. Emulator will behave as if you placed a gameboy colour cartridge into an original gameboy in most instances. Feel free to try other backwards compatible gbc games, but no garuntees on compatiblity.
 
 ROM files must be placed in the root directory of your compatible SD card (fat32/sdhc). Read the instructions at the bottom for controls. Forked from original gb_cardputer implementation. No bootloader has been merged with this firmware (at this time), so if you are having issues try using m5launcher to install.
 
@@ -12,7 +12,36 @@ ROM files must be placed in the root directory of your compatible SD card (fat32
 
 ![image](https://github.com/Mr-PauI/Gameboy-Enhanced-Firmware-m5stack-cardputer-/assets/169319235/e6c14e53-2d70-4172-9664-9099ce6bf767)
 
-
+11.06.2024:v0.67
+* Added ability to return to parent directory if it exists
+* Added ability to launch ROMs from other directories
+* Hides System Volume Information if in root directory; this is probably not what the user wants.
+  
+10.06.2024:v0.66.5
+* Added memsub_malloc() and memsub_freeall() functions to allow paging memory to be used for other purposes:namely, file browsing.
+* Changed file_picker() function to use memsub_malloc() / memsub_freeall(), limits are as follows:
+256 files/folders per folder, maximum path+file length+3 letter extension is 256 bytes
+There is no limit to the depth of the folders, except that the path name+file cannot exceed 256 bytes
+No issue with long file names, the memsub_malloc() has 65k roughly allocated per directory listing, just be mindful of the overall path+filename length
+* Added *.gbc in addition to *.gb files to selection menu
+* Added directories to selection menu, can now explore subdirectories
+* Adjusted default SGB palettes for Pokemon Blue/Red; previous fix required adjustment of these two titles.
+  
+09.06.2024:v0.66
+* Added Max and Min audio quality settings, 6 and 72 sample intervals respectively
+* Added 12 colour Analogue Pocket palette for Kirbys Pinball Land
+* Added 12 colour Analogue Pocket palette for Donkey Kong Land
+* Added SGB border and palette for Donkey Kong Land
+* Added Cardputer Arcade cabinet border, available for all games
+  
+08.06.2024:
+* Silver has been tested, must rename to .gb from .gbc
+  
+06.06.2024:v0.65
+* increased paged memory limit to 2megs to accommodate Pokemon Gold/Silver
+* Gold has been tested, must rename to .gb from .gbc
+* increased specificity of error messages regarding paging
+  
 04.05.2024:v0.64
 * Fixed bug with setting initial super gameboy palettes
 * Added Pokemon Yellow SGB Border and AP Community Palette
