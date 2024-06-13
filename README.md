@@ -4,13 +4,16 @@
 
 Updates are more frequent on m5burner than github, but I'm trying to drop a binary here now and then.
 
-Gameboy Emulator; complete with audio, configurable controls and performance options, savegames and no .gb rom file size limits.  Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. Pokemon Silver/Gold are the only confirmed fully supported .gbc titles, backwards compatible with the original gameboy and run in that mode. Emulator will behave as if you placed a gameboy colour cartridge into an original gameboy in most instances. Dragon Warrior I&II collection appears to work for instance. Feel free to try other backwards compatible gbc games, but no garuntees on compatiblity.
+Gameboy Emulator; complete with audio, configurable controls and performance options, savegames, save states, filesystem navigation and no .gb rom file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. 
 
-ROM files must be placed in the root directory of your compatible SD card (fat32/sdhc). Read the instructions at the bottom for controls. Forked from original gb_cardputer implementation. No bootloader has been merged with this firmware (at this time), so if you are having issues try using m5launcher to install.
+Pokemon Silver/Gold and Dragon Warrior I and II are the only confirmed fully supported .gbc titles, backwards compatible with the original gameboy and run in that mode. Emulator will behave as if you placed a gameboy colour cartridge into an original gameboy in most instances. Feel free to try other backwards compatible gbc games, but no garuntees on compatiblity. All *.gb and *.gbc files are listed by the file explorer in the current directory.
 
-![image](https://github.com/Mr-PauI/gb_cardputer_mod/assets/169319235/3f9b6801-0802-4e20-ab0e-7f8d1d3ead21)
+Read the instructions at the bottom for controls or refer to the graphic guide below. Forked from original gb_cardputer implementation. No bootloader has been merged with this firmware (at this time), so if you are having issues try using m5launcher to install.
 
-![image](https://github.com/Mr-PauI/Gameboy-Enhanced-Firmware-m5stack-cardputer-/assets/169319235/e6c14e53-2d70-4172-9664-9099ce6bf767)
+![image](https://github.com/Mr-PauI/Gameboy-Enhanced-Firmware-m5stack-cardputer-/assets/169319235/31c67758-ca57-4217-a3ef-25c20e5cc8f2)
+
+
+![image](https://github.com/Mr-PauI/Gameboy-Enhanced-Firmware-m5stack-cardputer-/assets/169319235/5c78d59e-ae08-46ed-9522-f11b659504ed)
 
 List of SGB and Analogue Pocket enhanced titles:
 * Arcade Classics No 1: Missle Command & Asteroids
@@ -33,6 +36,15 @@ List of SGB and Analogue Pocket enhanced titles:
 * Space Invaders
 * Tetris
 * Wario Land
+
+12.06.2024:v0.70
+* Added per-game savestates (1 state/game in .qsv file), backspace to save, minus/underscore button to load
+* All borders are now drawn as RGB565 sprites; almost no impact for FPS display now
+* Borders now have a cooldown before changing, allowing the emulator to run smoothly when cycling options
+* Increased scroll speed in file selection menu
+* Changed number of file/directories displayed at once from 3 to 5
+* Added Dragon Warrior I & II SGB & AP support w/ Border
+* Added SGB border support for Pokemon Silver/Gold, SGB/AP colours temporarily set to existing pallets until better is found
 
 11.06.2024(pm):v0.68
 * Control A and Control Start will now also navigate into directories
