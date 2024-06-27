@@ -9,9 +9,9 @@ This is a resource I have created to help other developers learn and develop qua
 
 Updates are more frequent on m5burner than github, but I'm trying to drop a binary here now and then.
 
-Gameboy Emulator; complete with audio, configurable controls and performance options, savegames, save states, filesystem navigation and no .gb rom file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. 
+Gameboy Emulator; complete with audio, configurable controls, display and performance options, savegames, save states, filesystem navigation and no .gb rom file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented.
 
-Pokemon Silver/Gold and Dragon Warrior I and II are the only confirmed fully supported .gbc titles, backwards compatible with the original gameboy and run in that mode. Emulator will behave as if you placed a gameboy colour cartridge into an original gameboy in most instances. Feel free to try other backwards compatible gbc games, but no garuntees on compatiblity. All *.gb and *.gbc files are listed by the file explorer in the current directory.
+Pokemon Silver/Gold,  Dragon Warrior I&II and Azure dreams are the only confirmed fully supported .gbc titles, backwards compatible with the original gameboy and run in that mode. Emulator will behave as if you placed a gameboy colour cartridge into an original gameboy in most instances. Feel free to try other backwards compatible gbc games, but no garuntees on compatiblity. All *.gb and *.gbc files are listed by the file explorer in the current directory. 
 
 Read the instructions at the bottom for controls or refer to the graphic guide below. Forked from original gb_cardputer implementation. No bootloader has been merged with this firmware (at this time), so if you are having issues try using m5launcher to install.
 
@@ -21,27 +21,67 @@ Read the instructions at the bottom for controls or refer to the graphic guide b
 ![image](https://github.com/Mr-PauI/Gameboy-Enhanced-Firmware-m5stack-cardputer-/assets/169319235/5c78d59e-ae08-46ed-9522-f11b659504ed)
 
 List of SGB and Analogue Pocket enhanced titles:
+* Alleyway
 * Arcade Classics No 1: Missle Command & Asteroids
 * Balloon kid
+* Baseball
+* Battlezone/Super Breakout
 * Donkey Kong
 * Donkey Kong Land
+* Dr. Mario
 * F1 race
 * Final Fantasy Legend
 * Final Fantasy Legend II
+* Game Boy Wars
 * Golf
+* Kaeru no Tame
+* Kirbys Dream Land
 * Kirbys pinball land
 * Zelda Links Awakening
+* Mario and Yoshi
 * Mario Land
-* Mario land 2
+* Mario Land 2
 * Metroid II
 * Pokemon Red
 * Pokemon Blue
 * Pokemon Yellow
+* Qix
 * Solar Striker
 * Space Invaders
+* Tennis
 * Tetris
 * Wario Land
+* X
+* Yakyuman
+* Yoshi
 
+25.06.2024:v0.75
+* Firmware now contains bootloader so it can be loaded without a launcher/direct from m5burner
+* Added SGP & AP support for Mega Man I/II and Mystic Quest
+* Added USB serial debug output to the entire function chain leading up to the main emulator loop. This should hopefully aid in helping debug games, and provide more comprehensive information for trouble shooting.
+* Added CPU mode to settings menu (CPU MODE: FAST/COMPATIBLE), defaults to fast. Enabled automatically for titles known to need this: Battlezone so far, will add any reported titles. For now it takes effect only upon restart of the emulator (will take effect immediately in future update). This disables all speed hacks,and forces rendering of every line of every frame.
+* BLE gamepad support only stable in file picker, causes restart during emulation so still disabled.
+* Fixed Minor bug with auto SGB mode flag setup
+24.06.2024:v0.74
+* Added compatibility mode that skips all speed hacks (skipped frames and unrenderd lines)
+* Added automatic compatibility mode override for titles that are identified to require this, as a result Battlezone is now compatible.
+* Added SGB support for Battlezone
+* Resolved BLE server and SD card conflict; this took about a week of research and debugging.
+20.05.2024:v0.73
+* BLE startup behaviour implemented, BLE sync from main menu implemented
+* Gamepad buttons a,b,x,y and d-pad directional control integrated
+19.05.2024:v0.72
+* Implemented Default Palette selection, SGB manual/auto selection and SGB border options
+* Added Default Palette, SGB palette manual/auto, SGB border manual/auto/gboy to options menu
+* Added BLE connect manual/auto, BLE button swap on/off (swaps a+b button mapping), BLE deadzone small/med/large for left-stick deadzone configuration
+* All new options are now saved in a new iteration of the config file, as usual, any previous config file will automatically migrate to the new version
+* BLE connection settings will be saved/loaded regardless of BLE compilation support for consistent configuration file layout
+18.05.2024:v0.71
+* Added SGB profiles for Alleyway, Baseball, Dr. Mario, Game Boy Wars, Kaeru no Tame, Kirbys Dream Land, Mario and Yoshi,Qix,Tennis,X,Yakyuman,Yoshi
+(note: not all of these are compatible, but it almost completes the built in SGB maps that were included in the SGB hardware; future core updates may improve compatibilty)
+* Added AP profiles for Alleyway, Baseball, Dr. Mario
+* Added bluetooth library to the emulator, this has a fairly substantial memory cost and will be disabled until ready for deployment; made inclusion of the BLE code optional when compiling.
+* Added initial hooks for gamepad support.
 12.06.2024:v0.70
 * Added per-game savestates (1 state/game in .qsv file), backspace to save, minus/underscore button to load
 * All borders are now drawn as RGB565 sprites; almost no impact for FPS display now
