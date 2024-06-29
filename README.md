@@ -41,7 +41,10 @@ List of SGB and Analogue Pocket enhanced titles:
 * Mario and Yoshi
 * Mario Land
 * Mario Land 2
+* Mega Man I
+* Mega Man II
 * Metroid II
+* Mystic Quest
 * Pokemon Red
 * Pokemon Blue
 * Pokemon Yellow
