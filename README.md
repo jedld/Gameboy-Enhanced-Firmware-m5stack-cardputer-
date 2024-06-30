@@ -58,6 +58,15 @@ List of SGB and Analogue Pocket enhanced titles:
 * Yakyuman
 * Yoshi
 
+29.06.2024:v0.76
+* Compatibiliyy mode settings now take effect immediately if changed mid-game; will display message if mode is locked on due to override requirement (ie: battlezone which requires it on for any functionality)
+* Button mapped to controller B and del/back button will return to a parent directory (if not at root)
+* Added CRT Television border available for all games
+* Added Star Wars: Super Return of the Jedi SGB & Ap support w/Border
+* Increased file/directory listing limit to 512 entries per directory
+* No longer crashes when there are too many files, will list first 512 files and display warning.
+* Added warning message when too many files/directories exist to list.
+
 25.06.2024:v0.75
 * Firmware now contains bootloader so it can be loaded without a launcher/direct from m5burner
 * Added SGP & AP support for Mega Man I/II and Mystic Quest
