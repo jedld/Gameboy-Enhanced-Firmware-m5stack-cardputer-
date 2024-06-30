@@ -51,12 +51,14 @@ List of SGB and Analogue Pocket enhanced titles:
 * Qix
 * Solar Striker
 * Space Invaders
+* Star Wars: Super Return of the Jedi
 * Tennis
 * Tetris
 * Wario Land
 * X
 * Yakyuman
 * Yoshi
+  
 
 29.06.2024:v0.76
 * Compatibiliyy mode settings now take effect immediately if changed mid-game; will display message if mode is locked on due to override requirement (ie: battlezone which requires it on for any functionality)
