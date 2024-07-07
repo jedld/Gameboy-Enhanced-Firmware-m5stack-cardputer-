@@ -1,5 +1,5 @@
-// ****************************************
-// * Embedded graphics for custom borders *
+// ***********************************************
+// * Embedded RGB565 graphics for custom borders *
 // ********************************************************************************
 // * The cardputer arcade border is a custom border that I made for this project. *
 // * Cardputer Arcade Border © 2024 by MrPaul is licensed under CC BY-SA 4.0      *
