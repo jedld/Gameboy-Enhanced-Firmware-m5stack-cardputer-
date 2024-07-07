@@ -32,6 +32,7 @@ List of SGB and Analogue Pocket enhanced titles:
 * Donkey Kong
 * Donkey Kong Land
 * Dr. Mario
+* Dragon Warrior I&II
 * F1 race
 * Final Fantasy Legend
 * Final Fantasy Legend II
