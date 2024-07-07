@@ -1,3 +1,11 @@
+// The first 32 palettes are the official palettes included on the SGB hardware
+// The mappings in () are the built in cartridge maps for games released before
+// the SGB hardware was developed. Other mappings and palettes have been obtained
+// from a variety of sources. By hand from screenshots, from community generated
+// palettes and from game packaging images. Accuracy varies by title for other
+// mappings. A real super game boy executes a different path in code on the
+// cartridge, so these simulate the primary effect of the SGB but dont provide
+// the SGB ram,audio and dynamic palette and border features.
 #define default32sgb_pallets_count 32
 const uint32_t default32sgb_palettes[] = {
 // 0 1-A (Balloon Kid)
