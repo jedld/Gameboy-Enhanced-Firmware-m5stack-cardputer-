@@ -22,8 +22,10 @@ Read the instructions at the bottom for controls or refer to the graphic guide b
 ![image](https://github.com/Mr-PauI/Gameboy-Enhanced-Firmware-m5stack-cardputer-/assets/169319235/5c78d59e-ae08-46ed-9522-f11b659504ed)
 
 List of SGB and Analogue Pocket enhanced titles:
+* Adventures of Lolo
 * Alleyway
 * Arcade Classics No 1: Missle Command & Asteroids
+* Arcade Classics No 2: Centipede and Millipede
 * Balloon kid
 * Baseball
 * Battlezone/Super Breakout
@@ -33,8 +35,11 @@ List of SGB and Analogue Pocket enhanced titles:
 * F1 race
 * Final Fantasy Legend
 * Final Fantasy Legend II
+* Game & Watch Gallery
+* Game Boy Gallery
 * Game Boy Wars
 * Golf
+* James Bond 007
 * Kaeru no Tame
 * Kirbys Dream Land
 * Kirbys pinball land
@@ -49,17 +54,24 @@ List of SGB and Analogue Pocket enhanced titles:
 * Pokemon Red
 * Pokemon Blue
 * Pokemon Yellow
+* Pokemon Gold(limited)
+* Pokemon Silver(limited)
 * Qix
 * Solar Striker
 * Space Invaders
 * Star Wars: Super Return of the Jedi
 * Tennis
 * Tetris
+* The Rescue of Princess Blobette Starring A Boy and His Blob
 * Wario Land
 * X
 * Yakyuman
 * Yoshi
   
+06.07.2024:v0.77
+* Added adventures of lolo, james bond 007, The Rescue of Princess Blobette Starring A Boy and His Blob, Game & Watch Gallery, Arcade Classics No2 Centipede and Millipede SGB & AP support
+* Increased speed of entering large directories in some circumstances
+* Increased file list limit to 1024 entries maximum, provided there is sufficient memory. Most files probably use less than half the max file name size, so 1024x128 directory entry listings are easily accommodated. File names may still be a full 256 bytes in length.
 
 29.06.2024:v0.76
 * Compatibiliyy mode settings now take effect immediately if changed mid-game; will display message if mode is locked on due to override requirement (ie: battlezone which requires it on for any functionality)
