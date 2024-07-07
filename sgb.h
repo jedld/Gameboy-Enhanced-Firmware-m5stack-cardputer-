@@ -130,7 +130,7 @@ const uint32_t default32sgb_palettes[] = {
 0xFFFFCE, 0xBDC65A, 0x848C42, 0x425229,
 // Below is above default32sgb_pallets_count and used for titles that aren't mapped to the default profiles
 // decimal index value and game title in comments
-// 32 Palette for final fantasy legends
+// 32 Palette for final fantasy legends I/II
 0xF8F8F8, 0xB0C0F8, 0x506088, 0x284858,
 0xF8F8F8, 0xB0C0F8, 0x506088, 0x284858,
 0xF8F8F8, 0xB0C0F8, 0x506088, 0x284858,
@@ -138,7 +138,7 @@ const uint32_t default32sgb_palettes[] = {
 0xFFFFFF, 0xFFFF00, 0xFF0000, 0x000000,
 0xFFFFFF, 0xFFFF00, 0xFF0000, 0x000000,
 0xFFFFFF, 0xFFFF00, 0xFF0000, 0x000000,
-// 34 Palette for Arcade Classic No. 1 - Asteroids & Missile Command / Arcade Classic No. 2 Centipede / James bond 007 / Mystic Quest
+// 34 Palette for Arcade Classic No. 1 - Asteroids & Missile Command / Arcade Classic No. 2 Centipede / James bond 007 / Mystic Quest / Game and watch gallery / Ken Griffey Jr. presents Major League Baseball
 0xFFFFFF, 0xFF8484, 0x943A3A, 0x000000,
 0xFFFFFF, 0xFF8484, 0x943A3A, 0x000000,
 0xFFFFFF, 0xFF8484, 0x943A3A, 0x000000,
@@ -154,4 +154,12 @@ const uint32_t default32sgb_palettes[] = {
 0xFFFFFF, 0x7BFF31, 0x008400, 0x000000,
 0xFFFFFF, 0x7BFF31, 0x008400, 0x000000,
 0xFFFFFF, 0x7BFF31, 0x008400, 0x000000,
+// 38 Gameboy Gallery
+0xFFFFFF, 0xFFAD63, 0x843100, 0x000000,
+0xFFFFFF, 0xFFAD63, 0x843100, 0x000000,
+0xFFFFFF, 0xFFAD63, 0x843100, 0x000000,
+// 39 Pocket Bomberman
+0xFFC542, 0xFFD600, 0x943A00, 0x4A0000,
+0xFFC542, 0xFFD600, 0x943A00, 0x4A0000,
+0xFFC542, 0xFFD600, 0x943A00, 0x4A0000,
 };
