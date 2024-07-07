@@ -49,6 +49,7 @@ List of SGB and Analogue Pocket enhanced titles:
 * Mario Land 2
 * Mega Man I
 * Mega Man II
+* Mega Man III
 * Metroid II
 * Mystic Quest
 * Pokemon Red
@@ -69,7 +70,7 @@ List of SGB and Analogue Pocket enhanced titles:
 * Yoshi
   
 06.07.2024:v0.77
-* Added adventures of lolo, james bond 007, The Rescue of Princess Blobette Starring A Boy and His Blob, Game & Watch Gallery, Arcade Classics No2 Centipede and Millipede SGB & AP support
+* Added adventures of lolo, james bond 007, Megaman 3, The Rescue of Princess Blobette Starring A Boy and His Blob, Game & Watch Gallery, Arcade Classics No2 Centipede and Millipede SGB & AP support
 * Increased speed of entering large directories in some circumstances
 * Increased file list limit to 1024 entries maximum, provided there is sufficient memory. Most files probably use less than half the max file name size, so 1024x128 directory entry listings are easily accommodated. File names may still be a full 256 bytes in length.
 
