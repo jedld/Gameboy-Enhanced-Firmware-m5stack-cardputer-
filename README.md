@@ -53,6 +53,7 @@ List of SGB and Analogue Pocket enhanced titles:
 * Mega Man III
 * Metroid II
 * Mystic Quest
+* Pocket Bomberman
 * Pokemon Red
 * Pokemon Blue
 * Pokemon Yellow
@@ -69,6 +70,24 @@ List of SGB and Analogue Pocket enhanced titles:
 * X
 * Yakyuman
 * Yoshi
+
+
+24.07.2024:0.78
+
+* Reduced overall volume; it still draws enough power to cause the backlight to flicker with the boost on full effect and volume maxed but it was flickering badly with the new amplification code.
+* Added revision number to boot sequence
+* Added configurable BASS BOOST to settings menu (0 -> +42db gain)
+* Removed dynamically allocated memory component for cartridge ram, 32k is largest any compatible game requires anyways so this is now a fixed buffer preventing memory fragmentation which allows the new....
+* Added ability to quit the current game and return to the file selection menu; there may be a slight
+sound as the next game starts. This is just left over audio buffer info from the previous emulation.
+* Spent time this month porting the emulator to T-Display S3 Touch, gamepad support working in that version, this was research to hopefully discover the incompatibility the cardputer seems to be having, power and library conflict are leading contenteders. Code is the same.
+
+07.07.2024:
+
+* Added bass boost function to audio engine
+* Added SGB support for pocket bomberman
+* Improved audio quality; less clipping at high volume levels.
+* Fix bug with startup audio being forced to Mute (part of BLE debugging code I forgot to remove) 
   
 06.07.2024:v0.77
 * Added adventures of lolo, james bond 007, Megaman 3, The Rescue of Princess Blobette Starring A Boy and His Blob, Game & Watch Gallery, Arcade Classics No2 Centipede and Millipede SGB & AP support
