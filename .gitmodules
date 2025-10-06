@@ -1,3 +1,4 @@
 [submodule "peanutgb"]
 	path = peanutgb
 	url = https://github.com/jedld/Peanut-GB
+	branch = gbc_support

@@ -3,6 +3,5 @@
 /.pio
 /downloads
 embedded_roms/
-embedded_rom.cpp
 embedded_roms.json
 .github/
