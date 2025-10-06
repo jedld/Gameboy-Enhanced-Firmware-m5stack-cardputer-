@@ -9,13 +9,28 @@
 
 #include <stdint.h>
 
-#define AUDIO_SAMPLE_RATE	32768
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/** Default sample rate requested from the speaker driver. */
+#define AUDIO_DEFAULT_SAMPLE_RATE  32768U
 
 #define DMG_CLOCK_FREQ		4194304.0
 #define SCREEN_REFRESH_CYCLES	70224.0
 #define VERTICAL_SYNC		(DMG_CLOCK_FREQ/SCREEN_REFRESH_CYCLES)
 
-#define AUDIO_SAMPLES		((unsigned)(AUDIO_SAMPLE_RATE / VERTICAL_SYNC))
+/** Query the currently configured sample rate (Hz). */
+uint32_t audio_get_sample_rate(void);
+
+/** Override the active sample rate (Hz) at runtime. */
+void audio_set_sample_rate(uint32_t sample_rate);
+
+/** Number of stereo frames generated for each video frame. */
+uint32_t audio_samples_per_frame(void);
+
+/** Convenience helper returning the interleaved sample count (L+R). */
+uint32_t audio_samples_per_buffer(void);
 
 /**
  * Fill allocated buffer "data" with "len" number of 32-bit floating point
@@ -37,3 +52,7 @@ void audio_write(const uint16_t addr, const uint8_t val);
  * Initialise audio driver.
  */
 void audio_init(void);
+
+#ifdef __cplusplus
+}
+#endif

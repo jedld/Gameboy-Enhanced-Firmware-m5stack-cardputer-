@@ -12,7 +12,125 @@ This is a resource I have created to help other developers learn and develop qua
 
 Updates are more frequent on m5burner than github, but I'm trying to drop a binary here now and then.
 
-Gameboy Emulator; complete with audio, configurable controls, display and performance options, savegames, save states, filesystem navigation and no .gb rom file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented.
+Gameboy Emulator; complete with audio, configurable controls, display and performance options, savegames, save states, filesystem navigation and no .gb rom file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. DMG titles automatically receive authentic Game Boy Color colourisation, including the original boot-time button combos for palette selection.
+
+## Compiling the firmware for the M5Stack Cardputer
+
+### Prerequisites
+
+* Arduino IDE 2.3 or newer (https://www.arduino.cc/en/software). You can also use the Arduino CLI if you prefer working from the terminal.
+* M5Stack board support package `>= 2.1.1`, installed through the Arduino Board Manager.
+* Libraries from M5Stack: **M5Unified** (installs **M5GFX** and **M5Cardputer**) via the Arduino Library Manager.
+* USB-C cable capable of data transfer for flashing the Cardputer.
+
+### 1. Prepare the sources
+
+Clone the repository together with its submodules so the Peanut-GB core is available locally:
+
+```bash
+git clone --recursive https://github.com/Mr-PauI/Gameboy-Enhanced-Firmware-m5stack-cardputer-.git
+cd Gameboy-Enhanced-Firmware-m5stack-cardputer-
+```
+
+If you already cloned the project without `--recursive`, initialise the submodule before building:
+
+```bash
+git submodule update --init --recursive
+```
+
+### Build and flash with VS Code + PlatformIO
+
+1. Install Visual Studio Code and add the **PlatformIO IDE** extension (it bundles the PlatformIO CLI).
+2. Open this repository folder in VS Code. PlatformIO will detect the `platformio.ini` file automatically.
+3. When prompted, allow PlatformIO to install the missing Espressif32 toolchain and dependencies defined in `platformio.ini` (this pulls **M5Unified** for you).
+4. Connect the Cardputer via USB-C. If you are on Linux, ensure your user has access to `/dev/ttyACM*` devices (typically by joining the `dialout` group).
+5. From the PlatformIO toolbar (bottom status bar) choose the **Build** target to compile. The active environment is `m5stack_cardputer` and is selected automatically.
+6. Choose **Upload** to flash the firmware. If the serial port is not detected, click the PlatformIO serial-port selector in the status bar and pick the correct `/dev/ttyACM*` entry.
+7. Use **Monitor** (or `PlatformIO: Serial Monitor`) to observe runtime logs at 115200 baud.
+
+You can perform the same actions from the command line without opening VS Code:
+
+```bash
+pio run
+pio run -t upload --upload-port /dev/ttyACM0
+pio device monitor -b 115200
+```
+
+Adjust the upload port to match your system. PlatformIO caches toolchains, so these downloads only happen the first time.
+
+#### One-command build & upload helper
+
+The repository includes a convenience script that wraps the PlatformIO CLI:
+
+```bash
+./scripts/flash_cardputer.sh [-p /dev/ttyACM0]
+```
+
+By default it builds and uploads the `m5stack_cardputer` environment. Pass `--no-upload` to compile without flashing, or `-e <env>` if you add more PlatformIO targets later. Set the `PIO_BIN` environment variable when PlatformIO is not available as `pio` on your `$PATH`.
+
+## Bundling ROMs directly into the firmware (optional)
+
+The firmware can embed multiple Game Boy or Game Boy Color ROM images so they boot without streaming data from the SD card. Embedded titles show up in the file picker under a `[FW]` label, and the one flagged for autoboot is marked `[FW★]` and launches automatically when present.
+
+1. Place the ROM file (`*.gb`/`*.gbc`) on your workstation.
+2. Add it to the embedded ROM manifest with the helper script:
+
+	```bash
+	python3 scripts/embed_rom.py add path/to/YourGame.gbc --name "Custom label" --autoboot
+	```
+
+	* The script maintains `embedded_roms.json` (manifest metadata) and stores raw payloads under `embedded_roms/`. Re-running `add` with different options updates the manifest entry in place.
+	* Use `--name` to control how the title appears in the firmware menu. Omit `--autoboot` if you want the SD card browser to remain the default boot experience.
+
+3. Rebuild and flash the firmware. The script regenerates `embedded_rom.cpp` and related headers every time you modify the manifest, so no manual edits are required.
+
+### Managing embedded ROMs
+
+The helper script exposes several sub-commands to maintain the manifest:
+
+* `python3 scripts/embed_rom.py list` – show all registered ROMs and their autoboot status.
+* `python3 scripts/embed_rom.py remove "Custom label"` – delete an entry by name (the payload file is removed too).
+* `python3 scripts/embed_rom.py autoboot "Custom label"` – toggle which entry will launch automatically at startup.
+* `python3 scripts/embed_rom.py clear` – wipe the manifest and generated payloads.
+* `python3 scripts/embed_rom.py generate` – rebuild the translation units from the existing manifest (handy after resolving merge conflicts).
+
+Remember to respect the legal status of any ROMs you embed—the project does not distribute copyrighted games.
+
+### 2. Install the M5Stack Cardputer board definition (Arduino IDE only)
+
+1. Open the Arduino IDE and go to **File ▸ Preferences**.
+2. In **Additional Boards Manager URLs** add `https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json` (keep existing entries separated with commas).
+3. Open **Tools ▸ Board ▸ Boards Manager…**, search for **M5Stack**, and install the **M5Stack Arduino** core.
+4. After installation pick **Tools ▸ Board ▸ M5Stack Arduino ▸ M5Stack-Cardputer**.
+5. Ensure that **USB CDC On Boot** is *Enabled* and **PSRAM** is set to *OPI PSRAM* (the defaults for this core).
+
+### 3. Install required libraries (Arduino IDE only)
+
+1. Open **Tools ▸ Manage Libraries…**.
+2. Search for **M5Unified** by M5Stack and install the latest version. The dependent libraries (M5GFX, M5Cardputer) are installed automatically.
+3. The remaining headers (Peanut-GB, minigb_apu) are bundled with this repository, so no further libraries are required.
+
+### 4. Build and flash from the Arduino IDE
+
+1. Restart the Arduino IDE to ensure the new board and libraries are loaded.
+2. Open `gb_cardputer.ino` in the repository root.
+3. Connect the Cardputer to your computer via USB-C. On Linux you may need to add your user to the `dialout` group or adjust `udev` permissions for `/dev/ttyACM*` devices.
+4. Select the serial port the Cardputer exposes under **Tools ▸ Port**.
+5. Click **Verify** to compile. A successful build finishes without errors.
+6. Click **Upload** to flash the firmware. The Cardputer resets automatically when the upload completes.
+
+### (Optional) Build with the Arduino CLI
+
+Once the board package is installed you can automate builds without launching the IDE:
+
+```bash
+arduino-cli core install m5stack:esp32
+arduino-cli lib install M5Unified
+arduino-cli compile --fqbn m5stack:esp32:m5stack_cardputer gb_cardputer.ino
+arduino-cli upload --fqbn m5stack:esp32:m5stack_cardputer -p /dev/ttyACM0 gb_cardputer.ino
+```
+
+Adjust the serial port (`-p`) to match your system. The first two commands only need to be executed once per environment.
 
 Pokemon Silver/Gold,  Dragon Warrior I&II and Azure dreams are the only confirmed fully supported .gbc titles, backwards compatible with the original gameboy and run in that mode. Emulator will behave as if you placed a gameboy colour cartridge into an original gameboy in most instances. Feel free to try other backwards compatible gbc games, but no garuntees on compatiblity. All *.gb and *.gbc files are listed by the file explorer in the current directory. 
 
@@ -157,6 +275,9 @@ sound as the next game starts. This is just left over audio buffer info from the
 * Added Solar Striker SGB & AP support
 * Added Missle Command/Asteroids SGB and AP support w/ border
 * Added Space Invaders SGB & SP support w/ Border
+
+01.10.2025:Cardputer port
+* Automatically detects Game Boy Color compatible ROMs on the Cardputer port and enables colour palettes based on the ROM header hash.
 
 11.06.2024(am):v0.67
 * Added ability to return to parent directory if it exists

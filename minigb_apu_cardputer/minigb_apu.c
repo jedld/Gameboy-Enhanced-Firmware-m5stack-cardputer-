@@ -14,7 +14,6 @@
 #include "minigb_apu.h"
 
 #define DMG_CLOCK_FREQ_U	((unsigned)DMG_CLOCK_FREQ)
-#define AUDIO_NSAMPLES		(AUDIO_SAMPLES * 2u)
 
 #define AUDIO_MEM_SIZE		(0xFF3F - 0xFF10 + 1)
 #define AUDIO_ADDR_COMPENSATION	0xFF10
@@ -25,13 +24,67 @@
 #define VOL_INIT_MAX		(INT16_MAX/8)
 #define VOL_INIT_MIN		(INT16_MIN/8)
 
-/* Handles time keeping for sound generation.
- * FREQ_INC_REF must be equal to, or larger than AUDIO_SAMPLE_RATE in order
- * to avoid a division by zero error.
- * Using a square of 2 simplifies calculations. */
-#define FREQ_INC_REF		(AUDIO_SAMPLE_RATE * 16)
-
 #define MAX_CHAN_VOLUME		15
+
+static uint32_t g_audio_sample_rate = AUDIO_DEFAULT_SAMPLE_RATE;
+static uint32_t g_freq_inc_ref = AUDIO_DEFAULT_SAMPLE_RATE * 16u;
+static uint32_t g_freq_inc_scale = 16u;
+static uint32_t g_audio_samples = 0;
+static uint32_t g_audio_nsamples = 0;
+static bool g_audio_params_ready = false;
+
+static void audio_recompute_timing(void)
+{
+	if(g_audio_sample_rate == 0)
+		g_audio_sample_rate = AUDIO_DEFAULT_SAMPLE_RATE;
+	else if(g_audio_sample_rate < 8000u)
+		g_audio_sample_rate = 8000u;
+
+	g_freq_inc_ref = g_audio_sample_rate * 16u;
+	g_freq_inc_scale = (g_freq_inc_ref + (g_audio_sample_rate / 2u)) / g_audio_sample_rate;
+	if(g_freq_inc_scale == 0)
+		g_freq_inc_scale = 1;
+
+	double samples_exact = (double)g_audio_sample_rate / VERTICAL_SYNC;
+	uint32_t frames = (uint32_t)(samples_exact + 0.5);
+	if(frames == 0)
+		frames = 1;
+	g_audio_samples = frames;
+	g_audio_nsamples = g_audio_samples * 2u;
+	g_audio_params_ready = true;
+}
+
+static void audio_ensure_params(void)
+{
+	if(!g_audio_params_ready)
+	{
+		audio_recompute_timing();
+	}
+}
+
+uint32_t audio_get_sample_rate(void)
+{
+	audio_ensure_params();
+	return g_audio_sample_rate;
+}
+
+void audio_set_sample_rate(uint32_t sample_rate)
+{
+	g_audio_sample_rate = sample_rate;
+	audio_recompute_timing();
+}
+
+uint32_t audio_samples_per_frame(void)
+{
+	audio_ensure_params();
+	return g_audio_samples;
+}
+
+uint32_t audio_samples_per_buffer(void)
+{
+	audio_ensure_params();
+	return g_audio_nsamples;
+}
 
 /**
  * Memory holding audio registers between 0xFF10 and 0xFF3F inclusive.
@@ -102,7 +155,8 @@ static int32_t vol_l, vol_r;
 static void set_note_freq(struct chan *c, const uint32_t freq)
 {
 	/* Lowest expected value of freq is 64. */
-	c->freq_inc = freq * (uint32_t)(FREQ_INC_REF / AUDIO_SAMPLE_RATE);
+	audio_ensure_params();
+	c->freq_inc = freq * g_freq_inc_scale;
 }
 
 static void chan_enable(const uint_fast8_t i, const bool enable)
@@ -122,7 +176,7 @@ static void update_env(struct chan *c)
 {
 	c->env.counter += c->env.inc;
 
-	while (c->env.counter > FREQ_INC_REF) {
+	while (c->env.counter > g_freq_inc_ref) {
 		if (c->env.step) {
 			c->volume += c->env.up ? 1 : -1;
 			if (c->volume == 0 || c->volume == MAX_CHAN_VOLUME) {
@@ -130,7 +184,7 @@ static void update_env(struct chan *c)
 			}
 			c->volume = MAX(0, MIN(MAX_CHAN_VOLUME, c->volume));
 		}
-		c->env.counter -= FREQ_INC_REF;
+		c->env.counter -= g_freq_inc_ref;
 	}
 }
 
@@ -140,7 +194,7 @@ static void update_len(struct chan *c)
 		return;
 
 	c->len.counter += c->len.inc;
-	if (c->len.counter > FREQ_INC_REF) {
+	if (c->len.counter > g_freq_inc_ref) {
 		chan_enable(c - chans, 0);
 		c->len.counter = 0;
 	}
@@ -151,8 +205,8 @@ static bool update_freq(struct chan *c, uint32_t *pos)
 	uint32_t inc = c->freq_inc - *pos;
 	c->freq_counter += inc;
 
-	if (c->freq_counter > FREQ_INC_REF) {
-		*pos		= c->freq_inc - (c->freq_counter - FREQ_INC_REF);
+	if (c->freq_counter > g_freq_inc_ref) {
+		*pos		= c->freq_inc - (c->freq_counter - g_freq_inc_ref);
 		c->freq_counter = 0;
 		return true;
 	} else {
@@ -165,7 +219,7 @@ static void update_sweep(struct chan *c)
 {
 	c->sweep.counter += c->sweep.inc;
 
-	while (c->sweep.counter > FREQ_INC_REF) {
+	while (c->sweep.counter > g_freq_inc_ref) {
 		if (c->sweep.shift) {
 			uint16_t inc = (c->sweep.freq >> c->sweep.shift);
 			if (!c->sweep.up)
@@ -182,7 +236,7 @@ static void update_sweep(struct chan *c)
 		} else if (c->sweep.rate) {
 			c->enabled = 0;
 		}
-		c->sweep.counter -= FREQ_INC_REF;
+		c->sweep.counter -= g_freq_inc_ref;
 	}
 }
 
@@ -190,6 +244,8 @@ static void update_square(int16_t* samples, const bool ch2)
 {
 	uint32_t freq;
 	struct chan* c = chans + ch2;
+	audio_ensure_params();
+	const uint_fast16_t limit = g_audio_nsamples;
 
 	if (!c->powered || !c->enabled)
 		return;
@@ -198,7 +254,7 @@ static void update_square(int16_t* samples, const bool ch2)
 	set_note_freq(c, freq);
 	c->freq_inc *= 8;
 
-	for (uint_fast16_t i = 0; i < AUDIO_NSAMPLES; i += 2) {
+	for (uint_fast16_t i = 0; i < limit; i += 2) {
 		update_len(c);
 
 		if (!c->enabled)
@@ -250,6 +306,8 @@ static void update_wave(int16_t *samples)
 {
 	uint32_t freq;
 	struct chan *c = chans + 2;
+	audio_ensure_params();
+	const uint_fast16_t limit = g_audio_nsamples;
 
 	if (!c->powered || !c->enabled)
 		return;
@@ -259,7 +317,7 @@ static void update_wave(int16_t *samples)
 
 	c->freq_inc *= 32;
 
-	for (uint_fast16_t i = 0; i < AUDIO_NSAMPLES; i += 2) {
+	for (uint_fast16_t i = 0; i < limit; i += 2) {
 		update_len(c);
 
 		if (!c->enabled)
@@ -303,6 +361,8 @@ static void update_wave(int16_t *samples)
 static void update_noise(int16_t *samples)
 {
 	struct chan *c = chans + 3;
+	audio_ensure_params();
+	const uint_fast16_t limit = g_audio_nsamples;
 
 	if (!c->powered)
 		return;
@@ -320,7 +380,7 @@ static void update_noise(int16_t *samples)
 	if (c->freq >= 14)
 		c->enabled = 0;
 
-	for (uint_fast16_t i = 0; i < AUDIO_NSAMPLES; i += 2) {
+	for (uint_fast16_t i = 0; i < limit; i += 2) {
 		update_len(c);
 
 		if (!c->enabled)
@@ -373,6 +433,7 @@ void audio_callback(void *userdata, uint8_t *stream, int len)
 
 	/* Appease unused variable warning. */
 	(void)userdata;
+	audio_ensure_params();
 
 	memset(stream, 0, len);
 
@@ -385,6 +446,7 @@ void audio_callback(void *userdata, uint8_t *stream, int len)
 static void chan_trigger(uint_fast8_t i)
 {
 	struct chan *c = chans + i;
+	audio_ensure_params();
 
 	chan_enable(i, 1);
 	c->volume = c->volume_init;
@@ -396,9 +458,10 @@ static void chan_trigger(uint_fast8_t i)
 
 		c->env.step = val & 0x07;
 		c->env.up   = val & 0x08 ? 1 : 0;
+		uint64_t base = (uint64_t)g_freq_inc_ref;
 		c->env.inc  = c->env.step ?
-			(FREQ_INC_REF * 64ul) / ((uint32_t)c->env.step * AUDIO_SAMPLE_RATE) :
-			(8ul * FREQ_INC_REF) / AUDIO_SAMPLE_RATE ;
+			(uint32_t)((base * 64u) / ((uint64_t)c->env.step * g_audio_sample_rate)) :
+			(uint32_t)((base * 8u) / g_audio_sample_rate);
 		c->env.counter = 0;
 	}
 
@@ -411,8 +474,9 @@ static void chan_trigger(uint_fast8_t i)
 		c->sweep.up    = !(val & 0x08);
 		c->sweep.shift = (val & 0x07);
 		c->sweep.inc   = c->sweep.rate ?
-			((128 * FREQ_INC_REF) / (c->sweep.rate * AUDIO_SAMPLE_RATE)) : 0;
-		c->sweep.counter = FREQ_INC_REF;
+			(uint32_t)(((uint64_t)128 * g_freq_inc_ref) /
+				((uint64_t)c->sweep.rate * g_audio_sample_rate)) : 0;
+		c->sweep.counter = g_freq_inc_ref;
 	}
 
 	int len_max = 64;
@@ -425,7 +489,8 @@ static void chan_trigger(uint_fast8_t i)
 		c->val = VOL_INIT_MIN / MAX_CHAN_VOLUME;
 	}
 
-	c->len.inc = (256 * FREQ_INC_REF) / (AUDIO_SAMPLE_RATE * (len_max - c->len.load));
+	c->len.inc = (uint32_t)(((uint64_t)256 * g_freq_inc_ref) /
+		((uint64_t)g_audio_sample_rate * (len_max - c->len.load)));
 	c->len.counter = 0;
 }
 
@@ -460,6 +525,7 @@ uint8_t audio_read(const uint16_t addr)
  */
 void audio_write(const uint16_t addr, const uint8_t val)
 {
+	audio_ensure_params();
 	/* Find sound channel corresponding to register address. */
 	uint_fast8_t i;
 
@@ -578,6 +644,7 @@ void audio_write(const uint16_t addr, const uint8_t val)
 
 void audio_init(void)
 {
+	audio_ensure_params();
 	/* Initialise channels and samples. */
 	memset(chans, 0, sizeof(chans));
 	chans[0].val = chans[1].val = -1;
