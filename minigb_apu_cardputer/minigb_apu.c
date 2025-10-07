@@ -21,8 +21,10 @@
 #define MAX(a, b)		( a > b ? a : b )
 #define MIN(a, b)		( a <= b ? a : b )
 
-#define VOL_INIT_MAX		(INT16_MAX/8)
-#define VOL_INIT_MIN		(INT16_MIN/8)
+// Moderately increased from INT16_MAX/8 to INT16_MAX/6 (~1.33x volume boost)
+// Prevents clipping while improving audio quality
+#define VOL_INIT_MAX		(INT16_MAX/6)
+#define VOL_INIT_MIN		(INT16_MIN/6)
 
 #define MAX_CHAN_VOLUME		15
 

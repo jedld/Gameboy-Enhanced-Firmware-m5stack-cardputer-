@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 /** Default sample rate requested from the speaker driver. */
-#define AUDIO_DEFAULT_SAMPLE_RATE  32768U
+#define AUDIO_DEFAULT_SAMPLE_RATE  44100U
 
 #define DMG_CLOCK_FREQ		4194304.0
 #define SCREEN_REFRESH_CYCLES	70224.0
