@@ -16,6 +16,7 @@
 #include <cmath>
 #include <limits.h>
 #include <esp_heap_caps.h>
+#include <esp_attr.h>
 #include <esp32-hal-psram.h>
 #include "esp32-hal-cpu.h"
 #ifdef CONFIG_PM_ENABLE
@@ -200,6 +201,10 @@ struct RomCache {
   size_t cache_misses;
   size_t cache_swaps;
   size_t bank_size;
+  uint32_t bank_mask;
+  uint32_t hot_bank_base;
+  uint8_t bank_shift;
+  uint8_t bank_shift_valid;
   int16_t lru_head;
   int16_t lru_tail;
   int32_t hot_bank;
@@ -458,6 +463,35 @@ static size_t rom_cache_preferred_block_size() {
   return g_psram_available ? ROM_STREAM_BLOCK_SIZE : ROM_BANK_SIZE;
 }
 
+static inline void rom_cache_update_geometry(RomCache *cache) {
+  if(cache == nullptr) {
+    return;
+  }
+
+  cache->bank_mask = 0;
+  cache->bank_shift = 0;
+  cache->bank_shift_valid = 0;
+
+  const size_t block_size = cache->bank_size;
+  if(block_size == 0) {
+    return;
+  }
+
+  if((block_size & (block_size - 1)) == 0) {
+    cache->bank_mask = static_cast<uint32_t>(block_size - 1);
+    cache->bank_shift = static_cast<uint8_t>(__builtin_ctzll(static_cast<unsigned long long>(block_size)));
+    cache->bank_shift_valid = 1;
+  }
+}
+
+static inline uint32_t rom_cache_bank_base(const RomCache *cache, uint32_t bank) {
+  const size_t block_size = cache->bank_size ? cache->bank_size : ROM_STREAM_BLOCK_SIZE;
+  if(cache->bank_shift_valid) {
+    return bank << cache->bank_shift;
+  }
+  return bank * static_cast<uint32_t>(block_size);
+}
+
 struct PaletteState {
   bool gbc_enabled;
   uint8_t active_index;
@@ -473,14 +507,14 @@ struct priv_t;
 static void rom_cache_reset(RomCache *cache);
 static bool rom_cache_open(RomCache *cache, const char *path);
 static bool rom_cache_open_memory(RomCache *cache, const uint8_t *data, size_t size);
-static uint8_t rom_cache_read(RomCache *cache, uint32_t addr);
+static inline uint8_t IRAM_ATTR rom_cache_read(RomCache *cache, uint32_t addr);
 static void rom_cache_close(RomCache *cache);
 static uint8_t rom_cache_cgb_flag(const RomCache *cache);
 static uint8_t* rom_cache_alloc_block(size_t bytes, bool prefer_internal_first);
-static int16_t rom_cache_bank_index(const RomCache *cache, const RomCacheBank *bank);
-static void rom_cache_lru_detach(RomCache *cache, int16_t index);
-static void rom_cache_lru_touch(RomCache *cache, int16_t index);
-static void rom_cache_lru_insert_after(RomCache *cache, int16_t index, int16_t after_index);
+static inline int16_t IRAM_ATTR rom_cache_bank_index(const RomCache *cache, const RomCacheBank *bank);
+static inline void IRAM_ATTR rom_cache_lru_detach(RomCache *cache, int16_t index);
+static inline void IRAM_ATTR rom_cache_lru_touch(RomCache *cache, int16_t index);
+static inline void IRAM_ATTR rom_cache_lru_insert_after(RomCache *cache, int16_t index, int16_t after_index);
 static const char* gbc_palette_name(size_t index);
 static void palette_apply_dmg(PaletteState *palette);
 static void palette_set_label(PaletteState *palette, const char *label);
@@ -1497,11 +1531,11 @@ static uint8_t* rom_cache_alloc_block(size_t bytes, bool prefer_internal_first) 
   return (uint8_t *)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
 }
 
-static int16_t rom_cache_bank_index(const RomCache *cache, const RomCacheBank *bank) {
+static inline int16_t IRAM_ATTR rom_cache_bank_index(const RomCache *cache, const RomCacheBank *bank) {
   return static_cast<int16_t>(bank - cache->banks);
 }
 
-static void rom_cache_lru_detach(RomCache *cache, int16_t index) {
+static inline void IRAM_ATTR rom_cache_lru_detach(RomCache *cache, int16_t index) {
   if(index < 0 || index >= ROM_CACHE_BANK_MAX) {
     return;
   }
@@ -1527,7 +1561,7 @@ static void rom_cache_lru_detach(RomCache *cache, int16_t index) {
   entry->lru_next = -1;
 }
 
-static void rom_cache_lru_touch(RomCache *cache, int16_t index) {
+static inline void IRAM_ATTR rom_cache_lru_touch(RomCache *cache, int16_t index) {
   if(index < 0 || index >= ROM_CACHE_BANK_MAX) {
     return;
   }
@@ -1548,7 +1582,7 @@ static void rom_cache_lru_touch(RomCache *cache, int16_t index) {
   }
 }
 
-static void rom_cache_lru_insert_after(RomCache *cache, int16_t index, int16_t after_index) {
+static inline void IRAM_ATTR rom_cache_lru_insert_after(RomCache *cache, int16_t index, int16_t after_index) {
   if(index < 0 || index >= ROM_CACHE_BANK_MAX) {
     return;
   }
@@ -1592,6 +1626,7 @@ static bool rom_cache_prepare_buffers(RomCache *cache) {
   }
 
   cache->bank_size = rom_cache_preferred_block_size();
+  rom_cache_update_geometry(cache);
 
   if(cache->bank0 == nullptr) {
     cache->bank0 = rom_cache_alloc_block(cache->bank_size, true);
@@ -1664,6 +1699,7 @@ static bool rom_cache_prepare_buffers(RomCache *cache) {
   cache->memory_size = 0;
   cache->hot_bank = -1;
   cache->hot_bank_ptr = nullptr;
+  cache->hot_bank_base = 0;
 #if ENABLE_PROFILING
   g_rom_profiler.last_hits = 0;
   g_rom_profiler.last_misses = 0;
@@ -1707,6 +1743,7 @@ static void rom_cache_reset(RomCache *cache) {
   cache->use_memory = false;
   cache->bank_count = bank_count;
   cache->bank_size = rom_cache_preferred_block_size();
+  rom_cache_update_geometry(cache);
   cache->cache_hits = 0;
   cache->cache_misses = 0;
   cache->cache_swaps = 0;
@@ -1714,6 +1751,7 @@ static void rom_cache_reset(RomCache *cache) {
   cache->lru_tail = -1;
   cache->hot_bank = -1;
   cache->hot_bank_ptr = nullptr;
+  cache->hot_bank_base = 0;
 #if ENABLE_PROFILING
   g_rom_profiler.last_hits = 0;
   g_rom_profiler.last_misses = 0;
@@ -1754,6 +1792,7 @@ static bool rom_cache_trim_banks(RomCache *cache, size_t new_count) {
   cache->cache_swaps = 0;
   cache->hot_bank = -1;
   cache->hot_bank_ptr = nullptr;
+  cache->hot_bank_base = 0;
 
   for(size_t i = 0; i < cache->bank_count; ++i) {
     RomCacheBank &entry = cache->banks[i];
@@ -1781,7 +1820,7 @@ static bool rom_cache_fill_bank(RomCache *cache, RomCacheBank *slot, uint32_t ba
     memset(slot->data, 0xFF, block_size);
   }
 
-  uint32_t base = bank * block_size;
+  uint32_t base = rom_cache_bank_base(cache, bank);
 
   if(cache->use_memory) {
     if(cache->memory_rom == nullptr || base >= cache->memory_size) {
@@ -1893,6 +1932,7 @@ static bool rom_cache_open(RomCache *cache, const char *path) {
 
   cache->hot_bank = 0;
   cache->hot_bank_ptr = cache->bank0;
+  cache->hot_bank_base = rom_cache_bank_base(cache, 0);
 
   return true;
 }
@@ -1905,6 +1945,7 @@ static bool rom_cache_open_memory(RomCache *cache, const uint8_t *data, size_t s
   rom_cache_close(cache);
   cache->bank_count = 0;
   cache->bank_size = 0;
+  rom_cache_update_geometry(cache);
   cache->use_memory = false; // direct access, bypass rom_cache_read()
   cache->memory_rom = data;
   cache->memory_size = size;
@@ -1914,6 +1955,7 @@ static bool rom_cache_open_memory(RomCache *cache, const uint8_t *data, size_t s
   cache->cache_swaps = 0;
   cache->hot_bank = -1;
   cache->hot_bank_ptr = nullptr;
+  cache->hot_bank_base = 0;
 
   Serial.printf("Embedded ROM mapped directly (%u bytes)\n", (unsigned)size);
   Serial.println("ROM cache disabled for embedded source");
@@ -1924,7 +1966,7 @@ static bool rom_cache_open_memory(RomCache *cache, const uint8_t *data, size_t s
   return true;
 }
 
-static uint8_t rom_cache_read(RomCache *cache, uint32_t addr) {
+static inline uint8_t IRAM_ATTR rom_cache_read(RomCache *cache, uint32_t addr) {
   if(cache->size == 0 || addr >= cache->size) {
     return 0xFF;
   }
@@ -1936,27 +1978,42 @@ static uint8_t rom_cache_read(RomCache *cache, uint32_t addr) {
 
   const size_t block_size = cache->bank_size ? cache->bank_size : ROM_STREAM_BLOCK_SIZE;
 
+  if(cache->hot_bank_ptr != nullptr) {
+    const uint32_t base = cache->hot_bank_base;
+    if(addr >= base) {
+      const uint32_t rel = addr - base;
+      if(rel < block_size) {
+        cache->cache_hits++;
+        if(rel + 64 < block_size) {
+          __builtin_prefetch(cache->hot_bank_ptr + rel + 64, 0, 1);
+        }
+        return cache->hot_bank_ptr[rel];
+      }
+    }
+  }
+
   if(addr < block_size) {
     if(cache->bank0 != nullptr) {
       cache->cache_hits++;
       cache->hot_bank = 0;
       cache->hot_bank_ptr = cache->bank0;
+      cache->hot_bank_base = 0;
       return cache->bank0[addr];
     }
     cache->hot_bank = -1;
     cache->hot_bank_ptr = nullptr;
+    cache->hot_bank_base = 0;
     return 0xFF;
   }
 
-  uint32_t bank = addr / block_size;
-  uint32_t offset = addr % block_size;
-
-  if(cache->hot_bank_ptr != nullptr && cache->hot_bank == static_cast<int32_t>(bank)) {
-    cache->cache_hits++;
-    if(offset + 64 < block_size) {
-      __builtin_prefetch(cache->hot_bank_ptr + offset + 64, 0, 1);
-    }
-    return cache->hot_bank_ptr[offset];
+  uint32_t bank;
+  uint32_t offset;
+  if(cache->bank_shift_valid) {
+    bank = addr >> cache->bank_shift;
+    offset = addr & cache->bank_mask;
+  } else {
+    bank = addr / block_size;
+    offset = addr % block_size;
   }
 
   size_t bank_count = cache->bank_count;
@@ -1975,6 +2032,7 @@ static uint8_t rom_cache_read(RomCache *cache, uint32_t addr) {
         rom_cache_lru_touch(cache, candidate_index);
         cache->hot_bank = candidate->bank_number;
         cache->hot_bank_ptr = candidate->data;
+        cache->hot_bank_base = rom_cache_bank_base(cache, bank);
         if(offset + 64 < block_size) {
           __builtin_prefetch(candidate->data + offset + 64, 0, 1);
         }
@@ -2079,11 +2137,13 @@ static uint8_t rom_cache_read(RomCache *cache, uint32_t addr) {
   if(slot->data != nullptr) {
     cache->hot_bank = slot->bank_number;
     cache->hot_bank_ptr = slot->data;
+    cache->hot_bank_base = rom_cache_bank_base(cache, slot->bank_number);
     return slot->data[offset];
   }
 
   cache->hot_bank = -1;
   cache->hot_bank_ptr = nullptr;
+  cache->hot_bank_base = 0;
   return 0xFF;
 }
 
