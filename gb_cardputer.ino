@@ -711,6 +711,477 @@ static TaskHandle_t render_task_handle = nullptr;
 static TaskHandle_t audio_task_handle = nullptr;
 #endif
 
+static constexpr const char *PRINTER_OUTPUT_DIR = "/printer";
+static constexpr size_t PRINTER_TILE_BYTES = 16;
+static constexpr size_t PRINTER_TILES_PER_ROW = 20;
+static constexpr size_t PRINTER_PIXEL_ROWS_PER_TILE = 8;
+static constexpr size_t PRINTER_IMAGE_WIDTH = 160;
+static constexpr size_t PRINTER_RX_FIFO_SIZE = 16;
+static constexpr uint8_t PRINTER_RX_FIFO_MASK = static_cast<uint8_t>(PRINTER_RX_FIFO_SIZE - 1);
+static constexpr size_t PRINTER_MAX_IMAGE_BYTES = 32768;
+
+struct GameBoyPrinterState {
+  enum class Stage : uint8_t {
+    WaitSync1 = 0,
+    WaitSync2,
+    Header,
+    Data,
+    ChecksumLow,
+    ChecksumHigh
+  };
+
+  Stage stage;
+  uint8_t header_index;
+  uint16_t expected_length;
+  uint16_t data_received;
+  uint32_t checksum_accum;
+  uint16_t checksum_expected;
+  uint8_t command;
+  uint8_t compression_flag;
+  std::vector<uint8_t> packet_data;
+  std::vector<uint8_t> image_data;
+  std::vector<uint8_t> decompress_buffer;
+  uint8_t rx_fifo[PRINTER_RX_FIFO_SIZE];
+  uint8_t rx_head;
+  uint8_t rx_tail;
+  uint8_t status_lo;
+  uint8_t status_hi;
+  bool busy;
+  uint8_t last_response;
+  uint32_t job_counter;
+
+  GameBoyPrinterState()
+      : stage(Stage::WaitSync1),
+        header_index(0),
+        expected_length(0),
+        data_received(0),
+        checksum_accum(0),
+        checksum_expected(0),
+        command(0),
+        compression_flag(0),
+        packet_data(),
+        image_data(),
+        decompress_buffer(),
+        rx_fifo{0},
+        rx_head(0),
+        rx_tail(0),
+        status_lo(0),
+        status_hi(0),
+        busy(false),
+        last_response(0),
+        job_counter(0) {
+    image_data.reserve(PRINTER_MAX_IMAGE_BYTES);
+  }
+
+  void reset(bool reset_jobs = false) {
+    stage = Stage::WaitSync1;
+    header_index = 0;
+    expected_length = 0;
+    data_received = 0;
+    checksum_accum = 0;
+    checksum_expected = 0;
+    command = 0;
+    compression_flag = 0;
+    packet_data.clear();
+    busy = false;
+    status_lo = 0;
+    status_hi = 0;
+    rx_head = 0;
+    rx_tail = 0;
+    last_response = 0;
+    if(reset_jobs) {
+      job_counter = 0;
+    }
+    image_data.clear();
+    decompress_buffer.clear();
+  }
+
+  uint8_t dequeueRx() {
+    if(rx_head == rx_tail) {
+      return 0x00;
+    }
+    uint8_t value = rx_fifo[rx_head];
+    rx_head = static_cast<uint8_t>((rx_head + 1) & PRINTER_RX_FIFO_MASK);
+    return value;
+  }
+
+  void enqueueRx(uint8_t value) {
+    uint8_t next = static_cast<uint8_t>((rx_tail + 1) & PRINTER_RX_FIFO_MASK);
+    if(next == rx_head) {
+      return;
+    }
+    rx_fifo[rx_tail] = value;
+    rx_tail = next;
+  }
+
+  uint8_t onTransmit(uint8_t tx_byte) {
+    uint8_t response = dequeueRx();
+    last_response = response;
+    parseByte(tx_byte);
+    return response;
+  }
+
+  uint8_t lastResponse() const {
+    return last_response;
+  }
+
+  void parseByte(uint8_t byte) {
+    switch(stage) {
+      case Stage::WaitSync1:
+        if(byte == 0x88) {
+          stage = Stage::WaitSync2;
+        }
+        break;
+      case Stage::WaitSync2:
+        if(byte == 0x33) {
+          stage = Stage::Header;
+          header_index = 0;
+          checksum_accum = 0;
+          expected_length = 0;
+          data_received = 0;
+          packet_data.clear();
+        } else if(byte != 0x88) {
+          stage = Stage::WaitSync1;
+        }
+        break;
+      case Stage::Header:
+        switch(header_index) {
+          case 0:
+            command = byte;
+            checksum_accum = byte;
+            header_index++;
+            break;
+          case 1:
+            compression_flag = byte;
+            checksum_accum += byte;
+            header_index++;
+            break;
+          case 2:
+            expected_length = byte;
+            checksum_accum += byte;
+            header_index++;
+            break;
+          case 3:
+            expected_length |= static_cast<uint16_t>(byte) << 8;
+            checksum_accum += byte;
+            header_index = 0;
+            data_received = 0;
+            if(expected_length > 0) {
+              const uint16_t reserve_len = command == 0x02 && expected_length > 0x280 ? 0x280 : expected_length;
+              packet_data.reserve(reserve_len);
+              stage = Stage::Data;
+            } else {
+              stage = Stage::ChecksumLow;
+            }
+            break;
+          default:
+            stage = Stage::WaitSync1;
+            break;
+        }
+        break;
+      case Stage::Data:
+        if(packet_data.size() < PRINTER_MAX_IMAGE_BYTES) {
+          packet_data.push_back(byte);
+        }
+        checksum_accum += byte;
+        data_received++;
+        if(data_received >= expected_length) {
+          stage = Stage::ChecksumLow;
+        }
+        break;
+      case Stage::ChecksumLow:
+        checksum_expected = byte;
+        stage = Stage::ChecksumHigh;
+        break;
+      case Stage::ChecksumHigh: {
+        checksum_expected |= static_cast<uint16_t>(byte) << 8;
+        const uint16_t computed = static_cast<uint16_t>(checksum_accum & 0xFFFFu);
+        if(computed != checksum_expected) {
+          Serial.printf("Game Boy Printer: checksum mismatch cmd=0x%02X len=%u expected=0x%04X got=0x%04X\n",
+                        command,
+                        static_cast<unsigned>(expected_length),
+                        static_cast<unsigned>(checksum_expected),
+                        static_cast<unsigned>(computed));
+        } else {
+          processPacket();
+        }
+        stage = Stage::WaitSync1;
+        queueStatusAck();
+        break;
+      }
+    }
+  }
+
+  void queueStatusAck() {
+    const uint8_t busy_flag = busy ? 0x04 : 0x00;
+    enqueueRx(0x00);
+    enqueueRx(static_cast<uint8_t>(status_lo | busy_flag));
+    enqueueRx(status_hi);
+    enqueueRx(0x00);
+  }
+
+  void processPacket() {
+    switch(command) {
+      case 0x00: // Initialise
+        image_data.clear();
+        status_lo = 0x00;
+        status_hi = 0x00;
+        busy = false;
+        break;
+      case 0x01: // Status request
+        // Nothing additional required; status will be queued by queueStatusAck().
+        break;
+      case 0x02: // Data
+        handleDataPacket();
+        break;
+      case 0x04: // Print
+        handlePrintPacket();
+        break;
+      default:
+        // Unsupported command; ignore but keep protocol alive.
+        break;
+    }
+  }
+
+  void handleDataPacket() {
+    decompressPayload();
+    if(decompress_buffer.empty()) {
+      return;
+    }
+    if(image_data.size() + decompress_buffer.size() > PRINTER_MAX_IMAGE_BYTES) {
+      Serial.println("Game Boy Printer: image buffer overflow, discarding data");
+      image_data.clear();
+      return;
+    }
+    image_data.insert(image_data.end(), decompress_buffer.begin(), decompress_buffer.end());
+  }
+
+  void handlePrintPacket() {
+    busy = true;
+    if(saveBufferedImage()) {
+      image_data.clear();
+      status_lo = 0x00;
+      status_hi = 0x00;
+    } else {
+      status_hi |= 0x01;
+    }
+    busy = false;
+  }
+
+  void decompressPayload() {
+    decompress_buffer.clear();
+    if(packet_data.empty()) {
+      return;
+    }
+    const bool compressed = (compression_flag & 0x01u) != 0;
+    if(!compressed) {
+      decompress_buffer.insert(decompress_buffer.end(), packet_data.begin(), packet_data.end());
+      return;
+    }
+
+    size_t index = 0;
+    while(index < packet_data.size()) {
+      uint8_t control = packet_data[index++];
+      if(control & 0x80) {
+        const size_t count = static_cast<size_t>((control & 0x7Fu) + 3u);
+        if(index >= packet_data.size()) {
+          break;
+        }
+        const uint8_t value = packet_data[index++];
+        if(decompress_buffer.size() + count > PRINTER_MAX_IMAGE_BYTES) {
+          decompress_buffer.clear();
+          Serial.println("Game Boy Printer: decompressed data exceeds limits");
+          return;
+        }
+        decompress_buffer.insert(decompress_buffer.end(), count, value);
+      } else {
+        size_t count = static_cast<size_t>(control) + 1u;
+        if(index + count > packet_data.size()) {
+          count = packet_data.size() - index;
+        }
+        if(decompress_buffer.size() + count > PRINTER_MAX_IMAGE_BYTES) {
+          decompress_buffer.clear();
+          Serial.println("Game Boy Printer: decompressed data exceeds limits");
+          return;
+        }
+        decompress_buffer.insert(decompress_buffer.end(), packet_data.begin() + index, packet_data.begin() + index + count);
+        index += count;
+      }
+    }
+  }
+
+  bool ensureOutputPath(char *path_buffer, size_t buffer_len) {
+    if(!ensure_sd_card(true)) {
+      Serial.println("Game Boy Printer: SD card unavailable");
+      return false;
+    }
+    if(!SD.exists(PRINTER_OUTPUT_DIR)) {
+      if(!SD.mkdir(PRINTER_OUTPUT_DIR)) {
+        Serial.println("Game Boy Printer: failed to create output directory");
+        return false;
+      }
+    }
+    for(uint32_t attempt = job_counter; attempt < job_counter + 10000; ++attempt) {
+      char candidate[64];
+      snprintf(candidate, sizeof(candidate), "%s/print_%04u.bmp", PRINTER_OUTPUT_DIR, static_cast<unsigned>(attempt & 0xFFFFu));
+      if(!SD.exists(candidate)) {
+        if(strlen(candidate) + 1 > buffer_len) {
+          return false;
+        }
+        strncpy(path_buffer, candidate, buffer_len);
+        path_buffer[buffer_len - 1] = '\0';
+        job_counter = attempt + 1;
+        return true;
+      }
+    }
+    Serial.println("Game Boy Printer: exhausted filename attempts");
+    return false;
+  }
+
+  bool saveBufferedImage() {
+    if(image_data.empty()) {
+      Serial.println("Game Boy Printer: no image data to save");
+      return false;
+    }
+
+    const size_t total_bytes = image_data.size();
+    if(total_bytes < PRINTER_TILES_PER_ROW * PRINTER_TILE_BYTES) {
+      Serial.println("Game Boy Printer: insufficient image data");
+      return false;
+    }
+
+    const size_t tiles_total = total_bytes / PRINTER_TILE_BYTES;
+    if(tiles_total < PRINTER_TILES_PER_ROW) {
+      Serial.println("Game Boy Printer: tile data incomplete");
+      return false;
+    }
+
+    const size_t tile_rows = tiles_total / PRINTER_TILES_PER_ROW;
+    if(tile_rows == 0) {
+      Serial.println("Game Boy Printer: zero tile rows");
+      return false;
+    }
+
+    const size_t height = tile_rows * PRINTER_PIXEL_ROWS_PER_TILE;
+    const size_t row_stride = ((PRINTER_IMAGE_WIDTH * 3u) + 3u) & ~3u;
+    std::vector<uint8_t> bmp_buffer(row_stride * height, 0xFF);
+    static const uint8_t GREY_LEVELS[4] = { 0xFF, 0xAA, 0x55, 0x00 };
+
+    for(size_t tile_row = 0; tile_row < tile_rows; ++tile_row) {
+      for(size_t row = 0; row < PRINTER_PIXEL_ROWS_PER_TILE; ++row) {
+        const size_t y = tile_row * PRINTER_PIXEL_ROWS_PER_TILE + row;
+        if(y >= height) {
+          break;
+        }
+        const size_t dst_row = height - 1 - y;
+        uint8_t *dst = bmp_buffer.data() + dst_row * row_stride;
+        for(size_t tile_col = 0; tile_col < PRINTER_TILES_PER_ROW; ++tile_col) {
+          const size_t tile_index = tile_row * PRINTER_TILES_PER_ROW + tile_col;
+          if(tile_index * PRINTER_TILE_BYTES + (row * 2 + 1) >= image_data.size()) {
+            break;
+          }
+          const uint8_t *tile_base = &image_data[tile_index * PRINTER_TILE_BYTES];
+          const uint8_t lo = tile_base[row * 2];
+          const uint8_t hi = tile_base[row * 2 + 1];
+          for(uint8_t bit = 0; bit < 8; ++bit) {
+            const uint8_t colour_index = static_cast<uint8_t>(((hi >> (7 - bit)) & 0x01u) << 1) |
+                                         static_cast<uint8_t>((lo >> (7 - bit)) & 0x01u);
+            const uint8_t grey = GREY_LEVELS[colour_index & 0x03u];
+            const size_t x = tile_col * 8u + bit;
+            const size_t dst_index = x * 3u;
+            if(dst_index + 2 < row_stride) {
+              dst[dst_index + 0] = grey;
+              dst[dst_index + 1] = grey;
+              dst[dst_index + 2] = grey;
+            }
+          }
+        }
+      }
+    }
+
+    char path[64];
+    if(!ensureOutputPath(path, sizeof(path))) {
+      return false;
+    }
+
+    struct __attribute__((packed)) BmpFileHeader {
+      uint16_t type;
+      uint32_t size;
+      uint16_t reserved1;
+      uint16_t reserved2;
+      uint32_t offset;
+    } file_header;
+
+    struct __attribute__((packed)) BmpInfoHeader {
+      uint32_t size;
+      int32_t width;
+      int32_t height;
+      uint16_t planes;
+      uint16_t bit_count;
+      uint32_t compression;
+      uint32_t image_size;
+      int32_t x_ppm;
+      int32_t y_ppm;
+      uint32_t colours_used;
+      uint32_t colours_important;
+    } info_header;
+
+    const uint32_t headers_size = sizeof(file_header) + sizeof(info_header);
+    file_header.type = 0x4D42; // 'BM'
+    file_header.size = headers_size + static_cast<uint32_t>(bmp_buffer.size());
+    file_header.reserved1 = 0;
+    file_header.reserved2 = 0;
+    file_header.offset = headers_size;
+
+    info_header.size = sizeof(info_header);
+    info_header.width = static_cast<int32_t>(PRINTER_IMAGE_WIDTH);
+    info_header.height = static_cast<int32_t>(height);
+    info_header.planes = 1;
+    info_header.bit_count = 24;
+    info_header.compression = 0;
+    info_header.image_size = static_cast<uint32_t>(bmp_buffer.size());
+    info_header.x_ppm = 2835;
+    info_header.y_ppm = 2835;
+    info_header.colours_used = 0;
+    info_header.colours_important = 0;
+
+    File file = SD.open(path, FILE_WRITE);
+    if(!file) {
+      Serial.printf("Game Boy Printer: failed to open %s for write\n", path);
+      return false;
+    }
+
+    bool ok = true;
+    if(file.write(reinterpret_cast<uint8_t *>(&file_header), sizeof(file_header)) != sizeof(file_header)) {
+      ok = false;
+    }
+    if(ok && file.write(reinterpret_cast<uint8_t *>(&info_header), sizeof(info_header)) != sizeof(info_header)) {
+      ok = false;
+    }
+    if(ok && file.write(bmp_buffer.data(), bmp_buffer.size()) != static_cast<int>(bmp_buffer.size())) {
+      ok = false;
+    }
+    file.close();
+
+    if(!ok) {
+      Serial.printf("Game Boy Printer: failed to write image %s\n", path);
+      SD.remove(path);
+      return false;
+    }
+
+    Serial.printf("Game Boy Printer: saved image %s (%ux%u)\n",
+                  path,
+                  static_cast<unsigned>(PRINTER_IMAGE_WIDTH),
+                  static_cast<unsigned>(height));
+    return true;
+  }
+};
+
+static GameBoyPrinterState g_printer;
+
+static void gb_printer_serial_tx(struct gb_s *gb, const uint8_t tx);
+static enum gb_serial_rx_ret_e gb_printer_serial_rx(struct gb_s *gb, uint8_t *rx);
+
 static void apply_default_button_mapping() {
   memcpy(g_settings.button_mapping,
          DEFAULT_JOYPAD_KEYMAP,
@@ -1502,6 +1973,20 @@ void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr,
   p->cart_ram[addr] = val;
   p->cart_ram_dirty = true;
   p->cart_save_write_failed = false;
+}
+
+static void gb_printer_serial_tx(struct gb_s *gb, const uint8_t tx) {
+  (void)gb;
+  g_printer.onTransmit(tx);
+}
+
+static enum gb_serial_rx_ret_e gb_printer_serial_rx(struct gb_s *gb, uint8_t *rx) {
+  (void)gb;
+  if(rx == nullptr) {
+    return GB_SERIAL_RX_NO_CONNECTION;
+  }
+  *rx = g_printer.lastResponse();
+  return GB_SERIAL_RX_SUCCESS;
 }
 
 /**
@@ -4528,6 +5013,7 @@ void setup() {
   Serial.println("Cardputer firmware booting...");
   configure_performance_profile();
   reset_save_state(&priv);
+  g_printer.reset(true);
 
   bool psram_ok = psramInit();
   Serial.printf("PSRAM init: %s, size=%u bytes, free=%u bytes\n",
@@ -4609,6 +5095,7 @@ void setup() {
   // Initialize GameBoy emulation context.
   enum gb_init_error_e ret = GB_INIT_NO_ERROR;
   while(true) {
+    g_printer.reset(false);
     palette_apply_dmg(&priv.palette);
     priv.rom_is_cgb = false;
     priv.rom_is_cgb_only = false;
@@ -4875,6 +5362,11 @@ void setup() {
     priv.rom_source = RomSource::None;
     priv.embedded_rom = nullptr;
     priv.embedded_rom_size = 0;
+  }
+
+  if(ret == GB_INIT_NO_ERROR) {
+    g_printer.reset(false);
+    gb_init_serial(&gb, &gb_printer_serial_tx, &gb_printer_serial_rx);
   }
 
   if(ret == GB_INIT_NO_ERROR && priv.rom_is_cgb) {
