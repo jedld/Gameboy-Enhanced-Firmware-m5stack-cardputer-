@@ -4,6 +4,14 @@
 #define ENABLE_LCD 1
 #define ENABLE_PROFILING 1
 
+#ifndef ENABLE_BLUETOOTH
+#define ENABLE_BLUETOOTH 1
+#endif
+
+#ifndef ENABLE_BLUETOOTH_CONTROLLERS
+#define ENABLE_BLUETOOTH_CONTROLLERS ENABLE_BLUETOOTH
+#endif
+
 #ifndef ENABLE_MBC7
 #define ENABLE_MBC7 1
 #endif
@@ -599,7 +607,9 @@ static void wait_for_keyboard_release();
 static void show_home_menu();
 static void show_options_menu();
 static void show_keymap_menu();
+#if ENABLE_BLUETOOTH_CONTROLLERS
 static void show_bluetooth_menu();
+#endif
 #if ENABLE_SOUND
 static void audioSetup();
 static void audioPump();
@@ -1931,7 +1941,9 @@ static void poll_keyboard() {
   handle_volume_keys(status);
   const bool local_keyboard_pressed = M5Cardputer.Keyboard.isPressed();
 
+#if ENABLE_BLUETOOTH_CONTROLLERS
   BluetoothManager::instance().loop();
+#endif
 
   auto press_button = [&](JoypadButton button) {
     switch(button) {
@@ -1984,12 +1996,14 @@ static void poll_keyboard() {
     }
   }
 
+#if ENABLE_BLUETOOTH_CONTROLLERS
   ExternalInput::instance().apply([&](uint8_t keycode) {
     char translated = hid_keycode_to_ascii(keycode);
     if(translated != 0) {
       handle_key(translated);
     }
   });
+#endif
 }
 
 static void poll_keyboard();
@@ -4342,9 +4356,14 @@ static void show_options_menu() {
     OPTION_CACHE = 3,
     OPTION_VOLUME = 4,
     OPTION_FRAME_SKIP = 5,
+#if ENABLE_BLUETOOTH_CONTROLLERS
     OPTION_BLUETOOTH = 6,
     OPTION_KEYMAP = 7,
     OPTION_DONE = 8,
+#else
+    OPTION_KEYMAP = 6,
+    OPTION_DONE = 7,
+#endif
     OPTION_COUNT
   };
 
@@ -4383,9 +4402,11 @@ static void show_options_menu() {
   draw_option(OPTION_FRAME_SKIP,
       "Frame skip",
       String(frame_skip_mode_label(g_settings.frame_skip_mode)));
+#if ENABLE_BLUETOOTH_CONTROLLERS
   draw_option(OPTION_BLUETOOTH,
       "Bluetooth devices",
       BluetoothManager::instance().isReady() ? "" : "(off)" );
+#endif
       draw_option(OPTION_KEYMAP, "Configure buttons", "");
       draw_option(OPTION_DONE, "Back", "");
 
@@ -4439,6 +4460,7 @@ static void show_options_menu() {
           settings_changed = true;
           redraw = true;
           break;
+#if ENABLE_BLUETOOTH_CONTROLLERS
         case OPTION_FRAME_SKIP:
           adjust_frame_skip_mode(1);
           settings_changed = true;
@@ -4449,6 +4471,13 @@ static void show_options_menu() {
           show_bluetooth_menu();
           redraw = true;
           break;
+#else
+        case OPTION_FRAME_SKIP:
+          adjust_frame_skip_mode(1);
+          settings_changed = true;
+          redraw = true;
+          break;
+#endif
         case OPTION_KEYMAP:
           wait_for_keyboard_release();
           show_keymap_menu();
@@ -4549,6 +4578,7 @@ static void show_options_menu() {
   M5Cardputer.Display.clearDisplay();
 }
 
+#if ENABLE_BLUETOOTH_CONTROLLERS
 static void show_bluetooth_menu() {
   BluetoothManager &bt = BluetoothManager::instance();
   if(!bt.isReady()) {
@@ -4720,6 +4750,7 @@ static void show_bluetooth_menu() {
     }
   }
 }
+#endif
 
 static void show_home_menu() {
   const uint8_t OPTION_LAUNCH = 0;
@@ -5636,9 +5667,11 @@ void setup() {
   // Speaker initialisation handled in audioSetup().
 #endif
 
+#if ENABLE_BLUETOOTH_CONTROLLERS
   BluetoothManager::instance().setKeyboardCallback([](uint8_t keycode, bool pressed) {
     ExternalInput::instance().setKeyState(keycode, pressed);
   });
+#endif
 
   // Set display rotation to horizontal.
   M5Cardputer.Display.setRotation(1);

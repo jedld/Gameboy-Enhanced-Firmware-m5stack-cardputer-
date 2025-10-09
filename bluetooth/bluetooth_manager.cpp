@@ -1,5 +1,7 @@
 #include "bluetooth_manager.h"
 
+#if ENABLE_BLUETOOTH
+
 #include <algorithm>
 #include <cstring>
 
@@ -386,3 +388,5 @@ BluetoothDeviceInfo *BluetoothManager::findDevice(NimBLERemoteCharacteristic *ch
   }
   return &(*it);
 }
+
+#endif  // ENABLE_BLUETOOTH

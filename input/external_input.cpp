@@ -1,5 +1,7 @@
 #include "external_input.h"
 
+#if ENABLE_BLUETOOTH_CONTROLLERS
+
 ExternalInput &ExternalInput::instance() {
   static ExternalInput inst;
   return inst;
@@ -16,3 +18,5 @@ bool ExternalInput::isKeyPressed(uint8_t keycode) const {
 void ExternalInput::clear() {
   key_states_.fill(false);
 }
+
+#endif  // ENABLE_BLUETOOTH_CONTROLLERS

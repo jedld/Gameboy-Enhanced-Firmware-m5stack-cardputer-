@@ -1,10 +1,17 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifndef ENABLE_BLUETOOTH
+#define ENABLE_BLUETOOTH 1
+#endif
+
+#if ENABLE_BLUETOOTH
 
 #include <NimBLEDevice.h>
 
@@ -77,3 +84,54 @@ private:
   BluetoothKeyCallback keyboard_cb_;
   std::vector<BluetoothDeviceInfo> devices_;
 };
+
+#else  // ENABLE_BLUETOOTH
+
+struct BluetoothDeviceInfo {
+  std::string name;
+  bool connected = false;
+  bool connecting = false;
+
+  std::string label() const {
+    if(!name.empty()) {
+      return name;
+    }
+    return std::string();
+  }
+};
+
+using BluetoothKeyCallback = std::function<void(uint8_t keycode, bool pressed)>;
+
+class BluetoothManager {
+public:
+  static BluetoothManager &instance() {
+    static BluetoothManager inst;
+    return inst;
+  }
+
+  bool initialize() { return false; }
+  void shutdown() {}
+
+  void startScan() {}
+  void stopScan() {}
+
+  bool isScanning() const { return false; }
+
+  const std::vector<BluetoothDeviceInfo> &devices() const { return devices_; }
+
+  bool connectDevice(size_t) { return false; }
+  void disconnectAll() {}
+
+  void setKeyboardCallback(BluetoothKeyCallback) {}
+
+  void loop() {}
+
+  bool isReady() const { return false; }
+
+private:
+  BluetoothManager() = default;
+
+  std::vector<BluetoothDeviceInfo> devices_;
+};
+
+#endif  // ENABLE_BLUETOOTH

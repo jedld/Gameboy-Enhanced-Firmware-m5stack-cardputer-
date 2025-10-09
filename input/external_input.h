@@ -3,6 +3,12 @@
 #include <array>
 #include <cstdint>
 
+#ifndef ENABLE_BLUETOOTH_CONTROLLERS
+#define ENABLE_BLUETOOTH_CONTROLLERS 1
+#endif
+
+#if ENABLE_BLUETOOTH_CONTROLLERS
+
 class ExternalInput {
 public:
   static ExternalInput &instance();
@@ -26,3 +32,26 @@ private:
 
   std::array<bool, 256> key_states_{};
 };
+
+#else  // ENABLE_BLUETOOTH_CONTROLLERS
+
+class ExternalInput {
+public:
+  static ExternalInput &instance() {
+    static ExternalInput inst;
+    return inst;
+  }
+
+  void setKeyState(uint8_t, bool) {}
+  bool isKeyPressed(uint8_t) const { return false; }
+
+  void clear() {}
+
+  template <typename Callback>
+  void apply(Callback &&) const {}
+
+private:
+  ExternalInput() = default;
+};
+
+#endif  // ENABLE_BLUETOOTH_CONTROLLERS

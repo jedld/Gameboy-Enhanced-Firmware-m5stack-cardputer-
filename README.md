@@ -61,6 +61,8 @@ Adjust the upload port to match your system. PlatformIO caches toolchains, so th
 #### Optional build flags
 
 - `ENABLE_MBC7` (default `1`) toggles the MBC7 accelerometer/EEPROM emulation. Set it to `0` in `platformio.ini` or provide `-D ENABLE_MBC7=0` on the command line if you want to exclude MBC7 support (for example to shave a little flash or when targeting devices without the tilt sensor).
+- `ENABLE_BLUETOOTH` (default `1`) controls whether the firmware initialises the NimBLE stack. Set it to `0` to strip Bluetooth support entirely and reclaim memory.
+- `ENABLE_BLUETOOTH_CONTROLLERS` (default `1`) enables the Bluetooth HID controller/keyboard bridge. Set to `0` when you only need other Bluetooth features or want the lightest build.
 
 #### One-command build & upload helper
 
