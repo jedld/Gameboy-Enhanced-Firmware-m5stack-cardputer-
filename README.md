@@ -12,7 +12,7 @@ This is a resource I have created to help other developers learn and develop qua
 
 Updates are more frequent on m5burner than github, but I'm trying to drop a binary here now and then.
 
-Gameboy Emulator; complete with audio, configurable controls, display and performance options, savegames, save states, filesystem navigation and no .gb rom file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. DMG titles automatically receive authentic Game Boy Color colourisation, including the original boot-time button combos for palette selection.
+Gameboy Emulator; complete with audio, configurable controls, display and performance options, savegames, save states, filesystem navigation and no .gb rom file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. DMG titles automatically receive authentic Game Boy Color colourisation, including the original boot-time button combos for palette selection. The Options menu also exposes a stretch-to-width toggle if you prefer filling the Cardputer display over pillarboxed output.
 
 ## Compiling the firmware for the M5Stack Cardputer
 

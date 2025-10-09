@@ -38,6 +38,8 @@
 #include "minigb_apu_cardputer/minigb_apu.h"
 #endif
 #include "peanutgb/peanut_gb.h"
+#include "bluetooth/bluetooth_manager.h"
+#include "input/external_input.h"
 #include <SD.h>
 #include <pgmspace.h>
 #include "gbc.h"
@@ -151,7 +153,14 @@ static uint8_t frame_row_map[DEST_H];
 static uint16_t frame_row_weight[DEST_H];
 static uint32_t swap_row_hash[DEST_H];
 static constexpr unsigned int FALLBACK_SEGMENT_ROWS = 4;
-static uint16_t fallback_segment_buffer[FALLBACK_SEGMENT_ROWS * LCD_WIDTH];
+static uint16_t fallback_segment_buffer[FALLBACK_SEGMENT_ROWS * DEST_W];
+
+static bool stretch_col_map_initialised = false;
+static uint16_t stretch_col_map[DEST_W];
+static uint16_t stretch_col_weight[DEST_W];
+static bool last_stretch_mode = false;
+static uint16_t stretch_line_buffer[DEST_W];
+static uint16_t stretch_blend_buffer[LCD_WIDTH];
 
 enum class JoypadButton : uint8_t {
   Up = 0,
@@ -233,6 +242,7 @@ enum FrameSkipMode : uint8_t {
 struct FirmwareSettings {
   bool audio_enabled;
   bool cgb_bootstrap_palettes;
+  bool stretch_display;
   uint8_t rom_cache_banks;
   uint8_t master_volume;
   uint8_t frame_skip_mode;
@@ -240,7 +250,7 @@ struct FirmwareSettings {
 };
 
 static constexpr uint8_t DEFAULT_MASTER_VOLUME = 255;
-static constexpr uint8_t SETTINGS_VERSION = 3;
+static constexpr uint8_t SETTINGS_VERSION = 4;
 static constexpr uint8_t VOLUME_STEP = 16;
 static constexpr const char *SETTINGS_DIR = "/config";
 static constexpr const char *SETTINGS_FILE_PATH = "/config/cardputer_settings.ini";
@@ -255,6 +265,7 @@ static constexpr size_t MBC7_EEPROM_RAW_SIZE = MBC7_EEPROM_WORD_COUNT * sizeof(u
 static FirmwareSettings g_settings = {
   true,
   true,
+  false,
   ROM_CACHE_BANK_MAX,
   DEFAULT_MASTER_VOLUME,
   static_cast<uint8_t>(FRAME_SKIP_MODE_AUTO),
@@ -588,6 +599,7 @@ static void wait_for_keyboard_release();
 static void show_home_menu();
 static void show_options_menu();
 static void show_keymap_menu();
+static void show_bluetooth_menu();
 #if ENABLE_SOUND
 static void audioSetup();
 static void audioPump();
@@ -1296,6 +1308,7 @@ static bool save_settings_to_sd() {
   file.printf("version=%u\n", static_cast<unsigned>(SETTINGS_VERSION));
   file.printf("audio=%u\n", g_settings.audio_enabled ? 1u : 0u);
   file.printf("bootstrap=%u\n", g_settings.cgb_bootstrap_palettes ? 1u : 0u);
+  file.printf("stretch=%u\n", g_settings.stretch_display ? 1u : 0u);
   file.printf("cache=%u\n", static_cast<unsigned>(g_settings.rom_cache_banks));
   file.printf("volume=%u\n", static_cast<unsigned>(g_settings.master_volume));
   file.printf("frame_skip=%u\n", static_cast<unsigned>(g_settings.frame_skip_mode));
@@ -1359,6 +1372,8 @@ static bool load_settings_from_sd() {
       g_settings.audio_enabled = (value.toInt() != 0);
     } else if(key == "bootstrap") {
       g_settings.cgb_bootstrap_palettes = (value.toInt() != 0);
+    } else if(key == "stretch") {
+      g_settings.stretch_display = (value.toInt() != 0);
     } else if(key == "cache") {
       long banks = value.toInt();
       if(banks >= 1 && banks <= ROM_CACHE_BANK_MAX) {
@@ -1866,14 +1881,57 @@ static void handle_volume_keys(const Keyboard_Class::KeysState &status) {
   previous_down = down_pressed;
 }
 
+static char hid_keycode_to_ascii(uint8_t keycode) {
+  if(keycode >= 0x04 && keycode <= 0x1d) {
+    return static_cast<char>('a' + (keycode - 0x04));
+  }
+  if(keycode >= 0x1e && keycode <= 0x26) {
+    return static_cast<char>('1' + (keycode - 0x1e));
+  }
+  if(keycode == 0x27) {
+    return '0';
+  }
+  switch(keycode) {
+    case 0x28:
+      return '\n';
+    case 0x29:
+      return 0x1B;
+    case 0x2C:
+      return ' ';
+    case 0x2D:
+      return '-';
+    case 0x2E:
+      return '=';
+    case 0x2F:
+      return '[';
+    case 0x30:
+      return ']';
+    case 0x31:
+      return '\\';
+    case 0x33:
+      return ';';
+    case 0x34:
+      return '\'';
+    case 0x36:
+      return ',';
+    case 0x37:
+      return '.';
+    case 0x38:
+      return '/';
+    default:
+      break;
+  }
+  return 0;
+}
+
 static void poll_keyboard() {
   gb.direct.joypad = 0xff;
   M5Cardputer.update();
   Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
   handle_volume_keys(status);
-  if(!M5Cardputer.Keyboard.isPressed()) {
-    return;
-  }
+  const bool local_keyboard_pressed = M5Cardputer.Keyboard.isPressed();
+
+  BluetoothManager::instance().loop();
 
   auto press_button = [&](JoypadButton button) {
     switch(button) {
@@ -1920,9 +1978,18 @@ static void poll_keyboard() {
     }
   };
 
-  for(auto key : status.word) {
-    handle_key(key);
+  if(local_keyboard_pressed) {
+    for(auto key : status.word) {
+      handle_key(key);
+    }
   }
+
+  ExternalInput::instance().apply([&](uint8_t keycode) {
+    char translated = hid_keycode_to_ascii(keycode);
+    if(translated != 0) {
+      handle_key(translated);
+    }
+  });
 }
 
 static void poll_keyboard();
@@ -3404,6 +3471,50 @@ static RenderProfiler profiler_consume_render_stats() {
 }
 #endif
 
+static void ensure_stretch_map() {
+  if(stretch_col_map_initialised) {
+    return;
+  }
+
+  constexpr float scale = static_cast<float>(LCD_WIDTH) / static_cast<float>(DEST_W);
+  const float max_src = static_cast<float>(LCD_WIDTH - 1);
+
+  for(unsigned int x = 0; x < DEST_W; ++x) {
+    float src_x = (static_cast<float>(x) + 0.5f) * scale - 0.5f;
+    if(src_x < 0.0f) {
+      src_x = 0.0f;
+    } else if(src_x > max_src) {
+      src_x = max_src;
+    }
+
+    int x0 = static_cast<int>(floorf(src_x));
+    if(x0 < 0) {
+      x0 = 0;
+    } else if(x0 > static_cast<int>(LCD_WIDTH - 1)) {
+      x0 = LCD_WIDTH - 1;
+    }
+
+    float frac = src_x - static_cast<float>(x0);
+    if(x0 >= static_cast<int>(LCD_WIDTH - 1)) {
+      frac = 0.0f;
+    } else if(frac < 0.0f) {
+      frac = 0.0f;
+    } else if(frac > 1.0f) {
+      frac = 1.0f;
+    }
+
+    uint16_t weight = static_cast<uint16_t>(frac * 256.0f + 0.5f);
+    if(weight > 256) {
+      weight = 256;
+    }
+
+    stretch_col_map[x] = static_cast<uint16_t>(x0);
+    stretch_col_weight[x] = weight;
+  }
+
+  stretch_col_map_initialised = true;
+}
+
 // Draw a frame to the display while scaling it to fit.
 // This is needed as the Cardputer's display has a height of 135px,
 // while the GameBoy's has a height of 144px.
@@ -3411,11 +3522,25 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
   if(fb == nullptr) {
     return;
   }
+
+  const bool stretch = g_settings.stretch_display;
+
+  if(stretch != last_stretch_mode) {
+    display_cache_valid = false;
+    memset(swap_row_hash, 0, sizeof(swap_row_hash));
+    last_stretch_mode = stretch;
+  }
+
+  if(stretch) {
+    ensure_stretch_map();
+  }
+
 #if ENABLE_PROFILING
   uint64_t render_start = micros64();
   uint32_t rows_written = 0;
   uint32_t segments_flushed = 0;
 #endif
+
   if(!frame_row_map_initialised) {
     constexpr float scale = static_cast<float>(LCD_HEIGHT) / static_cast<float>(DEST_H);
     const float max_src = static_cast<float>(LCD_HEIGHT - 1);
@@ -3444,8 +3569,9 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
     frame_row_map_initialised = true;
   }
 
-  const int32_t x_offset = DISPLAY_CENTER(0);
-  const size_t row_bytes = LCD_WIDTH * sizeof(uint16_t);
+  const uint16_t output_width = stretch ? DEST_W : LCD_WIDTH;
+  const int32_t x_offset = stretch ? 0 : DISPLAY_CENTER(0);
+  const size_t row_bytes = output_width * sizeof(uint16_t);
   const bool cache_was_valid = display_cache_valid;
 
   auto needs_update = [&](unsigned int src_y0, uint16_t weight) -> bool {
@@ -3490,44 +3616,67 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
                          uint16_t weight,
                          bool compute_hash) -> uint32_t {
     const uint16_t *row0 = fb + (src_y0 * LCD_WIDTH);
-    const bool can_blend = (weight != 0) && (src_y0 + 1 < LCD_HEIGHT);
+  const uint16_t *src_row = row0;
+  bool use_blend = false;
+  bool use_next_row = false;
 
-    if(!can_blend) {
-      memcpy(dst, row0, row_bytes);
+  uint16_t *const blended_row = stretch_blend_buffer;
+    if(weight != 0 && src_y0 + 1 < LCD_HEIGHT) {
+      if(weight >= 256) {
+        src_row = fb + ((src_y0 + 1) * LCD_WIDTH);
+        use_next_row = true;
+      } else {
+        const uint16_t *row1 = fb + ((src_y0 + 1) * LCD_WIDTH);
+        const uint16_t w1 = weight;
+        const uint16_t w0 = 256 - weight;
+        for(unsigned int x = 0; x < LCD_WIDTH; ++x) {
+          blended_row[x] = blend_pixel(row0[x], row1[x], w0, w1);
+        }
+        src_row = blended_row;
+        use_blend = true;
+      }
+    }
+
+    if(!stretch) {
+      memcpy(dst, src_row, row_bytes);
       if(!compute_hash) {
         return 0;
       }
-      if(row_hash != nullptr) {
+      if(!use_blend && row_hash != nullptr) {
+        if(use_next_row) {
+          return row_hash[src_y0 + 1];
+        }
         return row_hash[src_y0];
       }
       uint32_t hash = 2166136261u;
-      for(unsigned int x = 0; x < LCD_WIDTH; ++x) {
+      for(unsigned int x = 0; x < output_width; ++x) {
         hash = framebuffer_hash_step(hash, dst[x]);
       }
       return hash;
     }
 
-    const uint16_t *row1 = fb + ((src_y0 + 1) * LCD_WIDTH);
-    const uint16_t w1 = weight;
-    const uint16_t w0 = 256 - weight;
-
-    if(!compute_hash) {
-      for(unsigned int x = 0; x < LCD_WIDTH; ++x) {
-        dst[x] = blend_pixel(row0[x], row1[x], w0, w1);
+    uint32_t hash = compute_hash ? 2166136261u : 0;
+    for(unsigned int x = 0; x < output_width; ++x) {
+      unsigned int base = stretch_col_map[x];
+      if(base >= LCD_WIDTH) {
+        base = LCD_WIDTH - 1;
       }
-      return 0;
-    }
-
-    uint32_t hash = 2166136261u;
-    for(unsigned int x = 0; x < LCD_WIDTH; ++x) {
-      const uint16_t colour = blend_pixel(row0[x], row1[x], w0, w1);
+      uint16_t w = stretch_col_weight[x];
+      uint16_t colour;
+      if(w == 0 || base >= LCD_WIDTH - 1) {
+        colour = src_row[base];
+      } else {
+        colour = blend_pixel(src_row[base], src_row[base + 1], 256 - w, w);
+      }
       dst[x] = colour;
-      hash = framebuffer_hash_step(hash, colour);
+      if(compute_hash) {
+        hash = framebuffer_hash_step(hash, colour);
+      }
     }
     return hash;
   };
 
-  uint16_t line_buffer[LCD_WIDTH];
+  uint16_t *const line_buffer = stretch_line_buffer;
 
   const bool use_full_cache = swap_fb_enabled && swap_fb_psram_backed && swap_fb != nullptr && row_hash != nullptr;
 
@@ -3547,9 +3696,11 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
       if(M5Cardputer.Display.dmaBusy()) {
         M5Cardputer.Display.waitDMA();
       }
-  M5Cardputer.Display.setAddrWindow(x_offset, segment_start, LCD_WIDTH, count);
-  M5Cardputer.Display.writePixelsDMA(fallback_segment_buffer, LCD_WIDTH * count, true);
-  M5Cardputer.Display.waitDMA();
+      M5Cardputer.Display.setAddrWindow(x_offset, segment_start, output_width, count);
+      M5Cardputer.Display.writePixelsDMA(fallback_segment_buffer,
+                                         output_width * count,
+                                         true);
+      M5Cardputer.Display.waitDMA();
 #if ENABLE_PROFILING
       rows_written += count;
       segments_flushed++;
@@ -3562,7 +3713,7 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
       const uint16_t weight = frame_row_weight[j];
       const bool dirty_hint = needs_update(src_y0, weight);
 
-      if(display_cache_valid && row_hash != nullptr) {
+      if(!stretch && display_cache_valid && row_hash != nullptr) {
         uint32_t expected_hash = 0;
         bool can_skip = false;
         if(weight == 0) {
@@ -3587,7 +3738,7 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
         if(segment_rows == 0) {
           segment_start = j;
         }
-        memcpy(fallback_segment_buffer + (segment_rows * LCD_WIDTH), line_buffer, row_bytes);
+        memcpy(fallback_segment_buffer + (segment_rows * output_width), line_buffer, row_bytes);
         segment_rows++;
         if(segment_rows == FALLBACK_SEGMENT_ROWS) {
           flush_segment(segment_rows);
@@ -3630,10 +3781,10 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
     if(M5Cardputer.Display.dmaBusy()) {
       M5Cardputer.Display.waitDMA();
     }
-  M5Cardputer.Display.setAddrWindow(x_offset, start, LCD_WIDTH, count);
-  M5Cardputer.Display.writePixelsDMA(swap_fb + (start * LCD_WIDTH),
-                    LCD_WIDTH * count,
-                    swap_fb_dma_capable);
+    M5Cardputer.Display.setAddrWindow(x_offset, start, output_width, count);
+    M5Cardputer.Display.writePixelsDMA(swap_fb + (start * output_width),
+                                       output_width * count,
+                                       swap_fb_dma_capable);
 #if ENABLE_PROFILING
     rows_written += count;
     segments_flushed++;
@@ -3643,10 +3794,10 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
   for(unsigned int j = 0; j < DEST_H; j++) {
     const unsigned int src_y0 = frame_row_map[j];
     const uint16_t weight = frame_row_weight[j];
-    uint16_t *cached_row = swap_fb + (j * LCD_WIDTH);
+    uint16_t *cached_row = swap_fb + (j * output_width);
     const bool dirty_hint = needs_update(src_y0, weight);
 
-    if(display_cache_valid && row_hash != nullptr) {
+    if(!stretch && display_cache_valid && row_hash != nullptr) {
       uint32_t expected_hash = 0;
       bool can_skip = false;
       if(weight == 0) {
@@ -4187,11 +4338,13 @@ static void show_options_menu() {
   enum Option : uint8_t {
     OPTION_AUDIO = 0,
     OPTION_BOOTSTRAP = 1,
-    OPTION_CACHE = 2,
-    OPTION_VOLUME = 3,
-    OPTION_FRAME_SKIP = 4,
-    OPTION_KEYMAP = 5,
-    OPTION_DONE = 6,
+    OPTION_STRETCH = 2,
+    OPTION_CACHE = 3,
+    OPTION_VOLUME = 4,
+    OPTION_FRAME_SKIP = 5,
+    OPTION_BLUETOOTH = 6,
+    OPTION_KEYMAP = 7,
+    OPTION_DONE = 8,
     OPTION_COUNT
   };
 
@@ -4219,14 +4372,20 @@ static void show_options_menu() {
       };
 
       draw_option(OPTION_AUDIO, "Audio", g_settings.audio_enabled ? "On" : "Off");
-      draw_option(OPTION_BOOTSTRAP,
-                  "CGB auto palettes",
-                  g_settings.cgb_bootstrap_palettes ? "On" : "Off");
-      draw_option(OPTION_CACHE, "ROM cache banks", String(g_settings.rom_cache_banks));
-    draw_option(OPTION_VOLUME, "Volume", String(g_settings.master_volume));
-    draw_option(OPTION_FRAME_SKIP,
-          "Frame skip",
-          String(frame_skip_mode_label(g_settings.frame_skip_mode)));
+  draw_option(OPTION_BOOTSTRAP,
+      "CGB auto palettes",
+      g_settings.cgb_bootstrap_palettes ? "On" : "Off");
+  draw_option(OPTION_STRETCH,
+      "Stretch display",
+      g_settings.stretch_display ? "On" : "Off");
+  draw_option(OPTION_CACHE, "ROM cache banks", String(g_settings.rom_cache_banks));
+  draw_option(OPTION_VOLUME, "Volume", String(g_settings.master_volume));
+  draw_option(OPTION_FRAME_SKIP,
+      "Frame skip",
+      String(frame_skip_mode_label(g_settings.frame_skip_mode)));
+  draw_option(OPTION_BLUETOOTH,
+      "Bluetooth devices",
+      BluetoothManager::instance().isReady() ? "" : "(off)" );
       draw_option(OPTION_KEYMAP, "Configure buttons", "");
       draw_option(OPTION_DONE, "Back", "");
 
@@ -4260,6 +4419,13 @@ static void show_options_menu() {
           settings_changed = true;
           redraw = true;
           break;
+        case OPTION_STRETCH:
+          g_settings.stretch_display = !g_settings.stretch_display;
+          settings_changed = true;
+          display_cache_valid = false;
+          memset(swap_row_hash, 0, sizeof(swap_row_hash));
+          redraw = true;
+          break;
         case OPTION_CACHE:
           g_settings.rom_cache_banks++;
           if(g_settings.rom_cache_banks == 0 || g_settings.rom_cache_banks > ROM_CACHE_BANK_MAX) {
@@ -4276,6 +4442,11 @@ static void show_options_menu() {
         case OPTION_FRAME_SKIP:
           adjust_frame_skip_mode(1);
           settings_changed = true;
+          redraw = true;
+          break;
+        case OPTION_BLUETOOTH:
+          wait_for_keyboard_release();
+          show_bluetooth_menu();
           redraw = true;
           break;
         case OPTION_KEYMAP:
@@ -4376,6 +4547,178 @@ static void show_options_menu() {
   }
 
   M5Cardputer.Display.clearDisplay();
+}
+
+static void show_bluetooth_menu() {
+  BluetoothManager &bt = BluetoothManager::instance();
+  if(!bt.isReady()) {
+    if(!bt.initialize()) {
+      M5Cardputer.Display.clearDisplay();
+      M5Cardputer.Display.setCursor(0, 0);
+      M5Cardputer.Display.println("Bluetooth init failed");
+      delay(1500);
+      return;
+    }
+  }
+
+  bool running = true;
+  int selection = 0;
+  bool redraw = true;
+
+  while(running) {
+    bt.loop();
+
+    if(redraw) {
+      redraw = false;
+      M5Cardputer.Display.clearDisplay();
+      set_font_size(96);
+      M5Cardputer.Display.setCursor(0, 0);
+      M5Cardputer.Display.println("Bluetooth");
+      set_font_size(144);
+      M5Cardputer.Display.println(bt.isScanning() ? "Scanning..." : "Idle");
+      M5Cardputer.Display.println();
+
+      const auto &devices = bt.devices();
+      const int total_items = 2 + static_cast<int>(devices.size());
+      for(int index = 0; index < total_items; ++index) {
+        String line;
+        if(index == 0) {
+          line = bt.isScanning() ? "Stop scan" : "Start scan";
+        } else if(index == 1) {
+          line = "Disconnect all";
+        } else {
+          const auto &dev = devices[static_cast<size_t>(index - 2)];
+          line = (dev.connected ? "[✓] " : "[ ] ") + String(dev.name.c_str());
+        }
+
+        if(selection == index) {
+          line = "> " + line;
+        } else {
+          line = "  " + line;
+        }
+        M5Cardputer.Display.println(line);
+      }
+
+      M5Cardputer.Display.println();
+      M5Cardputer.Display.println("ESC=Back  L=Select  H=Prev");
+    }
+
+    M5Cardputer.update();
+    if(!M5Cardputer.Keyboard.isPressed()) {
+      delay(30);
+      continue;
+    }
+
+    Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+
+    bool handled = false;
+
+    if(keys_state_contains_escape(status)) {
+      wait_for_keyboard_release();
+      running = false;
+      handled = true;
+    }
+
+    if(!handled) {
+      for(auto key : status.word) {
+        switch(key) {
+          case ';':
+          case ',':
+          case 'k':
+          case 'K':
+          case 'w':
+          case 'W':
+            selection--;
+            if(selection < 0) {
+              selection = 0;
+            }
+            redraw = true;
+            handled = true;
+            break;
+          case '.':
+          case 'j':
+          case 'J':
+          case 's':
+          case 'S': {
+            const int max_index = 2 + static_cast<int>(bt.devices().size()) - 1;
+            if(selection < max_index) {
+              selection++;
+            }
+            redraw = true;
+            handled = true;
+            break;
+          }
+          case 'h':
+          case 'H': {
+            if(selection == 0) {
+              if(bt.isScanning()) {
+                bt.stopScan();
+              } else {
+                bt.startScan();
+              }
+              redraw = true;
+            } else if(selection == 1) {
+              bt.disconnectAll();
+              redraw = true;
+            } else {
+              size_t index = static_cast<size_t>(selection - 2);
+              if(index < bt.devices().size()) {
+                // No special action for left input on device rows
+              }
+            }
+            handled = true;
+            break;
+          }
+          case 'l':
+          case 'L':
+            handled = true;
+            if(selection == 0) {
+              if(bt.isScanning()) {
+                bt.stopScan();
+              } else {
+                bt.startScan();
+              }
+              redraw = true;
+            } else if(selection == 1) {
+              bt.disconnectAll();
+              redraw = true;
+            } else {
+              size_t index = static_cast<size_t>(selection - 2);
+              if(index < bt.devices().size()) {
+                bt.connectDevice(index);
+                redraw = true;
+              }
+            }
+            break;
+          default:
+            break;
+        }
+        if(handled) {
+          break;
+        }
+      }
+    }
+
+    if(status.enter && !handled) {
+      if(selection == 0) {
+        bt.isScanning() ? bt.stopScan() : bt.startScan();
+      } else if(selection == 1) {
+        bt.disconnectAll();
+      } else {
+        size_t index = static_cast<size_t>(selection - 2);
+        if(index < bt.devices().size()) {
+          bt.connectDevice(index);
+        }
+      }
+      redraw = true;
+      handled = true;
+    }
+
+    if(handled) {
+      delay(160);
+      wait_for_keyboard_release();
+    }
+  }
 }
 
 static void show_home_menu() {
@@ -5293,6 +5636,10 @@ void setup() {
   // Speaker initialisation handled in audioSetup().
 #endif
 
+  BluetoothManager::instance().setKeyboardCallback([](uint8_t keycode, bool pressed) {
+    ExternalInput::instance().setKeyState(keycode, pressed);
+  });
+
   // Set display rotation to horizontal.
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.initDMA();
@@ -5751,7 +6098,7 @@ void setup() {
 #if ENABLE_LCD
   if(g_psram_available) {
     if(!swap_fb_enabled) {
-      const size_t swap_bytes = DEST_H * LCD_WIDTH * sizeof(uint16_t);
+  const size_t swap_bytes = DEST_H * DEST_W * sizeof(uint16_t);
       static constexpr uint32_t swap_caps_psram[] = {
         MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
@@ -5991,7 +6338,7 @@ void setup() {
   // Clear the display of any printed text before starting emulation.
   M5Cardputer.Display.clearDisplay();
   if(swap_fb_enabled && swap_fb != nullptr) {
-    memset(swap_fb, 0xFF, DEST_H * LCD_WIDTH * sizeof(uint16_t));
+  memset(swap_fb, 0xFF, DEST_H * DEST_W * sizeof(uint16_t));
     display_cache_valid = false;
     memset(swap_row_hash, 0, sizeof(swap_row_hash));
   }
