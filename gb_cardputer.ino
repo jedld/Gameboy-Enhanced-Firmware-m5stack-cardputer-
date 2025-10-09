@@ -288,6 +288,45 @@ static FirmwareSettings g_settings = {
     static_cast<uint8_t>('2')
   }
 };
+
+static constexpr size_t SAVE_STATE_SLOT_COUNT = 4;
+static constexpr uint32_t SAVE_STATE_MESSAGE_DURATION_MS = 2200;
+
+enum class StatusMessageKind : uint8_t {
+  Info = 0,
+  Success,
+  Error
+};
+
+struct SaveStateSlot {
+  bool valid;
+  uint64_t timestamp_us;
+  struct gb_s core_state;
+  uint8_t *wram;
+  uint8_t *vram;
+  uint8_t *oam;
+  uint8_t *hram_io;
+  uint8_t *cart_ram;
+  size_t cart_ram_size;
+
+  SaveStateSlot()
+      : valid(false),
+        timestamp_us(0),
+        core_state({}),
+        wram(nullptr),
+        vram(nullptr),
+        oam(nullptr),
+        hram_io(nullptr),
+        cart_ram(nullptr),
+        cart_ram_size(0) {}
+};
+
+static char g_status_message[64] = {0};
+static bool g_status_message_active = false;
+static uint32_t g_status_message_expiry_ms = 0;
+static uint16_t g_status_message_fg = 0xFFFF;
+static uint16_t g_status_message_bg = 0x0000;
+static uint16_t g_save_state_hotkey_mask = 0;
 static bool g_psram_available = false;
 static bool g_sd_mounted = false;
 static bool g_spi2_initialised = false;
@@ -313,6 +352,20 @@ static bool save_mbc7_eeprom_to_sd(const struct priv_t *priv, const struct gb_s 
 static void handle_volume_keys(const Keyboard_Class::KeysState &status);
 static void adjust_master_volume(int delta, bool persist, bool announce);
 static void configure_performance_profile();
+static const char *save_state_slot_label(size_t index);
+static void save_state_free_slot(SaveStateSlot &slot);
+static void save_state_clear_all(struct priv_t *priv);
+static uint8_t *save_state_alloc_buffer(size_t bytes, const char *label);
+static bool ensure_save_state_core_buffers(SaveStateSlot &slot);
+static bool ensure_save_state_buffers(SaveStateSlot &slot, size_t cart_ram_size);
+static void show_status_message(const char *message, StatusMessageKind kind);
+static void render_status_message_overlay();
+static bool save_state_store_slot(size_t slot_index);
+static bool save_state_load_slot(size_t slot_index);
+static int save_state_slot_from_key(char key);
+static bool handle_save_state_shortcuts(const Keyboard_Class::KeysState &status);
+static void gb_printer_serial_tx(struct gb_s *gb, const uint8_t tx);
+static enum gb_serial_rx_ret_e gb_printer_serial_rx(struct gb_s *gb, uint8_t *rx);
 
 #if ENABLE_SOUND
 static void apply_speaker_volume();
@@ -773,6 +826,7 @@ struct priv_t
   char mbc7_save_path[MAX_PATH_LEN];
   bool mbc7_save_path_valid;
   bool mbc7_save_write_failed;
+  SaveStateSlot save_slots[SAVE_STATE_SLOT_COUNT];
   char sd_rom_path[MAX_PATH_LEN];
   bool sd_rom_path_valid;
 };
@@ -1252,8 +1306,388 @@ struct GameBoyPrinterState {
 
 static GameBoyPrinterState g_printer;
 
-static void gb_printer_serial_tx(struct gb_s *gb, const uint8_t tx);
-static enum gb_serial_rx_ret_e gb_printer_serial_rx(struct gb_s *gb, uint8_t *rx);
+static const char *save_state_slot_label(size_t index) {
+  static const char *const labels[SAVE_STATE_SLOT_COUNT] = {
+    "Slot 1",
+    "Slot 2",
+    "Slot 3",
+    "Slot 4"
+  };
+  if(index >= SAVE_STATE_SLOT_COUNT) {
+    return "Slot";
+  }
+  return labels[index];
+}
+
+static void save_state_free_slot(SaveStateSlot &slot) {
+  if(slot.wram != nullptr) {
+    heap_caps_free(slot.wram);
+    slot.wram = nullptr;
+  }
+  if(slot.vram != nullptr) {
+    heap_caps_free(slot.vram);
+    slot.vram = nullptr;
+  }
+  if(slot.oam != nullptr) {
+    heap_caps_free(slot.oam);
+    slot.oam = nullptr;
+  }
+  if(slot.hram_io != nullptr) {
+    heap_caps_free(slot.hram_io);
+    slot.hram_io = nullptr;
+  }
+  if(slot.cart_ram != nullptr) {
+    heap_caps_free(slot.cart_ram);
+    slot.cart_ram = nullptr;
+  }
+  slot.cart_ram_size = 0;
+  slot.valid = false;
+  slot.timestamp_us = 0;
+  memset(&slot.core_state, 0, sizeof(slot.core_state));
+}
+
+static void save_state_clear_all(struct priv_t *priv) {
+  if(priv == nullptr) {
+    return;
+  }
+  for(size_t i = 0; i < SAVE_STATE_SLOT_COUNT; ++i) {
+    save_state_free_slot(priv->save_slots[i]);
+  }
+}
+
+static uint8_t *save_state_alloc_buffer(size_t bytes, const char *label) {
+  uint8_t *ptr = (uint8_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if(ptr == nullptr) {
+    ptr = (uint8_t *)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+  }
+  if(ptr == nullptr) {
+    Serial.printf("Save state allocation failed for %s (%u bytes)\n",
+                  label != nullptr ? label : "buffer",
+                  static_cast<unsigned>(bytes));
+  }
+  return ptr;
+}
+
+static bool ensure_save_state_core_buffers(SaveStateSlot &slot) {
+  if(slot.wram == nullptr) {
+    slot.wram = save_state_alloc_buffer(WRAM_TOTAL_SIZE, "WRAM snapshot");
+    if(slot.wram == nullptr) {
+      return false;
+    }
+  }
+  if(slot.vram == nullptr) {
+    slot.vram = save_state_alloc_buffer(VRAM_TOTAL_SIZE, "VRAM snapshot");
+    if(slot.vram == nullptr) {
+      return false;
+    }
+  }
+  if(slot.oam == nullptr) {
+    slot.oam = save_state_alloc_buffer(OAM_SIZE, "OAM snapshot");
+    if(slot.oam == nullptr) {
+      return false;
+    }
+  }
+  if(slot.hram_io == nullptr) {
+    slot.hram_io = save_state_alloc_buffer(HRAM_IO_SIZE, "HRAM snapshot");
+    if(slot.hram_io == nullptr) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool ensure_save_state_buffers(SaveStateSlot &slot, size_t cart_ram_size) {
+  if(!ensure_save_state_core_buffers(slot)) {
+    return false;
+  }
+
+  if(cart_ram_size == 0) {
+    if(slot.cart_ram != nullptr) {
+      heap_caps_free(slot.cart_ram);
+      slot.cart_ram = nullptr;
+    }
+    slot.cart_ram_size = 0;
+    return true;
+  }
+
+  if(slot.cart_ram != nullptr && slot.cart_ram_size == cart_ram_size) {
+    return true;
+  }
+
+  if(slot.cart_ram != nullptr) {
+    heap_caps_free(slot.cart_ram);
+    slot.cart_ram = nullptr;
+  }
+
+  slot.cart_ram = save_state_alloc_buffer(cart_ram_size, "cart RAM snapshot");
+  if(slot.cart_ram == nullptr) {
+    slot.cart_ram_size = 0;
+    return false;
+  }
+  slot.cart_ram_size = cart_ram_size;
+  return true;
+}
+
+static void show_status_message(const char *message, StatusMessageKind kind) {
+  if(message == nullptr || message[0] == '\0') {
+    g_status_message_active = false;
+    g_status_message[0] = '\0';
+    return;
+  }
+
+  strncpy(g_status_message, message, sizeof(g_status_message) - 1);
+  g_status_message[sizeof(g_status_message) - 1] = '\0';
+
+  switch(kind) {
+    case StatusMessageKind::Success:
+      g_status_message_bg = rgb888_to_rgb565(0x228B22); // forest green
+      g_status_message_fg = 0xFFFF;
+      break;
+    case StatusMessageKind::Error:
+      g_status_message_bg = rgb888_to_rgb565(0xB22222); // firebrick red
+      g_status_message_fg = 0xFFFF;
+      break;
+    default:
+      g_status_message_bg = rgb888_to_rgb565(0x303030);
+      g_status_message_fg = 0xFFFF;
+      break;
+  }
+
+  g_status_message_expiry_ms = millis() + SAVE_STATE_MESSAGE_DURATION_MS;
+  g_status_message_active = true;
+}
+
+static void render_status_message_overlay() {
+  if(!g_status_message_active) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if(static_cast<int32_t>(now - g_status_message_expiry_ms) >= 0) {
+    g_status_message_active = false;
+    return;
+  }
+
+  if(M5Cardputer.Display.dmaBusy()) {
+    M5Cardputer.Display.waitDMA();
+  }
+
+  const int16_t padding_x = 8;
+  const int16_t padding_y = 4;
+  const int16_t max_width = DEST_W - 12;
+
+  M5Cardputer.Display.setTextFont(1);
+  M5Cardputer.Display.setTextSize(1);
+  M5Cardputer.Display.setTextColor(g_status_message_fg, g_status_message_bg);
+
+  int16_t text_width = M5Cardputer.Display.textWidth(g_status_message);
+  if(text_width < 0) {
+    text_width = 0;
+  }
+  int16_t text_height = M5Cardputer.Display.fontHeight();
+  if(text_height <= 0) {
+    text_height = 8;
+  }
+
+  int16_t box_width = text_width + padding_x * 2;
+  if(box_width > max_width) {
+    box_width = max_width;
+  }
+
+  int16_t box_height = text_height + padding_y * 2;
+  if(box_height < 20) {
+    box_height = 20;
+  }
+
+  const int16_t box_x = (DEST_W - box_width) / 2;
+  const int16_t box_y = 6;
+
+  M5Cardputer.Display.fillRoundRect(box_x, box_y, box_width, box_height, 6, g_status_message_bg);
+  const int16_t text_x = box_x + padding_x;
+  int16_t inner_height = box_height - padding_y * 2;
+  if(inner_height < text_height) {
+    inner_height = text_height;
+  }
+  const int16_t text_y = box_y + padding_y + ((inner_height - text_height) / 2);
+  M5Cardputer.Display.drawString(g_status_message, text_x, text_y);
+}
+
+static bool save_state_store_slot(size_t slot_index) {
+  if(slot_index >= SAVE_STATE_SLOT_COUNT) {
+    return false;
+  }
+
+  if(priv.rom_source == RomSource::None) {
+    show_status_message("Save failed: no game", StatusMessageKind::Error);
+    return false;
+  }
+
+  if(gb.wram == nullptr || gb.vram == nullptr || gb.oam == nullptr || gb.hram_io == nullptr) {
+    show_status_message("Save failed: buffers not ready", StatusMessageKind::Error);
+    return false;
+  }
+
+  if(priv.cart_ram_size > 0 && priv.cart_ram == nullptr) {
+    show_status_message("Save failed: cart RAM missing", StatusMessageKind::Error);
+    return false;
+  }
+
+  SaveStateSlot &slot = priv.save_slots[slot_index];
+
+  if(!ensure_save_state_buffers(slot, priv.cart_ram_size)) {
+    show_status_message("Save failed: out of memory", StatusMessageKind::Error);
+    return false;
+  }
+
+  memcpy(&slot.core_state, &gb, sizeof(gb));
+  memcpy(slot.wram, gb.wram, WRAM_TOTAL_SIZE);
+  memcpy(slot.vram, gb.vram, VRAM_TOTAL_SIZE);
+  memcpy(slot.oam, gb.oam, OAM_SIZE);
+  memcpy(slot.hram_io, gb.hram_io, HRAM_IO_SIZE);
+
+  if(priv.cart_ram != nullptr && priv.cart_ram_size > 0 && slot.cart_ram != nullptr) {
+    memcpy(slot.cart_ram, priv.cart_ram, priv.cart_ram_size);
+  }
+
+  slot.timestamp_us = micros64();
+  slot.valid = true;
+
+  char message[48];
+  snprintf(message, sizeof(message), "%s saved", save_state_slot_label(slot_index));
+  show_status_message(message, StatusMessageKind::Success);
+  return true;
+}
+
+static bool save_state_load_slot(size_t slot_index) {
+  if(slot_index >= SAVE_STATE_SLOT_COUNT) {
+    return false;
+  }
+
+  SaveStateSlot &slot = priv.save_slots[slot_index];
+  if(!slot.valid) {
+    char empty_msg[48];
+    snprintf(empty_msg, sizeof(empty_msg), "%s empty", save_state_slot_label(slot_index));
+    show_status_message(empty_msg, StatusMessageKind::Info);
+    return false;
+  }
+
+  if(gb.wram == nullptr || gb.vram == nullptr || gb.oam == nullptr || gb.hram_io == nullptr) {
+    show_status_message("Load failed: buffers not ready", StatusMessageKind::Error);
+    return false;
+  }
+
+  if(slot.cart_ram_size != priv.cart_ram_size) {
+    if(!(slot.cart_ram_size == 0 && priv.cart_ram_size == 0)) {
+      show_status_message("Load failed: incompatible cart RAM", StatusMessageKind::Error);
+      return false;
+    }
+  }
+
+  if(slot.cart_ram_size > 0 && slot.cart_ram == nullptr) {
+    show_status_message("Load failed: slot missing cart RAM", StatusMessageKind::Error);
+    return false;
+  }
+
+  if(slot.cart_ram_size > 0 && (priv.cart_ram == nullptr || priv.cart_ram_size == 0)) {
+    show_status_message("Load failed: cart RAM unavailable", StatusMessageKind::Error);
+    return false;
+  }
+
+  memcpy(&gb, &slot.core_state, sizeof(gb));
+  gb.gb_rom_read = &gb_rom_read;
+  gb.gb_cart_ram_read = &gb_cart_ram_read;
+  gb.gb_cart_ram_write = &gb_cart_ram_write;
+  gb.gb_error = &gb_error;
+  gb.gb_serial_tx = &gb_printer_serial_tx;
+  gb.gb_serial_rx = &gb_printer_serial_rx;
+  gb.direct.priv = &priv;
+
+#if ENABLE_MBC7
+  if(gb.mbc == 7) {
+    gb.mbc7_accel_read = mbc7_cardputer_accel_read;
+  }
+#endif
+
+  memcpy(gb.wram, slot.wram, WRAM_TOTAL_SIZE);
+  memcpy(gb.vram, slot.vram, VRAM_TOTAL_SIZE);
+  memcpy(gb.oam, slot.oam, OAM_SIZE);
+  memcpy(gb.hram_io, slot.hram_io, HRAM_IO_SIZE);
+
+  if(priv.cart_ram != nullptr && priv.cart_ram_size > 0 && slot.cart_ram != nullptr) {
+    memcpy(priv.cart_ram, slot.cart_ram, priv.cart_ram_size);
+    priv.cart_ram_dirty = true;
+    priv.cart_ram_loaded = true;
+    priv.cart_ram_last_flush_ms = millis();
+  }
+
+  gb.direct.joypad = 0xFF;
+
+  display_cache_valid = false;
+  memset(priv.framebuffer_row_dirty[0], 1, sizeof(priv.framebuffer_row_dirty[0]));
+  if(!priv.single_buffer_mode) {
+    memset(priv.framebuffer_row_dirty[1], 1, sizeof(priv.framebuffer_row_dirty[1]));
+  }
+  if(swap_fb_enabled) {
+    memset(swap_row_hash, 0, sizeof(swap_row_hash));
+  }
+
+  char message[48];
+  snprintf(message, sizeof(message), "%s loaded", save_state_slot_label(slot_index));
+  show_status_message(message, StatusMessageKind::Success);
+  return true;
+}
+
+static int save_state_slot_from_key(char key) {
+  switch(key) {
+    case '1':
+    case '!':
+      return 0;
+    case '2':
+    case '@':
+      return 1;
+    case '3':
+    case '#':
+      return 2;
+    case '4':
+    case '$':
+      return 3;
+    default:
+      break;
+  }
+  return -1;
+}
+
+static bool handle_save_state_shortcuts(const Keyboard_Class::KeysState &status) {
+  if(!status.fn) {
+    g_save_state_hotkey_mask = 0;
+    return false;
+  }
+
+  uint16_t current_mask = 0;
+  bool handled = false;
+  const bool load_mode = status.shift || status.ctrl || status.alt || status.opt;
+
+  for(char key : status.word) {
+    const int slot = save_state_slot_from_key(key);
+    if(slot < 0) {
+      continue;
+    }
+    const uint16_t bit = static_cast<uint16_t>(1u << slot);
+    current_mask |= bit;
+    if((g_save_state_hotkey_mask & bit) != 0) {
+      continue;
+    }
+    if(load_mode) {
+      save_state_load_slot(static_cast<size_t>(slot));
+    } else {
+      save_state_store_slot(static_cast<size_t>(slot));
+    }
+    handled = true;
+  }
+
+  g_save_state_hotkey_mask = current_mask;
+  return handled;
+}
 
 static void apply_default_button_mapping() {
   memcpy(g_settings.button_mapping,
@@ -1461,6 +1895,8 @@ static void reset_save_state(struct priv_t *priv) {
   if(priv == nullptr) {
     return;
   }
+
+  save_state_clear_all(priv);
 
   priv->cart_ram_size = 0;
   priv->cart_ram_dirty = false;
@@ -1939,6 +2375,7 @@ static void poll_keyboard() {
   M5Cardputer.update();
   Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
   handle_volume_keys(status);
+  handle_save_state_shortcuts(status);
   const bool local_keyboard_pressed = M5Cardputer.Keyboard.isPressed();
 
 #if ENABLE_BLUETOOTH_CONTROLLERS
@@ -1992,6 +2429,21 @@ static void poll_keyboard() {
 
   if(local_keyboard_pressed) {
     for(auto key : status.word) {
+      if(status.fn) {
+        switch(key) {
+          case '1':
+          case '2':
+          case '3':
+          case '4':
+          case '!':
+          case '@':
+          case '#':
+          case '$':
+            continue;
+          default:
+            break;
+        }
+      }
       handle_key(key);
     }
   }
@@ -2000,7 +2452,10 @@ static void poll_keyboard() {
   ExternalInput::instance().apply([&](uint8_t keycode) {
     char translated = hid_keycode_to_ascii(keycode);
     if(translated != 0) {
-      handle_key(translated);
+      if(!(status.fn && (translated == '1' || translated == '2' ||
+                         translated == '3' || translated == '4'))) {
+        handle_key(translated);
+      }
     }
   });
 #endif
@@ -3770,14 +4225,16 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
       display_cache_valid = true;
     }
 
-    if(row_dirty != nullptr) {
-      memset(row_dirty, 0, LCD_HEIGHT * sizeof(uint8_t));
-    }
+  if(row_dirty != nullptr) {
+    memset(row_dirty, 0, LCD_HEIGHT * sizeof(uint8_t));
+  }
 
 #if ENABLE_PROFILING
-    profiler_add_render_sample(micros64() - render_start, rows_written, segments_flushed);
+  profiler_add_render_sample(micros64() - render_start, rows_written, segments_flushed);
 #endif
-    return;
+
+  render_status_message_overlay();
+  return;
   }
 
   unsigned int segment_start = 0;
@@ -3862,6 +4319,8 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
 #if ENABLE_PROFILING
   profiler_add_render_sample(micros64() - render_start, rows_written, segments_flushed);
 #endif
+
+  render_status_message_overlay();
 }
 
 // Draw a frame to the display without scaling.
@@ -3892,6 +4351,8 @@ void draw_frame(const uint16_t *fb) {
   }
   M5Cardputer.Display.waitDMA();
   M5Cardputer.Display.endWrite();
+
+  render_status_message_overlay();
 }
 
 static void renderTask(void *param) {

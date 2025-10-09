@@ -12,7 +12,14 @@ This is a resource I have created to help other developers learn and develop qua
 
 Updates are more frequent on m5burner than github, but I'm trying to drop a binary here now and then.
 
-Gameboy Emulator; complete with audio, configurable controls, display and performance options, savegames, save states, filesystem navigation and no .gb rom file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. DMG titles automatically receive authentic Game Boy Color colourisation, including the original boot-time button combos for palette selection. The Options menu also exposes a stretch-to-width toggle if you prefer filling the Cardputer display over pillarboxed output.
+Gameboy Emulator; complete with audio, configurable controls, display and performance options, savegames, save states, filesystem navigation and no .gb ROM file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. DMG titles automatically receive authentic Game Boy Color colourisation, including the original boot-time button combos for palette selection. The Options menu also exposes a stretch-to-width toggle if you prefer filling the Cardputer display over pillarboxed output. A four-slot quick save-state system with on-screen feedback lets you checkpoint and recover progress without leaving the emulator loop.
+
+### Quick save states & status overlay
+
+* Hold `Fn` and tap `1`–`4` to capture a snapshot into the matching slot.
+* Hold `Fn` alongside any modifier (`Shift`, `Ctrl`, `Alt` or `Opt`) and tap `1`–`4` to instantly load that slot.
+* Each action confirms with a colour-coded banner (green = saved, grey = empty slot, red = failure) rendered directly over the gameplay framebuffer.
+* Slots are per-session and reset when you change cartridges or reboot; battery-backed saves continue to flush automatically in the background.
 
 ## Compiling the firmware for the M5Stack Cardputer
 
@@ -281,6 +288,11 @@ sound as the next game starts. This is just left over audio buffer info from the
 * Added Solar Striker SGB & AP support
 * Added Missle Command/Asteroids SGB and AP support w/ border
 * Added Space Invaders SGB & SP support w/ Border
+
+10.10.2025:Cardputer port
+* Added four quick save-state slots with Fn hotkeys and modifier-based loading.
+* Added an in-game status message overlay for save/load feedback and other system notices.
+* Save-state buffers now auto-dispose when switching ROMs to reclaim PSRAM instantly.
 
 01.10.2025:Cardputer port
 * Automatically detects Game Boy Color compatible ROMs on the Cardputer port and enables colour palettes based on the ROM header hash.
