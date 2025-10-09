@@ -1,5 +1,8 @@
-// Sound isn't done yet
-// (or might never be)
+# 1 "/tmp/tmp8govw193"
+#include <Arduino.h>
+# 1 "/home/jedld/workspace/Gameboy-Enhanced-Firmware-m5stack-cardputer-/gb_cardputer.ino"
+
+
 #define ENABLE_SOUND 1
 #define ENABLE_LCD 1
 #define ENABLE_PROFILING 1
@@ -112,7 +115,7 @@ static constexpr uint32_t AUDIO_TASK_STACK_SIZE = 2048;
 
 #define DISPLAY_CENTER(x) x + (DEST_W/2 - LCD_WIDTH/2)
 
-// ROM streaming helpers.
+
 static constexpr size_t ROM_STREAM_BLOCK_SIZE = 0x1000;
 static constexpr size_t ROM_CACHE_BANK_MAX = 24;
 static constexpr size_t ROM_CACHE_BANK_LIMIT_NO_PSRAM = 9;
@@ -138,9 +141,9 @@ static const size_t DEFAULT_GBC_PALETTE_INDEX = 0;
 
 static constexpr size_t JOYPAD_BUTTON_COUNT = 8;
 
-// Second framebuffer cache used to avoid redrawing unchanged rows when PSRAM
-// is available. Some rendering decisions (adaptive interlacing) depend on
-// whether this cache is active.
+
+
+
 static uint16_t *swap_fb = nullptr;
 static bool swap_fb_enabled = false;
 static bool swap_fb_dma_capable = false;
@@ -340,7 +343,7 @@ static inline void updateAdaptiveFrameSkip(struct gb_s *gb, bool over_budget) {
   const uint8_t min_active_frames_target = fallback_mode ? FRAME_SKIP_MIN_ACTIVE_FRAMES_FALLBACK
                                                          : FRAME_SKIP_MIN_ACTIVE_FRAMES_DEFAULT;
 
-  // Lazily initialise tunable parameters if the core hasn't set them yet.
+
   if(state.hold_frames == 0) {
     state.hold_frames = hold_frames_target;
   }
@@ -425,9 +428,9 @@ static inline void updateAdaptiveFrameSkip(struct gb_s *gb, bool over_budget) {
     gb->direct.interlace = interlace.active ? 1 : 0;
 
     if(interlace.active) {
-      // Delay enabling frame skip until interlacing alone fails to recover.
+
       if(state.over_budget_streak > enable_streak * 2) {
-        interlace.over_budget_streak = INTERLACE_ENABLE_STREAK; // keep active but allow skip logic
+        interlace.over_budget_streak = INTERLACE_ENABLE_STREAK;
       } else {
         over_budget = false;
       }
@@ -473,7 +476,7 @@ static inline void updateAdaptiveFrameSkip(struct gb_s *gb, bool over_budget) {
 static inline void apply_frame_skip_policy(struct gb_s *gb, bool over_budget) {
   FrameSkipMode mode = static_cast<FrameSkipMode>(g_settings.frame_skip_mode);
 
-  // Always run adaptive logic to maintain interlace and internal state.
+
   updateAdaptiveFrameSkip(gb, over_budget);
 
   auto &state = gb->display.frame_skip_state;
@@ -505,7 +508,61 @@ static inline void apply_frame_skip_policy(struct gb_s *gb, bool over_budget) {
       return;
   }
 }
-
+static size_t rom_cache_preferred_bank_limit();
+static size_t rom_cache_preferred_block_size();
+void debugPrint(const char* str);
+static bool build_save_path_for_rom(const char *rom_path,
+                                    const char *extension,
+                                    char *out,
+                                    size_t out_len);
+static bool load_mbc7_eeprom_from_sd(struct priv_t *, struct gb_s *);
+static bool save_mbc7_eeprom_to_sd(const struct priv_t *, const struct gb_s *);
+uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr);
+uint8_t gb_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr);
+void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr,
+         const uint8_t val);
+static bool rom_cache_prepare_buffers(RomCache *cache);
+static bool rom_cache_trim_banks(RomCache *cache, size_t new_count);
+static bool rom_cache_fill_bank(RomCache *cache, RomCacheBank *slot, uint32_t bank);
+static bool load_embedded_rom(struct priv_t *priv, const EmbeddedRomEntry *entry);
+static void palette_apply_gbc_index(PaletteState *palette,
+                                    size_t index,
+                                    bool auto_selected,
+                                    bool combo_selected);
+static void palette_disable_overrides(PaletteState *palette);
+static bool palette_map_combo(uint8_t direction,
+                              bool button_a,
+                              bool button_b,
+                              size_t *index_out);
+void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t val);
+void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160],
+     const uint_fast8_t line);
+void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty);
+void draw_frame(const uint16_t *fb);
+static void renderTask(void *param);
+static void audioTask(void *param);
+static void profiler_reset_main(uint64_t now);
+static void profiler_log(uint64_t now);
+void set_font_size(int size);
+static bool is_escape_key_char(char key);
+static String format_binding_label(uint8_t key);
+static void adjust_frame_skip_mode(int delta);
+static bool has_rom_extension(const String &file_name);
+static bool try_display_box_art(const String &rom_path, int x, int y, int max_width, int max_height);
+char* file_picker();
+static void audio_reset_buffers();
+static uint32_t audio_select_sample_rate();
+static void audioCoreInit(uint32_t sample_rate);
+static void audioTeardown();
+static void audio_release_finished();
+static int audio_acquire_buffer();
+static void audio_queue_push(size_t idx);
+static bool gb_run_frame_watchdog(struct gb_s *gb,
+                                  uint32_t max_steps,
+                                  uint32_t *steps_executed);
+void setup();
+void loop();
+#line 509 "/home/jedld/workspace/Gameboy-Enhanced-Firmware-m5stack-cardputer-/gb_cardputer.ino"
 static size_t rom_cache_preferred_bank_limit() {
   return g_psram_available ? ROM_CACHE_BANK_MAX : ROM_CACHE_BANK_LIMIT_NO_PSRAM;
 }
@@ -594,7 +651,7 @@ static void audioPump();
 static size_t audio_queue_count = 0;
 #endif
 
-// SD card SPI class.
+
 SPIClass SPI2;
 
 static bool ensure_sd_card(bool blocking) {
@@ -633,7 +690,7 @@ static bool ensure_sd_card(bool blocking) {
   }
 }
 
-// Prints debug info to the display.
+
 void debugPrint(const char* str) {
   M5Cardputer.Display.clearDisplay();
   M5Cardputer.Display.drawString(str, 0, 0);
@@ -710,27 +767,27 @@ static inline uint16_t rgb888_to_gb555(uint32_t colour) {
 
 static inline uint32_t framebuffer_hash_step(uint32_t hash, uint16_t value) {
   hash ^= value;
-  hash *= 16777619u; // FNV-1a prime
+  hash *= 16777619u;
   return hash;
 }
 
-// Penaut-GB structures and functions.
+
 struct priv_t
 {
   RomCache rom_cache;
-  /* Pointer to allocated memory holding save file. */
+
   uint8_t *cart_ram;
   PaletteState palette;
   RomSource rom_source;
   const EmbeddedRomEntry *embedded_rom_entry;
   const uint8_t *embedded_rom;
   size_t embedded_rom_size;
-  
+
   bool rom_is_cgb;
   bool rom_is_cgb_only;
   uint8_t rom_cgb_flag;
 
-  /* Frame buffers stored dynamically */
+
   uint16_t *framebuffers[2];
   uint32_t framebuffer_row_hash[2][LCD_HEIGHT];
   uint8_t framebuffer_row_dirty[2][LCD_HEIGHT];
@@ -973,23 +1030,23 @@ struct GameBoyPrinterState {
 
   void processPacket() {
     switch(command) {
-      case 0x00: // Initialise
+      case 0x00:
         image_data.clear();
         status_lo = 0x00;
         status_hi = 0x00;
         busy = false;
         break;
-      case 0x01: // Status request
-        // Nothing additional required; status will be queued by queueStatusAck().
+      case 0x01:
+
         break;
-      case 0x02: // Data
+      case 0x02:
         handleDataPacket();
         break;
-      case 0x04: // Print
+      case 0x04:
         handlePrintPacket();
         break;
       default:
-        // Unsupported command; ignore but keep protocol alive.
+
         break;
     }
   }
@@ -1178,7 +1235,7 @@ struct GameBoyPrinterState {
     } info_header;
 
     const uint32_t headers_size = sizeof(file_header) + sizeof(info_header);
-    file_header.type = 0x4D42; // 'BM'
+    file_header.type = 0x4D42;
     file_header.size = headers_size + static_cast<uint32_t>(bmp_buffer.size());
     file_header.reserved1 = 0;
     file_header.reserved2 = 0;
@@ -1972,59 +2029,59 @@ static inline uint8_t rom_source_read_byte(const struct priv_t *priv, uint32_t a
   return 0xFF;
 }
 
-/**
- * Returns a byte from the ROM file at the given address.
- */
+
+
+
 uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr)
 {
   struct priv_t * const p = (struct priv_t *)gb->direct.priv;
   return rom_source_read_byte(p, addr);
 }
 
-/**
- * Returns a byte from the cartridge RAM at the given address.
- */
+
+
+
 uint8_t gb_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr)
 {
   const struct priv_t * const p = (const struct priv_t *)gb->direct.priv;
-  
+
 #if ENABLE_MBC7
-  // MBC7 uses internal EEPROM (gb->mbc7.eeprom.data), not cart_ram
+
   if(gb->mbc == 7) {
     if(addr < 256) {
-      // Read from MBC7 EEPROM (stored as 16-bit words, addr is byte index)
+
       uint16_t word_index = addr / 2;
       if(word_index < 128) {
         if(addr & 1) {
-          return (gb->mbc7.eeprom.data[word_index] >> 8) & 0xFF;  // High byte
+          return (gb->mbc7.eeprom.data[word_index] >> 8) & 0xFF;
         } else {
-          return gb->mbc7.eeprom.data[word_index] & 0xFF;  // Low byte
+          return gb->mbc7.eeprom.data[word_index] & 0xFF;
         }
       }
     }
     return 0xFF;
   }
 #endif
-  
+
   if(p->cart_ram == nullptr || addr >= p->cart_ram_size) {
     return 0xFF;
   }
   return p->cart_ram[addr];
 }
 
-/**
- * Writes a given byte to the cartridge RAM at the given address.
- */
+
+
+
 void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr,
-		       const uint8_t val)
+         const uint8_t val)
 {
   struct priv_t * const p = (struct priv_t *)gb->direct.priv;
-  
+
 #if ENABLE_MBC7
-  // MBC7 uses internal EEPROM (gb->mbc7.eeprom.data), not cart_ram
+
   if(gb->mbc == 7) {
     if(addr < 256) {
-      // Write to MBC7 EEPROM (stored as 16-bit words, addr is byte index)
+
       uint16_t word_index = addr / 2;
       if(word_index < 128) {
         if(addr & 1) {
@@ -2039,7 +2096,7 @@ void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr,
     return;
   }
 #endif
-  
+
   if(p->cart_ram == nullptr || addr >= p->cart_ram_size) {
     return;
   }
@@ -2067,9 +2124,9 @@ static enum gb_serial_rx_ret_e gb_printer_serial_rx(struct gb_s *gb, uint8_t *rx
   return GB_SERIAL_RX_SUCCESS;
 }
 
-/**
- * Returns a pointer to the allocated space containing the ROM. Must be freed.
- */
+
+
+
 static uint8_t* rom_cache_alloc_block(size_t bytes, bool prefer_internal_first) {
   uint8_t *ptr = nullptr;
   if(prefer_internal_first) {
@@ -2509,7 +2566,7 @@ static bool rom_cache_open_memory(RomCache *cache, const uint8_t *data, size_t s
   cache->bank_count = 0;
   cache->bank_size = 0;
   rom_cache_update_geometry(cache);
-  cache->use_memory = false; // direct access, bypass rom_cache_read()
+  cache->use_memory = false;
   cache->memory_rom = data;
   cache->memory_size = size;
   cache->size = size;
@@ -2909,7 +2966,7 @@ static bool palette_map_combo(uint8_t direction,
     return false;
   }
 
-  // Holding both A and B does not map to a hardware palette.
+
   if(button_a && button_b) {
     return false;
   }
@@ -2988,7 +3045,7 @@ static bool palette_capture_boot_combo(size_t *out_index) {
   }
 
   const uint64_t start = micros64();
-  const uint64_t timeout = start + 700000; // 700 ms window
+  const uint64_t timeout = start + 700000;
 
   while(micros64() < timeout) {
     M5Cardputer.update();
@@ -3026,7 +3083,7 @@ static bool palette_capture_boot_combo(size_t *out_index) {
 
 static void palette_wait_for_boot_combo_release() {
   const uint64_t start = micros64();
-  const uint64_t timeout = start + 400000; // 400 ms grace period
+  const uint64_t timeout = start + 400000;
   while(micros64() < timeout) {
     M5Cardputer.update();
     if(!M5Cardputer.Keyboard.isPressed()) {
@@ -3066,7 +3123,7 @@ static size_t palette_lookup_auto_index(const struct priv_t *priv,
   }
 
   const size_t rom_size = rom_source_size(priv);
-  // Ensure the ROM is large enough to contain the required header fields.
+
   if(rom_size < 0x150) {
     return SIZE_MAX;
   }
@@ -3075,7 +3132,7 @@ static size_t palette_lookup_auto_index(const struct priv_t *priv,
     return rom_source_read_byte(priv, address);
   };
 
-  // Only apply bootstrap tables to Nintendo-licensed titles.
+
   const uint8_t old_license = read_rom(0x014B);
   bool nintendo_license = false;
   if(old_license == 0x33) {
@@ -3095,7 +3152,7 @@ static size_t palette_lookup_auto_index(const struct priv_t *priv,
     return SIZE_MAX;
   }
 
-  // Read the 16-byte internal title field.
+
   uint8_t title_bytes[16];
   bool has_meaningful_chars = false;
   for(size_t i = 0; i < 16; ++i) {
@@ -3243,9 +3300,9 @@ static void palette_configure_for_dmg(struct priv_t *priv) {
   }
 }
 
-/**
- * Ignore all errors.
- */
+
+
+
 void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t val) {
   const char* gb_err_str[GB_INVALID_MAX] = {
     "UNKNOWN",
@@ -3255,7 +3312,7 @@ void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t val)
     "HATL FOREVER"
   };
 
-	struct priv_t * priv = (struct priv_t *)gb->direct.priv;
+ struct priv_t * priv = (struct priv_t *)gb->direct.priv;
 
   if(priv->cart_ram != NULL) {
     free(priv->cart_ram);
@@ -3270,11 +3327,11 @@ void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t val)
 }
 
 #if ENABLE_LCD
-/**
- * Draws scanline into framebuffer - OPTIMIZED with RGB565 LUT
- */
+
+
+
 void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160],
-		   const uint_fast8_t line)
+     const uint_fast8_t line)
 {
   struct priv_t *priv = (priv_t*)gb->direct.priv;
 
@@ -3293,13 +3350,13 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160],
   if(row_hash != nullptr) {
     previous_hash = row_hash[line];
   }
-  uint32_t hash = 2166136261u; // FNV-1a offset basis
+  uint32_t hash = 2166136261u;
 
   if(gb->cgb.enabled) {
-    // CGB mode: unrolled batch conversion
+
     uint16_t *dst = active_fb + (line * LCD_WIDTH);
     uint32_t *cgb_line = gb->display.cgb_line;
-    
+
     for(unsigned int x = 0; x < LCD_WIDTH; x += 4) {
       uint16_t c0 = rgb888_to_rgb565(cgb_line[x]);
       uint16_t c1 = rgb888_to_rgb565(cgb_line[x+1]);
@@ -3323,19 +3380,19 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160],
     return;
   }
 
-  // DMG mode: use pre-computed RGB565 LUT (zero-cost conversion!)
+
   uint16_t *dst = active_fb + (line * LCD_WIDTH);
-  
+
 #if PEANUT_GB_12_COLOUR
   if(priv->palette.gbc_enabled) {
     const uint16_t *bg_lut = priv->palette.bg_rgb565;
     const uint16_t *obj0_lut = priv->palette.obj0_rgb565;
     const uint16_t *obj1_lut = priv->palette.obj1_rgb565;
-    
+
     for(unsigned int x = 0; x < LCD_WIDTH; x++) {
       const uint8_t p = pixels[x];
       const uint8_t pal_bits = (p & LCD_PALETTE_ALL) >> 4;
-      const uint16_t *lut = (pal_bits == 0) ? obj0_lut : 
+      const uint16_t *lut = (pal_bits == 0) ? obj0_lut :
                             (pal_bits == 1) ? obj1_lut : bg_lut;
       const uint16_t colour = lut[p & LCD_COLOUR];
       dst[x] = colour;
@@ -3351,7 +3408,7 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160],
   }
 #endif
 
-  // Simple DMG with LUT - unrolled loop
+
   const uint16_t *bg_lut = priv->palette.bg_rgb565;
   if(bg_lut == nullptr) {
     bg_lut = DMG_DEFAULT_PALETTE_RGB565;
@@ -3404,9 +3461,9 @@ static RenderProfiler profiler_consume_render_stats() {
 }
 #endif
 
-// Draw a frame to the display while scaling it to fit.
-// This is needed as the Cardputer's display has a height of 135px,
-// while the GameBoy's has a height of 144px.
+
+
+
 void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty) {
   if(fb == nullptr) {
     return;
@@ -3699,8 +3756,8 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
 #endif
 }
 
-// Draw a frame to the display without scaling.
-// Not normally called. Edit the code to use this function
+
+
 void draw_frame(const uint16_t *fb) {
   if(fb == nullptr) {
     return;
@@ -3887,22 +3944,7 @@ static void profiler_record_frame(uint64_t frame_us,
   }
 }
 #endif
-
-// Shorten ROM display names if they're too long.
-// Memory alloc with C strings is hard so this goes unused for now
-//char* clamp_str(char* input) {
-//  if(strlen(input) > 10) {
-//    char* output = (char*)malloc(sizeof(char)*4+sizeof(char)*strlen(input));
-//    for (int i = 0; i < 9; i++) {
-//      output[i] = input[i];
-//    }
-//    sprintf(output, "%s...", input);
-//    return output;
-//  } else {
-//    return input;
-//  }
-//}
-
+# 3906 "/home/jedld/workspace/Gameboy-Enhanced-Firmware-m5stack-cardputer-/gb_cardputer.ino"
 void set_font_size(int size) {
   const int height = M5Cardputer.Display.height();
   int textsize = height / size;
@@ -3914,9 +3956,9 @@ void set_font_size(int size) {
 
 static bool is_escape_key_char(char key) {
   switch(key) {
-    case 0x1B:  // ASCII escape
-    case '`':   // Cardputer ESC key reports backtick when unshifted
-    case '~':   // Shifted variant of the same key
+    case 0x1B:
+    case '`':
+    case '~':
       return true;
     default:
       return false;
@@ -3929,7 +3971,7 @@ static bool keys_state_contains_escape(const Keyboard_Class::KeysState &status) 
       return true;
     }
   }
-  // HID usage ID for Escape in USB keyboard scan code set
+
   for(uint8_t hid : status.hid_keys) {
     if(hid == 0x29) {
       return true;
@@ -4116,7 +4158,7 @@ static void show_keymap_menu() {
       }
     };
 
-    // Check for ESC key - return to previous menu (options menu)
+
     if(keys_state_contains_escape(status)) {
       wait_for_keyboard_release();
       done = true;
@@ -4438,7 +4480,7 @@ static void show_home_menu() {
 
     bool handled = false;
 
-    // Check for ESC key - in home menu, ESC doesn't do anything special (already at top level)
+
     if(keys_state_contains_escape(status)) {
       handled = true;
     } else {
@@ -4505,8 +4547,8 @@ static bool has_rom_extension(const String &file_name) {
   return extension.equals("gb") || extension.equals("gbc");
 }
 
-// Try to load and display box art for a ROM file. Returns true if art was drawn.
-// Box art should be placed in the same directory as the ROM with the same name but .png or .jpg extension
+
+
 static bool try_display_box_art(const String &rom_path, int x, int y, int max_width, int max_height) {
   int dot_index = rom_path.lastIndexOf('.');
   if(dot_index < 0) {
@@ -4537,7 +4579,7 @@ static bool try_display_box_art(const String &rom_path, int x, int y, int max_wi
   return false;
 }
 
-// Opens a ROM file picker menu and returns the path of the picked ROM.
+
 char* file_picker() {
   struct Entry {
     String name;
@@ -4846,15 +4888,15 @@ char* file_picker() {
     if(entries.empty()) {
       continue;
     }
-    
-    // Handle ESC key - go back to parent directory or exit if at root
+
+
     if(esc_pressed) {
       if(strcmp(current_path, "/") == 0) {
-        // At root, return NULL to exit file picker back to previous menu
+
         g_file_picker_cancelled = true;
         return NULL;
       } else {
-        // Go back to parent directory
+
         size_t len = strlen(current_path);
         if(len > 1) {
           char *slash = strrchr(current_path, '/');
@@ -4950,7 +4992,7 @@ char* file_picker() {
 
 #if ENABLE_SOUND
 static constexpr size_t AUDIO_BUFFER_COUNT = 4;
-static constexpr size_t AUDIO_TARGET_QUEUE = 3; // Increased from 2 to reduce underruns
+static constexpr size_t AUDIO_TARGET_QUEUE = 3;
 static constexpr uint32_t AUDIO_REQUESTED_SAMPLE_RATE = AUDIO_DEFAULT_SAMPLE_RATE;
 
 static int16_t *audio_buffers[AUDIO_BUFFER_COUNT];
@@ -5078,7 +5120,7 @@ static void audioSetup() {
     }
     cfg.dma_buf_count = 4;
   }
-  dma_len &= ~1u; // must be even
+  dma_len &= ~1u;
   cfg.dma_buf_len = dma_len;
   if(g_psram_available) {
     cfg.dma_buf_count = 12;
@@ -5086,7 +5128,7 @@ static void audioSetup() {
   cfg.task_priority = tskIDLE_PRIORITY + 4;
   cfg.task_pinned_core = 0;
   cfg.use_dac = false;
-  // Cardputer speaker (NS4168) uses dedicated I2S pins: G41=BCLK, G42=SDOUT, G43=LRCLK.
+
   cfg.pin_data_out = 42;
   cfg.pin_bck = 41;
   cfg.pin_ws = 43;
@@ -5254,7 +5296,7 @@ static bool gb_run_frame_watchdog(struct gb_s *gb,
 static constexpr uint32_t GB_FRAME_STEP_BUDGET = 2000000;
 
 void setup() {
-  // put your setup code here, to run once:
+
 
   Serial.begin(115200);
   delay(100);
@@ -5281,19 +5323,19 @@ void setup() {
   }
   apply_settings_constraints();
 
-  // Init M5Stack and M5Cardputer libs.
+
   auto cfg = M5.config();
   cfg.internal_spk = true;
   cfg.internal_mic = true;
   cfg.fallback_board = m5::board_t::board_M5Cardputer;
-  // Use keyboard.
+
   M5Cardputer.begin(cfg, true);
 
 #if ENABLE_SOUND
-  // Speaker initialisation handled in audioSetup().
+
 #endif
 
-  // Set display rotation to horizontal.
+
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.initDMA();
   set_font_size(80);
@@ -5340,7 +5382,7 @@ void setup() {
     }
   }
 
-  // Initialize GameBoy emulation context.
+
   enum gb_init_error_e ret = GB_INIT_NO_ERROR;
   while(true) {
     g_printer.reset(false);
@@ -5636,22 +5678,22 @@ void setup() {
     gb_set_cgb_mode(&gb, 1);
     palette_disable_overrides(&priv.palette);
 
-    /* Preload CGB palette with classic defaults. */
+
     for(size_t i = 0; i < 32; ++i) {
       const int component = (i % 4);
       uint32_t colour;
       switch(component) {
         case 0:
-          colour = 0xF8F8F8; // white
+          colour = 0xF8F8F8;
           break;
         case 1:
-          colour = 0xB8B8B8; // light grey
+          colour = 0xB8B8B8;
           break;
         case 2:
-          colour = 0x686868; // dark grey
+          colour = 0x686868;
           break;
         default:
-          colour = 0x080808; // black
+          colour = 0x080808;
           break;
       }
 
@@ -5673,7 +5715,7 @@ void setup() {
   }
 
 #if ENABLE_MBC7
-  // Initialize MBC7 support (accelerometer + EEPROM)
+
   if(gb.mbc == 7) {
     Serial.println("MBC7 cartridge detected - initializing accelerometer support");
     mbc7_cardputer_init(get_mbc7_state());
@@ -5683,7 +5725,7 @@ void setup() {
 
 #if ENABLE_LCD
   gb_init_lcd(&gb, &lcd_draw_line);
-  // Interlacing disabled to avoid double-buffer artifacts
+
   gb.direct.interlace = 0;
   g_interlace_state = {};
 #endif
@@ -5988,17 +6030,17 @@ void setup() {
 
   debugPrint("Before loop");
 
-  // Clear the display of any printed text before starting emulation.
+
   M5Cardputer.Display.clearDisplay();
   if(swap_fb_enabled && swap_fb != nullptr) {
     memset(swap_fb, 0xFF, DEST_H * LCD_WIDTH * sizeof(uint16_t));
     display_cache_valid = false;
     memset(swap_row_hash, 0, sizeof(swap_row_hash));
   }
-  
-  // Target game speed.
+
+
   const double target_speed_us = 1000000.0 / VERTICAL_SYNC;
-  
+
   static uint32_t frame_counter = 0;
   static bool logged_first_frame = false;
   static uint32_t watchdog_strikes = 0;
@@ -6259,11 +6301,11 @@ void setup() {
   }
 }
 
-// Unused as I'm using an infinite while-loop
-// inside the main function because otherwise
-// I'd need to deal with global variables
-// which are stupid (doing that gave me an
-// ambiguous compiler error so I no no wanna)
+
+
+
+
+
 void loop() {
 
 }
