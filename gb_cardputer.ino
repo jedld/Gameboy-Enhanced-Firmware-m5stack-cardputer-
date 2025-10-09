@@ -4,6 +4,10 @@
 #define ENABLE_LCD 1
 #define ENABLE_PROFILING 1
 
+#ifndef ENABLE_MBC7
+#define ENABLE_MBC7 1
+#endif
+
 #define MAX_FILES 256
 #define MAX_PATH_LEN 256
 
@@ -1644,6 +1648,7 @@ static bool save_cart_ram_to_sd(const struct priv_t *priv) {
   return true;
 }
 
+#if ENABLE_MBC7
 static bool load_mbc7_eeprom_from_sd(struct priv_t *priv, struct gb_s *gb) {
   if(priv == nullptr || gb == nullptr) {
     return false;
@@ -1732,6 +1737,15 @@ static bool save_mbc7_eeprom_to_sd(const struct priv_t *priv, const struct gb_s 
                 priv->mbc7_save_path);
   return true;
 }
+#else
+static bool load_mbc7_eeprom_from_sd(struct priv_t *, struct gb_s *) {
+  return false;
+}
+
+static bool save_mbc7_eeprom_to_sd(const struct priv_t *, const struct gb_s *) {
+  return false;
+}
+#endif
 
 static void adjust_master_volume(int delta, bool persist, bool announce) {
   int new_volume = static_cast<int>(g_settings.master_volume) + delta;
@@ -1914,6 +1928,7 @@ uint8_t gb_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr)
 {
   const struct priv_t * const p = (const struct priv_t *)gb->direct.priv;
   
+#if ENABLE_MBC7
   // MBC7 uses internal EEPROM (gb->mbc7.eeprom.data), not cart_ram
   if(gb->mbc == 7) {
     if(addr < 256) {
@@ -1929,6 +1944,7 @@ uint8_t gb_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr)
     }
     return 0xFF;
   }
+#endif
   
   if(p->cart_ram == nullptr || addr >= p->cart_ram_size) {
     return 0xFF;
@@ -1944,6 +1960,7 @@ void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr,
 {
   struct priv_t * const p = (struct priv_t *)gb->direct.priv;
   
+#if ENABLE_MBC7
   // MBC7 uses internal EEPROM (gb->mbc7.eeprom.data), not cart_ram
   if(gb->mbc == 7) {
     if(addr < 256) {
@@ -1961,6 +1978,7 @@ void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr,
     }
     return;
   }
+#endif
   
   if(p->cart_ram == nullptr || addr >= p->cart_ram_size) {
     return;
@@ -3351,17 +3369,17 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
 
       int y0 = static_cast<int>(src_y);
       float frac = src_y - static_cast<float>(y0);
-      if(y0 >= LCD_HEIGHT - 1) {
-        y0 = LCD_HEIGHT - 2;
-        frac = 1.0f;
+
+      if(frac >= 0.5f && y0 < LCD_HEIGHT - 1) {
+        y0 += 1;
+      }
+
+      if(y0 >= LCD_HEIGHT) {
+        y0 = LCD_HEIGHT - 1;
       }
 
       frame_row_map[j] = static_cast<uint8_t>(y0);
-      uint16_t blend = static_cast<uint16_t>(frac * 256.0f + 0.5f);
-      if(blend > 256) {
-        blend = 256;
-      }
-      frame_row_weight[j] = blend;
+      frame_row_weight[j] = 0;
     }
     frame_row_map_initialised = true;
   }
@@ -5413,12 +5431,14 @@ void setup() {
     gb.cgb.obj_palette_autoinc = 0;
   }
 
+#if ENABLE_MBC7
   // Initialize MBC7 support (accelerometer + EEPROM)
   if(gb.mbc == 7) {
     Serial.println("MBC7 cartridge detected - initializing accelerometer support");
     mbc7_cardputer_init(get_mbc7_state());
     gb.mbc7_accel_read = mbc7_cardputer_accel_read;
   }
+#endif
 
 #if ENABLE_LCD
   gb_init_lcd(&gb, &lcd_draw_line);
@@ -5573,7 +5593,7 @@ void setup() {
   }
 #endif
 
-  const bool uses_mbc7_eeprom = (gb.mbc == 7);
+  const bool uses_mbc7_eeprom = (ENABLE_MBC7 != 0) && (gb.mbc == 7);
   const size_t requested_cart_ram = gb_get_save_size(&gb);
   bool cart_ram_required = (requested_cart_ram > 0);
 
@@ -5630,10 +5650,12 @@ void setup() {
     priv.cart_ram_size = 0;
   }
 
+#if ENABLE_MBC7
   if(uses_mbc7_eeprom) {
     priv.mbc7_last_flush_ms = millis();
     load_mbc7_eeprom_from_sd(&priv, &gb);
   }
+#endif
 
 #if ENABLE_LCD
   if(priv.single_buffer_mode) {
@@ -5956,6 +5978,7 @@ void setup() {
       }
     }
 
+#if ENABLE_MBC7
     if(uses_mbc7_eeprom && priv.mbc7_eeprom_dirty && priv.mbc7_save_path_valid && g_sd_mounted) {
       const uint32_t last = priv.mbc7_last_flush_ms;
       const uint32_t elapsed = now_ms - last;
@@ -5978,6 +6001,7 @@ void setup() {
         }
       }
     }
+#endif
 
     updateAdaptiveFrameSkip(&gb, over_budget);
 

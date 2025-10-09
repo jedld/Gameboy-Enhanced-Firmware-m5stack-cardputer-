@@ -10,11 +10,19 @@
 #ifndef MBC7_CARDPUTER_H
 #define MBC7_CARDPUTER_H
 
+#ifndef ENABLE_MBC7
+#define ENABLE_MBC7 1
+#endif
+
+#include <stdint.h>
+
 // Include peanut_gb.h only for the struct definition we need
 // Don't include the full implementation to avoid dependency issues
 struct gb_s;
 
+#if ENABLE_MBC7
 #include "M5Cardputer.h"
+#endif
 
 /**
  * MBC7 Virtual Accelerometer State

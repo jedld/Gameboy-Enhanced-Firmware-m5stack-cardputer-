@@ -3,6 +3,13 @@
  */
 
 #include "mbc7_cardputer.h"
+
+#ifndef ENABLE_MBC7
+#define ENABLE_MBC7 1
+#endif
+
+#if ENABLE_MBC7
+
 #include <algorithm>
 #include <cmath>
 #include <esp_timer.h>
@@ -248,3 +255,38 @@ void mbc7_cardputer_draw_indicator(struct mbc7_cardputer_s *state, int center_x,
 extern "C" struct mbc7_cardputer_s* get_mbc7_state() {
     return &g_mbc7_state;
 }
+
+#else  // ENABLE_MBC7
+
+#include <cstddef>
+
+// Provide stub implementations when MBC7 support is disabled
+static struct mbc7_cardputer_s g_mbc7_state_stub = {};
+
+void mbc7_cardputer_init(struct mbc7_cardputer_s *state) {
+    if(state != nullptr) {
+        *state = {};
+    }
+}
+
+void mbc7_cardputer_update(struct mbc7_cardputer_s *state) {
+    (void)state;
+}
+
+int mbc7_cardputer_accel_read(struct gb_s *, float *x_out, float *y_out) {
+    if(x_out != nullptr) {
+        *x_out = 0.0f;
+    }
+    if(y_out != nullptr) {
+        *y_out = 0.0f;
+    }
+    return 0;
+}
+
+void mbc7_cardputer_draw_indicator(struct mbc7_cardputer_s *, int, int) {}
+
+extern "C" struct mbc7_cardputer_s* get_mbc7_state() {
+    return &g_mbc7_state_stub;
+}
+
+#endif // ENABLE_MBC7

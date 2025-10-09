@@ -58,6 +58,10 @@ pio device monitor -b 115200
 
 Adjust the upload port to match your system. PlatformIO caches toolchains, so these downloads only happen the first time.
 
+#### Optional build flags
+
+- `ENABLE_MBC7` (default `1`) toggles the MBC7 accelerometer/EEPROM emulation. Set it to `0` in `platformio.ini` or provide `-D ENABLE_MBC7=0` on the command line if you want to exclude MBC7 support (for example to shave a little flash or when targeting devices without the tilt sensor).
+
 #### One-command build & upload helper
 
 The repository includes a convenience script that wraps the PlatformIO CLI:
