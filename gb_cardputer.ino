@@ -1,8 +1,16 @@
 // Sound isn't done yet
 // (or might never be)
+#ifndef ENABLE_SOUND
 #define ENABLE_SOUND 1
+#endif
+
+#ifndef ENABLE_LCD
 #define ENABLE_LCD 1
+#endif
+
+#ifndef ENABLE_PROFILING
 #define ENABLE_PROFILING 1
+#endif
 
 #ifndef ENABLE_BLUETOOTH
 #define ENABLE_BLUETOOTH 1
@@ -112,6 +120,14 @@ static void profiler_record_frame(uint64_t frame_us,
                                   uint64_t now);
 #endif
 
+struct CacheRecoveryState {
+  bool pending_display;
+  size_t desired_rom_banks;
+  uint32_t next_attempt_ms;
+};
+
+static CacheRecoveryState g_cache_recovery = {false, 0, 0};
+
 #define DEST_W 240
 #define DEST_H 135
 
@@ -148,6 +164,11 @@ static const size_t DEFAULT_GBC_PALETTE_INDEX = 0;
 
 static constexpr size_t JOYPAD_BUTTON_COUNT = 8;
 
+struct RomCacheBank;
+struct RomCache;
+static bool rom_cache_trim_banks(RomCache *cache, size_t new_count);
+static size_t rom_cache_restore_banks(RomCache *cache, size_t desired_count);
+
 // Second framebuffer cache used to avoid redrawing unchanged rows when PSRAM
 // is available. Some rendering decisions (adaptive interlacing) depend on
 // whether this cache is active.
@@ -162,6 +183,22 @@ static uint16_t frame_row_weight[DEST_H];
 static uint32_t swap_row_hash[DEST_H];
 static constexpr unsigned int FALLBACK_SEGMENT_ROWS = 4;
 static uint16_t fallback_segment_buffer[FALLBACK_SEGMENT_ROWS * DEST_W];
+
+static void disable_display_cache() {
+  if(swap_fb_enabled) {
+    if(swap_fb != nullptr) {
+      heap_caps_free(swap_fb);
+      swap_fb = nullptr;
+    }
+    swap_fb_enabled = false;
+    swap_fb_dma_capable = false;
+    swap_fb_psram_backed = false;
+    Serial.println("Display cache released (memory pressure)");
+  }
+  display_cache_valid = false;
+  memset(swap_row_hash, 0, sizeof(swap_row_hash));
+}
+
 
 static bool stretch_col_map_initialised = false;
 static uint16_t stretch_col_map[DEST_W];
@@ -333,6 +370,55 @@ static bool g_spi2_initialised = false;
 static bool g_settings_loaded = false;
 static bool g_settings_dirty = false;
 
+static bool ensure_display_cache_allocated() {
+#if !ENABLE_LCD
+  return false;
+#else
+  if(!g_psram_available) {
+    return false;
+  }
+  if(swap_fb_enabled && swap_fb != nullptr) {
+    return true;
+  }
+
+  const size_t swap_bytes = DEST_H * DEST_W * sizeof(uint16_t);
+  static constexpr uint32_t kSwapCapsRestore[] = {
+    MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+  };
+
+  if(swap_fb != nullptr) {
+    heap_caps_free(swap_fb);
+    swap_fb = nullptr;
+  }
+
+  for(uint32_t cap : kSwapCapsRestore) {
+    uint16_t *buffer = (uint16_t *)heap_caps_malloc(swap_bytes, cap);
+    if(buffer != nullptr) {
+      swap_fb = buffer;
+      swap_fb_enabled = true;
+      swap_fb_dma_capable = (cap & MALLOC_CAP_DMA) != 0;
+      swap_fb_psram_backed = (cap & MALLOC_CAP_SPIRAM) != 0;
+      memset(swap_fb, 0xFF, swap_bytes);
+      display_cache_valid = false;
+      memset(swap_row_hash, 0, sizeof(swap_row_hash));
+      Serial.printf("Display cache restored (%u bytes, caps=0x%X)\n",
+                    (unsigned)swap_bytes,
+                    (unsigned)cap);
+      return true;
+    }
+  }
+
+  swap_fb_enabled = false;
+  swap_fb_dma_capable = false;
+  swap_fb_psram_backed = false;
+  display_cache_valid = false;
+  memset(swap_row_hash, 0, sizeof(swap_row_hash));
+  Serial.println("Display cache restore failed (allocation)");
+  return false;
+#endif
+}
+
 static bool ensure_sd_card(bool blocking);
 static bool ensure_settings_dir();
 static bool load_settings_from_sd();
@@ -358,6 +444,7 @@ static void save_state_clear_all(struct priv_t *priv);
 static uint8_t *save_state_alloc_buffer(size_t bytes, const char *label);
 static bool ensure_save_state_core_buffers(SaveStateSlot &slot);
 static bool ensure_save_state_buffers(SaveStateSlot &slot, size_t cart_ram_size);
+static bool save_state_slot_has_allocations(const SaveStateSlot &slot);
 static void show_status_message(const char *message, StatusMessageKind kind);
 static void render_status_message_overlay();
 static bool save_state_store_slot(size_t slot_index);
@@ -366,6 +453,8 @@ static int save_state_slot_from_key(char key);
 static bool handle_save_state_shortcuts(const Keyboard_Class::KeysState &status);
 static void gb_printer_serial_tx(struct gb_s *gb, const uint8_t tx);
 static enum gb_serial_rx_ret_e gb_printer_serial_rx(struct gb_s *gb, uint8_t *rx);
+static void request_cache_recovery(bool restore_display, size_t desired_rom_banks);
+static void process_cache_recovery();
 
 #if ENABLE_SOUND
 static void apply_speaker_volume();
@@ -837,6 +926,101 @@ static TaskHandle_t render_task_handle = nullptr;
 #if ENABLE_SOUND
 static TaskHandle_t audio_task_handle = nullptr;
 #endif
+
+static constexpr uint32_t CACHE_RECOVERY_RETRY_INTERVAL_MS = 750;
+static constexpr size_t DISPLAY_CACHE_RESTORE_MARGIN_BYTES = 64 * 1024;
+static constexpr size_t ROM_CACHE_RECOVERY_STEP = 2;
+
+static void request_cache_recovery(bool restore_display, size_t desired_rom_banks) {
+  if(restore_display) {
+    g_cache_recovery.pending_display = true;
+  }
+  if(desired_rom_banks > g_cache_recovery.desired_rom_banks) {
+    g_cache_recovery.desired_rom_banks = desired_rom_banks;
+  }
+  const uint32_t now = millis();
+  if(g_cache_recovery.next_attempt_ms == 0 || now < g_cache_recovery.next_attempt_ms) {
+    g_cache_recovery.next_attempt_ms = now;
+  }
+}
+
+static void process_cache_recovery() {
+  const bool need_display = g_psram_available && g_cache_recovery.pending_display;
+  const bool need_rom = (!priv.rom_cache.use_memory) &&
+                        (g_cache_recovery.desired_rom_banks > priv.rom_cache.bank_count);
+
+  if(!need_display && !need_rom) {
+    if(!g_cache_recovery.pending_display) {
+      g_cache_recovery.desired_rom_banks = priv.rom_cache.use_memory ? 0 : priv.rom_cache.bank_count;
+    }
+    g_cache_recovery.pending_display = false;
+    g_cache_recovery.next_attempt_ms = 0;
+    return;
+  }
+
+  const uint32_t now = millis();
+  if(now < g_cache_recovery.next_attempt_ms) {
+    return;
+  }
+  g_cache_recovery.next_attempt_ms = now + CACHE_RECOVERY_RETRY_INTERVAL_MS;
+
+  size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+  if(need_display) {
+    const size_t swap_bytes = DEST_H * DEST_W * sizeof(uint16_t);
+    if(free_psram >= swap_bytes + DISPLAY_CACHE_RESTORE_MARGIN_BYTES) {
+      if(ensure_display_cache_allocated()) {
+        Serial.println("Display cache restored after save-state");
+        g_cache_recovery.pending_display = false;
+        free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+      } else {
+        Serial.println("Display cache restore attempt failed; will retry");
+      }
+    } else {
+      Serial.println("Deferring display cache restore; insufficient PSRAM");
+    }
+  }
+
+  if(!priv.rom_cache.use_memory && g_cache_recovery.desired_rom_banks > priv.rom_cache.bank_count) {
+    const size_t current = priv.rom_cache.bank_count;
+    const size_t desired = g_cache_recovery.desired_rom_banks;
+    size_t step_target = current + ROM_CACHE_RECOVERY_STEP;
+    if(step_target > desired) {
+      step_target = desired;
+    }
+
+    const size_t block_size = priv.rom_cache.bank_size ? priv.rom_cache.bank_size : rom_cache_preferred_block_size();
+    const size_t banks_to_add = (step_target > current) ? (step_target - current) : 0;
+    const size_t required_bytes = banks_to_add * block_size;
+
+    if(banks_to_add > 0) {
+      if(free_psram >= required_bytes + DISPLAY_CACHE_RESTORE_MARGIN_BYTES) {
+        const size_t new_count = rom_cache_restore_banks(&priv.rom_cache, step_target);
+        if(new_count > current) {
+          Serial.printf("ROM cache recovery added %u banks (%u/%u)\n",
+                        (unsigned)(new_count - current),
+                        (unsigned)new_count,
+                        (unsigned)desired);
+          g_settings.rom_cache_banks = static_cast<uint8_t>(new_count);
+          g_settings_dirty = true;
+          free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+          if(new_count >= desired) {
+            g_cache_recovery.desired_rom_banks = new_count;
+          }
+        } else {
+          Serial.println("ROM cache recovery attempt failed to allocate new banks");
+        }
+      } else {
+        Serial.println("Deferring ROM cache recovery; insufficient PSRAM");
+      }
+    }
+  }
+
+  if(!g_cache_recovery.pending_display &&
+     (priv.rom_cache.use_memory || g_cache_recovery.desired_rom_banks <= priv.rom_cache.bank_count)) {
+    g_cache_recovery.desired_rom_banks = priv.rom_cache.use_memory ? 0 : priv.rom_cache.bank_count;
+  }
+}
 
 static constexpr const char *PRINTER_OUTPUT_DIR = "/printer";
 static constexpr size_t PRINTER_TILE_BYTES = 16;
@@ -1428,6 +1612,11 @@ static bool ensure_save_state_buffers(SaveStateSlot &slot, size_t cart_ram_size)
   return true;
 }
 
+static bool save_state_slot_has_allocations(const SaveStateSlot &slot) {
+  return slot.wram != nullptr || slot.vram != nullptr || slot.oam != nullptr ||
+         slot.hram_io != nullptr || slot.cart_ram != nullptr;
+}
+
 static void show_status_message(const char *message, StatusMessageKind kind) {
   if(message == nullptr || message[0] == '\0') {
     g_status_message_active = false;
@@ -1465,6 +1654,14 @@ static void render_status_message_overlay() {
   const uint32_t now = millis();
   if(static_cast<int32_t>(now - g_status_message_expiry_ms) >= 0) {
     g_status_message_active = false;
+    display_cache_valid = false;
+    memset(priv.framebuffer_row_dirty[0], 1, sizeof(priv.framebuffer_row_dirty[0]));
+    if(!priv.single_buffer_mode) {
+      memset(priv.framebuffer_row_dirty[1], 1, sizeof(priv.framebuffer_row_dirty[1]));
+    }
+    if(swap_fb_enabled) {
+      memset(swap_row_hash, 0, sizeof(swap_row_hash));
+    }
     return;
   }
 
@@ -1534,9 +1731,86 @@ static bool save_state_store_slot(size_t slot_index) {
 
   SaveStateSlot &slot = priv.save_slots[slot_index];
 
-  if(!ensure_save_state_buffers(slot, priv.cart_ram_size)) {
-    show_status_message("Save failed: out of memory", StatusMessageKind::Error);
-    return false;
+  const size_t original_rom_cache_banks = priv.rom_cache.bank_count;
+  const bool display_cache_initially_enabled = swap_fb_enabled && swap_fb != nullptr;
+  bool display_cache_disabled_for_save = false;
+
+  auto ensure_buffers = [&]() -> bool {
+    return ensure_save_state_buffers(slot, priv.cart_ram_size);
+  };
+
+  if(!ensure_buffers()) {
+    Serial.println("Save-state allocation failed; attempting to reclaim memory");
+
+    bool freed_any = false;
+    for(size_t i = 0; i < SAVE_STATE_SLOT_COUNT; ++i) {
+      if(i == slot_index) {
+        continue;
+      }
+      SaveStateSlot &candidate = priv.save_slots[i];
+      if(!candidate.valid && save_state_slot_has_allocations(candidate)) {
+        save_state_free_slot(candidate);
+        freed_any = true;
+      }
+    }
+    if(freed_any && ensure_buffers()) {
+      Serial.println("Recovered memory by clearing stale slot buffers");
+    } else {
+      if(swap_fb_enabled) {
+        display_cache_disabled_for_save = true;
+        disable_display_cache();
+      }
+
+      size_t current_banks = priv.rom_cache.bank_count;
+      while(current_banks > 1 && !ensure_buffers()) {
+        size_t target_banks = current_banks / 2;
+        if(target_banks < 1) {
+          target_banks = 1;
+        }
+        if(target_banks == current_banks) {
+          break;
+        }
+        Serial.printf("Trimming ROM cache banks %u -> %u to free memory for save state\n",
+                      (unsigned)current_banks,
+                      (unsigned)target_banks);
+        if(!rom_cache_trim_banks(&priv.rom_cache, target_banks)) {
+          break;
+        }
+        current_banks = priv.rom_cache.bank_count;
+        g_settings.rom_cache_banks = static_cast<uint8_t>(current_banks);
+        g_settings_dirty = true;
+      }
+
+      if(!ensure_buffers()) {
+        size_t victim_index = SIZE_MAX;
+        uint64_t oldest = UINT64_MAX;
+        for(size_t i = 0; i < SAVE_STATE_SLOT_COUNT; ++i) {
+          if(i == slot_index) {
+            continue;
+          }
+          const SaveStateSlot &candidate = priv.save_slots[i];
+          if(candidate.valid && candidate.timestamp_us < oldest) {
+            oldest = candidate.timestamp_us;
+            victim_index = i;
+          }
+        }
+
+        if(victim_index != SIZE_MAX) {
+          Serial.printf("Discarding %s to free memory\n",
+                        save_state_slot_label(victim_index));
+          save_state_free_slot(priv.save_slots[victim_index]);
+        }
+
+        if(!ensure_buffers()) {
+          Serial.println("Clearing all save-state slots to retry allocation");
+          save_state_clear_all(&priv);
+          if(!ensure_buffers()) {
+            show_status_message("Save failed: out of memory", StatusMessageKind::Error);
+            return false;
+          }
+        }
+      }
+    }
   }
 
   memcpy(&slot.core_state, &gb, sizeof(gb));
@@ -1555,6 +1829,17 @@ static bool save_state_store_slot(size_t slot_index) {
   char message[48];
   snprintf(message, sizeof(message), "%s saved", save_state_slot_label(slot_index));
   show_status_message(message, StatusMessageKind::Success);
+
+  const bool need_display_restore = display_cache_disabled_for_save && display_cache_initially_enabled;
+  const bool need_rom_restore = (!priv.rom_cache.use_memory) &&
+                                (original_rom_cache_banks > 0) &&
+                                (priv.rom_cache.bank_count < original_rom_cache_banks);
+
+  if(need_display_restore || need_rom_restore) {
+    const size_t desired_banks = need_rom_restore ? original_rom_cache_banks : priv.rom_cache.bank_count;
+    request_cache_recovery(need_display_restore, desired_banks);
+  }
+
   return true;
 }
 
@@ -2902,6 +3187,69 @@ static bool rom_cache_trim_banks(RomCache *cache, size_t new_count) {
   }
 
   return true;
+}
+
+static size_t rom_cache_restore_banks(RomCache *cache, size_t desired_count) {
+  if(cache == nullptr) {
+    return 0;
+  }
+
+  if(cache->use_memory) {
+    return cache->bank_count;
+  }
+
+  if(desired_count < 1) {
+    desired_count = 1;
+  }
+
+  size_t bank_limit = rom_cache_preferred_bank_limit();
+  if(desired_count > bank_limit) {
+    desired_count = bank_limit;
+  }
+  if(desired_count > ROM_CACHE_BANK_MAX) {
+    desired_count = ROM_CACHE_BANK_MAX;
+  }
+
+  size_t previous_count = cache->bank_count;
+  if(previous_count >= desired_count) {
+    return previous_count;
+  }
+
+  if(cache->bank_size == 0) {
+    cache->bank_size = rom_cache_preferred_block_size();
+    rom_cache_update_geometry(cache);
+  }
+
+  const size_t block_size = cache->bank_size ? cache->bank_size : rom_cache_preferred_block_size();
+  size_t added = 0;
+
+  for(size_t i = previous_count; i < desired_count; ++i) {
+    RomCacheBank &entry = cache->banks[i];
+    if(entry.data == nullptr) {
+      entry.data = rom_cache_alloc_block(block_size, false);
+    }
+    if(entry.data == nullptr) {
+      Serial.printf("ROM cache: failed to restore bank buffer #%u\n", (unsigned)i);
+      break;
+    }
+    memset(entry.data, 0xFF, block_size);
+    entry.bank_number = -1;
+    entry.valid = false;
+    entry.lru_prev = -1;
+    entry.lru_next = -1;
+    added++;
+  }
+
+  if(added == 0) {
+    return previous_count;
+  }
+
+  cache->bank_count = previous_count + added;
+  cache->lru_head = -1;
+  cache->lru_tail = -1;
+
+  Serial.printf("ROM cache restored to %u banks\n", (unsigned)cache->bank_count);
+  return cache->bank_count;
 }
 
 static bool rom_cache_fill_bank(RomCache *cache, RomCacheBank *slot, uint32_t bank) {
@@ -7084,6 +7432,8 @@ void setup() {
       }
     }
 #endif
+
+    process_cache_recovery();
 
   apply_frame_skip_policy(&gb, over_budget);
 
