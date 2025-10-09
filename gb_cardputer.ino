@@ -240,12 +240,19 @@ static constexpr uint8_t DEFAULT_JOYPAD_KEYMAP[JOYPAD_BUTTON_COUNT] = {
   static_cast<uint8_t>('2')
 };
 
+enum class RomCacheSegment : uint8_t {
+  Detached = 0,
+  Probationary,
+  Protected
+};
+
 struct RomCacheBank {
   int32_t bank_number;
   bool valid;
   uint8_t *data;
   int16_t lru_prev;
   int16_t lru_next;
+  RomCacheSegment segment;
 };
 
 struct RomCache {
@@ -265,8 +272,13 @@ struct RomCache {
   uint32_t hot_bank_base;
   uint8_t bank_shift;
   uint8_t bank_shift_valid;
-  int16_t lru_head;
-  int16_t lru_tail;
+  int16_t probation_head;
+  int16_t probation_tail;
+  int16_t protected_head;
+  int16_t protected_tail;
+  uint8_t probation_count;
+  uint8_t protected_count;
+  uint8_t protected_capacity;
   int32_t hot_bank;
   uint8_t *hot_bank_ptr;
 };
@@ -724,9 +736,12 @@ static void rom_cache_close(RomCache *cache);
 static uint8_t rom_cache_cgb_flag(const RomCache *cache);
 static uint8_t* rom_cache_alloc_block(size_t bytes, bool prefer_internal_first);
 static inline int16_t IRAM_ATTR rom_cache_bank_index(const RomCache *cache, const RomCacheBank *bank);
-static inline void IRAM_ATTR rom_cache_lru_detach(RomCache *cache, int16_t index);
-static inline void IRAM_ATTR rom_cache_lru_touch(RomCache *cache, int16_t index);
-static inline void IRAM_ATTR rom_cache_lru_insert_after(RomCache *cache, int16_t index, int16_t after_index);
+static inline void IRAM_ATTR rom_cache_detach_entry(RomCache *cache, int16_t index);
+static inline void IRAM_ATTR rom_cache_attach_front(RomCache *cache, int16_t index, RomCacheSegment segment);
+static inline void IRAM_ATTR rom_cache_touch_hit(RomCache *cache, int16_t index);
+static inline int16_t IRAM_ATTR rom_cache_select_victim(RomCache *cache);
+static inline void rom_cache_update_segment_targets(RomCache *cache);
+static inline void IRAM_ATTR rom_cache_enforce_protected_capacity(RomCache *cache);
 static const char* gbc_palette_name(size_t index);
 static void palette_apply_dmg(PaletteState *palette);
 static void palette_set_label(PaletteState *palette, const char *label);
@@ -930,10 +945,19 @@ static TaskHandle_t audio_task_handle = nullptr;
 static constexpr uint32_t CACHE_RECOVERY_RETRY_INTERVAL_MS = 750;
 static constexpr size_t DISPLAY_CACHE_RESTORE_MARGIN_BYTES = 64 * 1024;
 static constexpr size_t ROM_CACHE_RECOVERY_STEP = 2;
+static constexpr size_t ROM_CACHE_INTERNAL_RESTORE_MARGIN_BYTES = 32 * 1024;
 
 static void request_cache_recovery(bool restore_display, size_t desired_rom_banks) {
+  if(restore_display && !g_psram_available) {
+    restore_display = false;
+  }
+
   if(restore_display) {
     g_cache_recovery.pending_display = true;
+  }
+  const size_t max_banks = rom_cache_preferred_bank_limit();
+  if(desired_rom_banks > max_banks) {
+    desired_rom_banks = max_banks;
   }
   if(desired_rom_banks > g_cache_recovery.desired_rom_banks) {
     g_cache_recovery.desired_rom_banks = desired_rom_banks;
@@ -945,6 +969,10 @@ static void request_cache_recovery(bool restore_display, size_t desired_rom_bank
 }
 
 static void process_cache_recovery() {
+  if(!g_psram_available) {
+    g_cache_recovery.pending_display = false;
+  }
+
   const bool need_display = g_psram_available && g_cache_recovery.pending_display;
   const bool need_rom = (!priv.rom_cache.use_memory) &&
                         (g_cache_recovery.desired_rom_banks > priv.rom_cache.bank_count);
@@ -964,15 +992,16 @@ static void process_cache_recovery() {
   }
   g_cache_recovery.next_attempt_ms = now + CACHE_RECOVERY_RETRY_INTERVAL_MS;
 
-  size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  size_t free_external = g_psram_available ? heap_caps_get_free_size(MALLOC_CAP_SPIRAM) : 0;
+  size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
 
   if(need_display) {
     const size_t swap_bytes = DEST_H * DEST_W * sizeof(uint16_t);
-    if(free_psram >= swap_bytes + DISPLAY_CACHE_RESTORE_MARGIN_BYTES) {
+    if(free_external >= swap_bytes + DISPLAY_CACHE_RESTORE_MARGIN_BYTES) {
       if(ensure_display_cache_allocated()) {
         Serial.println("Display cache restored after save-state");
         g_cache_recovery.pending_display = false;
-        free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        free_external = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
       } else {
         Serial.println("Display cache restore attempt failed; will retry");
       }
@@ -981,7 +1010,7 @@ static void process_cache_recovery() {
     }
   }
 
-  if(!priv.rom_cache.use_memory && g_cache_recovery.desired_rom_banks > priv.rom_cache.bank_count) {
+  if(need_rom) {
     const size_t current = priv.rom_cache.bank_count;
     const size_t desired = g_cache_recovery.desired_rom_banks;
     size_t step_target = current + ROM_CACHE_RECOVERY_STEP;
@@ -994,7 +1023,11 @@ static void process_cache_recovery() {
     const size_t required_bytes = banks_to_add * block_size;
 
     if(banks_to_add > 0) {
-      if(free_psram >= required_bytes + DISPLAY_CACHE_RESTORE_MARGIN_BYTES) {
+      const size_t margin = g_psram_available ? DISPLAY_CACHE_RESTORE_MARGIN_BYTES
+                                              : ROM_CACHE_INTERNAL_RESTORE_MARGIN_BYTES;
+      const size_t available_pool = g_psram_available ? free_external : free_internal;
+
+      if(available_pool >= required_bytes + margin) {
         const size_t new_count = rom_cache_restore_banks(&priv.rom_cache, step_target);
         if(new_count > current) {
           Serial.printf("ROM cache recovery added %u banks (%u/%u)\n",
@@ -1003,7 +1036,11 @@ static void process_cache_recovery() {
                         (unsigned)desired);
           g_settings.rom_cache_banks = static_cast<uint8_t>(new_count);
           g_settings_dirty = true;
-          free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+          if(g_psram_available) {
+            free_external = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+          } else {
+            free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+          }
           if(new_count >= desired) {
             g_cache_recovery.desired_rom_banks = new_count;
           }
@@ -1011,7 +1048,9 @@ static void process_cache_recovery() {
           Serial.println("ROM cache recovery attempt failed to allocate new banks");
         }
       } else {
-        Serial.println("Deferring ROM cache recovery; insufficient PSRAM");
+        Serial.println(g_psram_available
+                           ? "Deferring ROM cache recovery; insufficient PSRAM"
+                           : "Deferring ROM cache recovery; insufficient internal RAM");
       }
     }
   }
@@ -2900,9 +2939,11 @@ static uint8_t* rom_cache_alloc_block(size_t bytes, bool prefer_internal_first) 
     }
   }
 
-  ptr = (uint8_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if(ptr != nullptr) {
-    return ptr;
+  if(g_psram_available) {
+    ptr = (uint8_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if(ptr != nullptr) {
+      return ptr;
+    }
   }
 
   if(!prefer_internal_first) {
@@ -2919,12 +2960,32 @@ static inline int16_t IRAM_ATTR rom_cache_bank_index(const RomCache *cache, cons
   return static_cast<int16_t>(bank - cache->banks);
 }
 
-static inline void IRAM_ATTR rom_cache_lru_detach(RomCache *cache, int16_t index) {
+static inline uint8_t rom_cache_calculate_protected_capacity(size_t bank_count) {
+  if(bank_count <= 1) {
+    return 0;
+  }
+
+  size_t capacity = (bank_count * 2 + 2) / 3; // ~66% with rounding
+  if(capacity >= bank_count) {
+    capacity = bank_count - 1;
+  }
+  return static_cast<uint8_t>(capacity);
+}
+
+static inline void IRAM_ATTR rom_cache_detach_entry(RomCache *cache, int16_t index) {
   if(index < 0 || index >= ROM_CACHE_BANK_MAX) {
     return;
   }
 
   RomCacheBank *entry = &cache->banks[index];
+  RomCacheSegment segment = entry->segment;
+
+  if(segment == RomCacheSegment::Detached) {
+    entry->lru_prev = -1;
+    entry->lru_next = -1;
+    return;
+  }
+
   int16_t prev = entry->lru_prev;
   int16_t next = entry->lru_next;
 
@@ -2934,63 +2995,119 @@ static inline void IRAM_ATTR rom_cache_lru_detach(RomCache *cache, int16_t index
   if(next >= 0) {
     cache->banks[next].lru_prev = prev;
   }
-  if(cache->lru_head == index) {
-    cache->lru_head = next;
+
+  int16_t *head = (segment == RomCacheSegment::Protected) ? &cache->protected_head : &cache->probation_head;
+  int16_t *tail = (segment == RomCacheSegment::Protected) ? &cache->protected_tail : &cache->probation_tail;
+  uint8_t *count = (segment == RomCacheSegment::Protected) ? &cache->protected_count : &cache->probation_count;
+
+  if(*head == index) {
+    *head = next;
   }
-  if(cache->lru_tail == index) {
-    cache->lru_tail = prev;
+  if(*tail == index) {
+    *tail = prev;
+  }
+  if(*count > 0) {
+    (*count)--;
   }
 
+  entry->segment = RomCacheSegment::Detached;
   entry->lru_prev = -1;
   entry->lru_next = -1;
 }
 
-static inline void IRAM_ATTR rom_cache_lru_touch(RomCache *cache, int16_t index) {
+static inline void IRAM_ATTR rom_cache_attach_front(RomCache *cache,
+                                                    int16_t index,
+                                                    RomCacheSegment segment) {
   if(index < 0 || index >= ROM_CACHE_BANK_MAX) {
     return;
   }
 
-  rom_cache_lru_detach(cache, index);
-
-  RomCacheBank *entry = &cache->banks[index];
-  entry->lru_prev = -1;
-  entry->lru_next = cache->lru_head;
-
-  if(cache->lru_head >= 0) {
-    cache->banks[cache->lru_head].lru_prev = index;
+  if(segment == RomCacheSegment::Detached) {
+    rom_cache_detach_entry(cache, index);
+    return;
   }
 
-  cache->lru_head = index;
-  if(cache->lru_tail < 0) {
-    cache->lru_tail = index;
+  rom_cache_detach_entry(cache, index);
+
+  RomCacheBank *entry = &cache->banks[index];
+  int16_t *head = (segment == RomCacheSegment::Protected) ? &cache->protected_head : &cache->probation_head;
+  int16_t *tail = (segment == RomCacheSegment::Protected) ? &cache->protected_tail : &cache->probation_tail;
+  uint8_t *count = (segment == RomCacheSegment::Protected) ? &cache->protected_count : &cache->probation_count;
+
+  entry->segment = segment;
+  entry->lru_prev = -1;
+  entry->lru_next = *head;
+
+  if(*head >= 0) {
+    cache->banks[*head].lru_prev = index;
+  } else {
+    *tail = index;
+  }
+
+  *head = index;
+  (*count)++;
+}
+
+static inline void IRAM_ATTR rom_cache_enforce_protected_capacity(RomCache *cache) {
+  while(cache->protected_capacity < cache->protected_count) {
+    int16_t victim = cache->protected_tail;
+    if(victim < 0) {
+      break;
+    }
+    rom_cache_detach_entry(cache, victim);
+    rom_cache_attach_front(cache, victim, RomCacheSegment::Probationary);
   }
 }
 
-static inline void IRAM_ATTR rom_cache_lru_insert_after(RomCache *cache, int16_t index, int16_t after_index) {
+static inline void rom_cache_update_segment_targets(RomCache *cache) {
+  cache->protected_capacity = rom_cache_calculate_protected_capacity(cache->bank_count);
+  if(cache->protected_capacity == 0 && cache->protected_head >= 0) {
+    // Move everything to probation if protected segment disabled.
+    while(cache->protected_head >= 0) {
+      int16_t idx = cache->protected_head;
+      rom_cache_detach_entry(cache, idx);
+      rom_cache_attach_front(cache, idx, RomCacheSegment::Probationary);
+    }
+  } else {
+    rom_cache_enforce_protected_capacity(cache);
+  }
+}
+
+static inline void IRAM_ATTR rom_cache_touch_hit(RomCache *cache, int16_t index) {
   if(index < 0 || index >= ROM_CACHE_BANK_MAX) {
     return;
   }
 
-  if(after_index < 0 || after_index >= ROM_CACHE_BANK_MAX) {
-    rom_cache_lru_touch(cache, index);
+  RomCacheBank *entry = &cache->banks[index];
+  if(entry->segment == RomCacheSegment::Protected) {
+    rom_cache_attach_front(cache, index, RomCacheSegment::Protected);
     return;
   }
 
-  rom_cache_lru_detach(cache, index);
-
-  RomCacheBank *entry = &cache->banks[index];
-  RomCacheBank *after_entry = &cache->banks[after_index];
-
-  entry->lru_prev = after_index;
-  entry->lru_next = after_entry->lru_next;
-
-  if(after_entry->lru_next >= 0) {
-    cache->banks[after_entry->lru_next].lru_prev = index;
-  } else {
-    cache->lru_tail = index;
+  if(entry->segment == RomCacheSegment::Probationary) {
+    if(cache->protected_capacity > 0) {
+      rom_cache_attach_front(cache, index, RomCacheSegment::Protected);
+      rom_cache_enforce_protected_capacity(cache);
+    } else {
+      rom_cache_attach_front(cache, index, RomCacheSegment::Probationary);
+    }
+    return;
   }
 
-  after_entry->lru_next = index;
+  rom_cache_attach_front(cache, index, RomCacheSegment::Probationary);
+}
+
+static inline int16_t IRAM_ATTR rom_cache_select_victim(RomCache *cache) {
+  if(cache->probation_tail >= 0) {
+    return cache->probation_tail;
+  }
+  if(cache->protected_tail >= 0) {
+    return cache->protected_tail;
+  }
+  if(cache->bank_count > 0) {
+    return 0;
+  }
+  return -1;
 }
 
 static bool rom_cache_prepare_buffers(RomCache *cache) {
@@ -3037,6 +3154,7 @@ static bool rom_cache_prepare_buffers(RomCache *cache) {
     entry.valid = false;
     entry.lru_prev = -1;
     entry.lru_next = -1;
+    entry.segment = RomCacheSegment::Detached;
     allocated_banks++;
   }
 
@@ -3070,13 +3188,18 @@ static bool rom_cache_prepare_buffers(RomCache *cache) {
     cache->banks[i].valid = false;
     cache->banks[i].lru_prev = -1;
     cache->banks[i].lru_next = -1;
+    cache->banks[i].segment = RomCacheSegment::Detached;
   }
 
   cache->cache_hits = 0;
   cache->cache_misses = 0;
   cache->cache_swaps = 0;
-  cache->lru_head = -1;
-  cache->lru_tail = -1;
+  cache->probation_head = -1;
+  cache->probation_tail = -1;
+  cache->protected_head = -1;
+  cache->protected_tail = -1;
+  cache->probation_count = 0;
+  cache->protected_count = 0;
   cache->size = 0;
   cache->use_memory = false;
   cache->memory_rom = nullptr;
@@ -3084,6 +3207,7 @@ static bool rom_cache_prepare_buffers(RomCache *cache) {
   cache->hot_bank = -1;
   cache->hot_bank_ptr = nullptr;
   cache->hot_bank_base = 0;
+  rom_cache_update_segment_targets(cache);
 #if ENABLE_PROFILING
   g_rom_profiler.last_hits = 0;
   g_rom_profiler.last_misses = 0;
@@ -3118,6 +3242,7 @@ static void rom_cache_reset(RomCache *cache) {
     cache->banks[i].valid = false;
     cache->banks[i].lru_prev = -1;
     cache->banks[i].lru_next = -1;
+    cache->banks[i].segment = RomCacheSegment::Detached;
   }
 
   cache->file = File();
@@ -3131,8 +3256,18 @@ static void rom_cache_reset(RomCache *cache) {
   cache->cache_hits = 0;
   cache->cache_misses = 0;
   cache->cache_swaps = 0;
-  cache->lru_head = -1;
-  cache->lru_tail = -1;
+  cache->probation_head = -1;
+  cache->probation_tail = -1;
+  cache->protected_head = -1;
+  cache->protected_tail = -1;
+  cache->probation_count = 0;
+  cache->protected_count = 0;
+  for(size_t i = 0; i < cache->bank_count; ++i) {
+    cache->banks[i].lru_prev = -1;
+    cache->banks[i].lru_next = -1;
+    cache->banks[i].segment = RomCacheSegment::Detached;
+  }
+  rom_cache_update_segment_targets(cache);
   cache->hot_bank = -1;
   cache->hot_bank_ptr = nullptr;
   cache->hot_bank_base = 0;
@@ -3166,11 +3301,17 @@ static bool rom_cache_trim_banks(RomCache *cache, size_t new_count) {
     entry.valid = false;
     entry.lru_prev = -1;
     entry.lru_next = -1;
+    entry.segment = RomCacheSegment::Detached;
   }
 
   cache->bank_count = new_count;
-  cache->lru_head = -1;
-  cache->lru_tail = -1;
+  cache->probation_head = -1;
+  cache->probation_tail = -1;
+  cache->protected_head = -1;
+  cache->protected_tail = -1;
+  cache->probation_count = 0;
+  cache->protected_count = 0;
+  rom_cache_update_segment_targets(cache);
   cache->cache_hits = 0;
   cache->cache_misses = 0;
   cache->cache_swaps = 0;
@@ -3184,6 +3325,7 @@ static bool rom_cache_trim_banks(RomCache *cache, size_t new_count) {
     entry.valid = false;
     entry.lru_prev = -1;
     entry.lru_next = -1;
+    entry.segment = RomCacheSegment::Detached;
   }
 
   return true;
@@ -3237,6 +3379,7 @@ static size_t rom_cache_restore_banks(RomCache *cache, size_t desired_count) {
     entry.valid = false;
     entry.lru_prev = -1;
     entry.lru_next = -1;
+    entry.segment = RomCacheSegment::Detached;
     added++;
   }
 
@@ -3245,8 +3388,13 @@ static size_t rom_cache_restore_banks(RomCache *cache, size_t desired_count) {
   }
 
   cache->bank_count = previous_count + added;
-  cache->lru_head = -1;
-  cache->lru_tail = -1;
+  cache->probation_head = -1;
+  cache->probation_tail = -1;
+  cache->protected_head = -1;
+  cache->protected_tail = -1;
+  cache->probation_count = 0;
+  cache->protected_count = 0;
+  rom_cache_update_segment_targets(cache);
 
   Serial.printf("ROM cache restored to %u banks\n", (unsigned)cache->bank_count);
   return cache->bank_count;
@@ -3393,6 +3541,13 @@ static bool rom_cache_open_memory(RomCache *cache, const uint8_t *data, size_t s
   cache->bank_count = 0;
   cache->bank_size = 0;
   rom_cache_update_geometry(cache);
+  cache->probation_head = -1;
+  cache->probation_tail = -1;
+  cache->protected_head = -1;
+  cache->protected_tail = -1;
+  cache->probation_count = 0;
+  cache->protected_count = 0;
+  cache->protected_capacity = 0;
   cache->use_memory = false; // direct access, bypass rom_cache_read()
   cache->memory_rom = data;
   cache->memory_size = size;
@@ -3476,7 +3631,7 @@ static inline uint8_t IRAM_ATTR rom_cache_read(RomCache *cache, uint32_t addr) {
       if(candidate->bank_number == (int32_t)bank) {
         cache->cache_hits++;
         int16_t candidate_index = rom_cache_bank_index(cache, candidate);
-        rom_cache_lru_touch(cache, candidate_index);
+        rom_cache_touch_hit(cache, candidate_index);
         cache->hot_bank = candidate->bank_number;
         cache->hot_bank_ptr = candidate->data;
         cache->hot_bank_base = rom_cache_bank_base(cache, bank);
@@ -3493,20 +3648,24 @@ static inline uint8_t IRAM_ATTR rom_cache_read(RomCache *cache, uint32_t addr) {
   cache->cache_misses++;
 
   RomCacheBank *slot = empty_slot;
+  int16_t slot_index = -1;
   if(slot == nullptr) {
-    if(cache->lru_tail >= 0) {
-      slot = &cache->banks[cache->lru_tail];
-    } else {
-      slot = &cache->banks[0];
+    int16_t victim_index = rom_cache_select_victim(cache);
+    if(victim_index < 0) {
+      victim_index = 0;
     }
+    slot = &cache->banks[victim_index];
+    slot_index = victim_index;
+  } else {
+    slot_index = rom_cache_bank_index(cache, slot);
   }
 
   const bool slot_prev_valid = slot->valid;
   const int32_t slot_prev_bank = slot->bank_number;
 
-  int16_t slot_index = rom_cache_bank_index(cache, slot);
-  rom_cache_lru_detach(cache, slot_index);
+  rom_cache_detach_entry(cache, slot_index);
   slot->valid = false;
+  slot->segment = RomCacheSegment::Detached;
 
   if(!rom_cache_fill_bank(cache, slot, bank)) {
     Serial.printf("Failed to fill ROM cache bank %u\n", (unsigned)bank);
@@ -3517,7 +3676,7 @@ static inline uint8_t IRAM_ATTR rom_cache_read(RomCache *cache, uint32_t addr) {
     slot->valid = true;
   }
 
-  rom_cache_lru_touch(cache, slot_index);
+  rom_cache_attach_front(cache, slot_index, RomCacheSegment::Probationary);
 
   if(slot_prev_valid && slot_prev_bank != (int32_t)bank) {
     cache->cache_swaps++;
@@ -3546,12 +3705,12 @@ static inline uint8_t IRAM_ATTR rom_cache_read(RomCache *cache, uint32_t addr) {
           }
         }
 
-        if(prefetch_slot == nullptr && cache->lru_tail >= 0) {
-          RomCacheBank *tail = &cache->banks[cache->lru_tail];
-          if(tail == slot && tail->lru_prev >= 0) {
-            prefetch_slot = &cache->banks[tail->lru_prev];
-          } else if(tail != slot) {
-            prefetch_slot = tail;
+        if(prefetch_slot == nullptr) {
+          int16_t victim_index = rom_cache_select_victim(cache);
+          if(victim_index >= 0 && victim_index != slot_index) {
+            prefetch_slot = &cache->banks[victim_index];
+          } else {
+            prefetch_slot = nullptr;
           }
         }
 
@@ -3559,7 +3718,7 @@ static inline uint8_t IRAM_ATTR rom_cache_read(RomCache *cache, uint32_t addr) {
           const bool prefetch_prev_valid = prefetch_slot->valid;
           const int32_t prefetch_prev_bank = prefetch_slot->bank_number;
           int16_t prefetch_index = rom_cache_bank_index(cache, prefetch_slot);
-          rom_cache_lru_detach(cache, prefetch_index);
+          rom_cache_detach_entry(cache, prefetch_index);
           prefetch_slot->valid = false;
           if(!rom_cache_fill_bank(cache, prefetch_slot, next_bank)) {
             if(prefetch_slot->data != nullptr) {
@@ -3568,7 +3727,9 @@ static inline uint8_t IRAM_ATTR rom_cache_read(RomCache *cache, uint32_t addr) {
             prefetch_slot->bank_number = next_bank;
             prefetch_slot->valid = true;
           }
-          rom_cache_lru_insert_after(cache, prefetch_index, slot_index);
+          rom_cache_attach_front(cache, prefetch_index, RomCacheSegment::Probationary);
+          // Restore the accessed bank to the most recent position.
+          rom_cache_attach_front(cache, slot_index, RomCacheSegment::Probationary);
           if(prefetch_prev_valid && prefetch_prev_bank != (int32_t)next_bank) {
             cache->cache_swaps++;
           }
