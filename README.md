@@ -17,9 +17,9 @@ Gameboy Emulator; complete with audio, configurable controls, display and perfor
 ### Quick save states & status overlay
 
 * Hold `Fn` and tap `1`–`4` to capture a snapshot into the matching slot.
-* Hold `Fn` alongside any modifier (`Shift`, `Ctrl`, `Alt` or `Opt`) and tap `1`–`4` to instantly load that slot.
+* Hold `Ctrl` and tap `1`–`4` to instantly load that slot.
 * Each action confirms with a colour-coded banner (green = saved, grey = empty slot, red = failure) rendered directly over the gameplay framebuffer.
-* Slots are per-session and reset when you change cartridges or reboot; battery-backed saves continue to flush automatically in the background.
+* Slots persist per cartridge and reload automatically after a reset or power cycle; switch to a different ROM to start with fresh slots. Battery-backed saves continue to flush automatically in the background.
 
 ## Compiling the firmware for the M5Stack Cardputer
 

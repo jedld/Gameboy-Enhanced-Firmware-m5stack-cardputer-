@@ -340,6 +340,8 @@ static FirmwareSettings g_settings = {
 
 static constexpr size_t SAVE_STATE_SLOT_COUNT = 4;
 static constexpr uint32_t SAVE_STATE_MESSAGE_DURATION_MS = 2200;
+static constexpr uint32_t SAVE_STATE_FILE_MAGIC = 0x53534247; // "GBSS"
+static constexpr uint16_t SAVE_STATE_FILE_VERSION = 1;
 
 enum class StatusMessageKind : uint8_t {
   Info = 0,
@@ -347,27 +349,33 @@ enum class StatusMessageKind : uint8_t {
   Error
 };
 
+struct SaveStateFileHeader {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  uint32_t core_size;
+  uint32_t wram_size;
+  uint32_t vram_size;
+  uint32_t oam_size;
+  uint32_t hram_size;
+  uint32_t cart_ram_size;
+  uint64_t timestamp_us;
+} __attribute__((packed));
+
 struct SaveStateSlot {
   bool valid;
   uint64_t timestamp_us;
-  struct gb_s core_state;
-  uint8_t *wram;
-  uint8_t *vram;
-  uint8_t *oam;
-  uint8_t *hram_io;
-  uint8_t *cart_ram;
   size_t cart_ram_size;
+  uint16_t version;
+  char path[MAX_PATH_LEN];
 
   SaveStateSlot()
       : valid(false),
         timestamp_us(0),
-        core_state({}),
-        wram(nullptr),
-        vram(nullptr),
-        oam(nullptr),
-        hram_io(nullptr),
-        cart_ram(nullptr),
-        cart_ram_size(0) {}
+        cart_ram_size(0),
+        version(0) {
+    path[0] = '\0';
+  }
 };
 
 static char g_status_message[64] = {0};
@@ -453,10 +461,9 @@ static void configure_performance_profile();
 static const char *save_state_slot_label(size_t index);
 static void save_state_free_slot(SaveStateSlot &slot);
 static void save_state_clear_all(struct priv_t *priv);
-static uint8_t *save_state_alloc_buffer(size_t bytes, const char *label);
-static bool ensure_save_state_core_buffers(SaveStateSlot &slot);
-static bool ensure_save_state_buffers(SaveStateSlot &slot, size_t cart_ram_size);
-static bool save_state_slot_has_allocations(const SaveStateSlot &slot);
+static bool save_states_supported();
+static bool build_save_state_path(const struct priv_t *priv, size_t slot_index, char *out, size_t out_len);
+static void save_state_refresh_metadata(struct priv_t *priv);
 static void show_status_message(const char *message, StatusMessageKind kind);
 static void render_status_message_overlay();
 static bool save_state_store_slot(size_t slot_index);
@@ -464,7 +471,6 @@ static bool save_state_load_slot(size_t slot_index);
 static int save_state_slot_from_key(char key);
 static bool handle_save_state_shortcuts(const Keyboard_Class::KeysState &status);
 static void gb_printer_serial_tx(struct gb_s *gb, const uint8_t tx);
-static enum gb_serial_rx_ret_e gb_printer_serial_rx(struct gb_s *gb, uint8_t *rx);
 static void request_cache_recovery(bool restore_display, size_t desired_rom_banks);
 static void process_cache_recovery();
 
@@ -941,6 +947,7 @@ static TaskHandle_t render_task_handle = nullptr;
 #if ENABLE_SOUND
 static TaskHandle_t audio_task_handle = nullptr;
 #endif
+
 
 static constexpr uint32_t CACHE_RECOVERY_RETRY_INTERVAL_MS = 750;
 static constexpr size_t DISPLAY_CACHE_RESTORE_MARGIN_BYTES = 64 * 1024;
@@ -1543,30 +1550,11 @@ static const char *save_state_slot_label(size_t index) {
 }
 
 static void save_state_free_slot(SaveStateSlot &slot) {
-  if(slot.wram != nullptr) {
-    heap_caps_free(slot.wram);
-    slot.wram = nullptr;
-  }
-  if(slot.vram != nullptr) {
-    heap_caps_free(slot.vram);
-    slot.vram = nullptr;
-  }
-  if(slot.oam != nullptr) {
-    heap_caps_free(slot.oam);
-    slot.oam = nullptr;
-  }
-  if(slot.hram_io != nullptr) {
-    heap_caps_free(slot.hram_io);
-    slot.hram_io = nullptr;
-  }
-  if(slot.cart_ram != nullptr) {
-    heap_caps_free(slot.cart_ram);
-    slot.cart_ram = nullptr;
-  }
-  slot.cart_ram_size = 0;
   slot.valid = false;
   slot.timestamp_us = 0;
-  memset(&slot.core_state, 0, sizeof(slot.core_state));
+  slot.cart_ram_size = 0;
+  slot.version = 0;
+  slot.path[0] = '\0';
 }
 
 static void save_state_clear_all(struct priv_t *priv) {
@@ -1577,83 +1565,109 @@ static void save_state_clear_all(struct priv_t *priv) {
     save_state_free_slot(priv->save_slots[i]);
   }
 }
-
-static uint8_t *save_state_alloc_buffer(size_t bytes, const char *label) {
-  uint8_t *ptr = (uint8_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if(ptr == nullptr) {
-    ptr = (uint8_t *)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+ 
+static bool save_states_supported() {
+  if(!g_sd_mounted) {
+    return false;
   }
-  if(ptr == nullptr) {
-    Serial.printf("Save state allocation failed for %s (%u bytes)\n",
-                  label != nullptr ? label : "buffer",
-                  static_cast<unsigned>(bytes));
-  }
-  return ptr;
-}
-
-static bool ensure_save_state_core_buffers(SaveStateSlot &slot) {
-  if(slot.wram == nullptr) {
-    slot.wram = save_state_alloc_buffer(WRAM_TOTAL_SIZE, "WRAM snapshot");
-    if(slot.wram == nullptr) {
-      return false;
-    }
-  }
-  if(slot.vram == nullptr) {
-    slot.vram = save_state_alloc_buffer(VRAM_TOTAL_SIZE, "VRAM snapshot");
-    if(slot.vram == nullptr) {
-      return false;
-    }
-  }
-  if(slot.oam == nullptr) {
-    slot.oam = save_state_alloc_buffer(OAM_SIZE, "OAM snapshot");
-    if(slot.oam == nullptr) {
-      return false;
-    }
-  }
-  if(slot.hram_io == nullptr) {
-    slot.hram_io = save_state_alloc_buffer(HRAM_IO_SIZE, "HRAM snapshot");
-    if(slot.hram_io == nullptr) {
-      return false;
-    }
+  if(priv.rom_source == RomSource::None) {
+    return false;
   }
   return true;
 }
 
-static bool ensure_save_state_buffers(SaveStateSlot &slot, size_t cart_ram_size) {
-  if(!ensure_save_state_core_buffers(slot)) {
+static bool build_save_state_path(const struct priv_t *priv,
+                                  size_t slot_index,
+                                  char *out,
+                                  size_t out_len) {
+  if(priv == nullptr || out == nullptr || out_len == 0 || slot_index >= SAVE_STATE_SLOT_COUNT) {
     return false;
   }
 
-  if(cart_ram_size == 0) {
-    if(slot.cart_ram != nullptr) {
-      heap_caps_free(slot.cart_ram);
-      slot.cart_ram = nullptr;
+  const unsigned slot_number = static_cast<unsigned>(slot_index + 1);
+
+  if(priv->rom_source == RomSource::SdCard && priv->sd_rom_path_valid) {
+    char buffer[MAX_PATH_LEN];
+    strncpy(buffer, priv->sd_rom_path, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+    char *last_slash = strrchr(buffer, '/');
+    char *last_dot = strrchr(buffer, '.');
+    if(last_dot != nullptr && (last_slash == nullptr || last_dot > last_slash)) {
+      *last_dot = '\0';
     }
-    slot.cart_ram_size = 0;
-    return true;
+    int written = snprintf(out, out_len, "%s.ss%u", buffer, slot_number);
+    return written > 0 && static_cast<size_t>(written) < out_len;
   }
 
-  if(slot.cart_ram != nullptr && slot.cart_ram_size == cart_ram_size) {
-    return true;
+  if(priv->rom_source == RomSource::Embedded && priv->embedded_rom_entry != nullptr) {
+    const EmbeddedRomEntry *entry = priv->embedded_rom_entry;
+    const char *identifier_source = nullptr;
+    if(entry->id != nullptr && entry->id[0] != '\0') {
+      identifier_source = entry->id;
+    } else if(entry->name != nullptr && entry->name[0] != '\0') {
+      identifier_source = entry->name;
+    }
+
+    char identifier[64];
+    sanitise_identifier(identifier_source, identifier, sizeof(identifier));
+    if(identifier[0] == '\0') {
+      strncpy(identifier, "embedded", sizeof(identifier) - 1);
+      identifier[sizeof(identifier) - 1] = '\0';
+    }
+
+    int written = snprintf(out,
+                           out_len,
+                           "%s/%s_slot%u.ss",
+                           SAVES_DIR,
+                           identifier,
+                           slot_number);
+    return written > 0 && static_cast<size_t>(written) < out_len;
   }
 
-  if(slot.cart_ram != nullptr) {
-    heap_caps_free(slot.cart_ram);
-    slot.cart_ram = nullptr;
-  }
-
-  slot.cart_ram = save_state_alloc_buffer(cart_ram_size, "cart RAM snapshot");
-  if(slot.cart_ram == nullptr) {
-    slot.cart_ram_size = 0;
-    return false;
-  }
-  slot.cart_ram_size = cart_ram_size;
-  return true;
+  return false;
 }
 
-static bool save_state_slot_has_allocations(const SaveStateSlot &slot) {
-  return slot.wram != nullptr || slot.vram != nullptr || slot.oam != nullptr ||
-         slot.hram_io != nullptr || slot.cart_ram != nullptr;
+static void save_state_refresh_metadata(struct priv_t *priv) {
+  if(priv == nullptr) {
+    return;
+  }
+
+  for(size_t i = 0; i < SAVE_STATE_SLOT_COUNT; ++i) {
+    SaveStateSlot &slot = priv->save_slots[i];
+    char path[MAX_PATH_LEN];
+    if(!build_save_state_path(priv, i, path, sizeof(path))) {
+      save_state_free_slot(slot);
+      continue;
+    }
+
+    strncpy(slot.path, path, sizeof(slot.path) - 1);
+    slot.path[sizeof(slot.path) - 1] = '\0';
+
+    if(!save_states_supported()) {
+      slot.valid = false;
+      continue;
+    }
+
+    File file = SD.open(slot.path, FILE_READ);
+    if(!file) {
+      slot.valid = false;
+      continue;
+    }
+
+    SaveStateFileHeader header = {};
+    int read_bytes = file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header));
+    file.close();
+
+    if(read_bytes != static_cast<int>(sizeof(header)) || header.magic != SAVE_STATE_FILE_MAGIC) {
+      slot.valid = false;
+      continue;
+    }
+
+    slot.valid = (header.version <= SAVE_STATE_FILE_VERSION);
+    slot.version = header.version;
+    slot.timestamp_us = header.timestamp_us;
+    slot.cart_ram_size = header.cart_ram_size;
+  }
 }
 
 static void show_status_message(const char *message, StatusMessageKind kind) {
@@ -1753,8 +1767,8 @@ static bool save_state_store_slot(size_t slot_index) {
     return false;
   }
 
-  if(priv.rom_source == RomSource::None) {
-    show_status_message("Save failed: no game", StatusMessageKind::Error);
+  if(!save_states_supported()) {
+    show_status_message("Save failed: SD required", StatusMessageKind::Error);
     return false;
   }
 
@@ -1768,117 +1782,80 @@ static bool save_state_store_slot(size_t slot_index) {
     return false;
   }
 
-  SaveStateSlot &slot = priv.save_slots[slot_index];
+  char path[MAX_PATH_LEN];
+  if(!build_save_state_path(&priv, slot_index, path, sizeof(path))) {
+    show_status_message("Save failed: path error", StatusMessageKind::Error);
+    return false;
+  }
 
-  const size_t original_rom_cache_banks = priv.rom_cache.bank_count;
-  const bool display_cache_initially_enabled = swap_fb_enabled && swap_fb != nullptr;
-  bool display_cache_disabled_for_save = false;
+  if(priv.rom_source == RomSource::Embedded && !ensure_saves_dir()) {
+    show_status_message("Save failed: no saves dir", StatusMessageKind::Error);
+    return false;
+  }
 
-  auto ensure_buffers = [&]() -> bool {
-    return ensure_save_state_buffers(slot, priv.cart_ram_size);
+  SD.remove(path);
+  File file = SD.open(path, FILE_WRITE);
+  if(!file) {
+    Serial.printf("Save-state open failed: %s\n", path);
+    show_status_message("Save failed: SD write", StatusMessageKind::Error);
+    return false;
+  }
+
+  SaveStateFileHeader header = {};
+  header.magic = SAVE_STATE_FILE_MAGIC;
+  header.version = SAVE_STATE_FILE_VERSION;
+  header.core_size = sizeof(gb);
+  header.wram_size = WRAM_TOTAL_SIZE;
+  header.vram_size = VRAM_TOTAL_SIZE;
+  header.oam_size = OAM_SIZE;
+  header.hram_size = HRAM_IO_SIZE;
+  header.cart_ram_size = static_cast<uint32_t>(priv.cart_ram_size);
+  header.timestamp_us = micros64();
+
+  bool ok = true;
+  auto write_block = [&](const void *data, size_t bytes) {
+    if(!ok) {
+      return;
+    }
+    int written = file.write(reinterpret_cast<const uint8_t *>(data), bytes);
+    if(written != static_cast<int>(bytes)) {
+      ok = false;
+    }
   };
 
-  if(!ensure_buffers()) {
-    Serial.println("Save-state allocation failed; attempting to reclaim memory");
-
-    bool freed_any = false;
-    for(size_t i = 0; i < SAVE_STATE_SLOT_COUNT; ++i) {
-      if(i == slot_index) {
-        continue;
-      }
-      SaveStateSlot &candidate = priv.save_slots[i];
-      if(!candidate.valid && save_state_slot_has_allocations(candidate)) {
-        save_state_free_slot(candidate);
-        freed_any = true;
-      }
-    }
-    if(freed_any && ensure_buffers()) {
-      Serial.println("Recovered memory by clearing stale slot buffers");
-    } else {
-      if(swap_fb_enabled) {
-        display_cache_disabled_for_save = true;
-        disable_display_cache();
-      }
-
-      size_t current_banks = priv.rom_cache.bank_count;
-      while(current_banks > 1 && !ensure_buffers()) {
-        size_t target_banks = current_banks / 2;
-        if(target_banks < 1) {
-          target_banks = 1;
-        }
-        if(target_banks == current_banks) {
-          break;
-        }
-        Serial.printf("Trimming ROM cache banks %u -> %u to free memory for save state\n",
-                      (unsigned)current_banks,
-                      (unsigned)target_banks);
-        if(!rom_cache_trim_banks(&priv.rom_cache, target_banks)) {
-          break;
-        }
-        current_banks = priv.rom_cache.bank_count;
-        g_settings.rom_cache_banks = static_cast<uint8_t>(current_banks);
-        g_settings_dirty = true;
-      }
-
-      if(!ensure_buffers()) {
-        size_t victim_index = SIZE_MAX;
-        uint64_t oldest = UINT64_MAX;
-        for(size_t i = 0; i < SAVE_STATE_SLOT_COUNT; ++i) {
-          if(i == slot_index) {
-            continue;
-          }
-          const SaveStateSlot &candidate = priv.save_slots[i];
-          if(candidate.valid && candidate.timestamp_us < oldest) {
-            oldest = candidate.timestamp_us;
-            victim_index = i;
-          }
-        }
-
-        if(victim_index != SIZE_MAX) {
-          Serial.printf("Discarding %s to free memory\n",
-                        save_state_slot_label(victim_index));
-          save_state_free_slot(priv.save_slots[victim_index]);
-        }
-
-        if(!ensure_buffers()) {
-          Serial.println("Clearing all save-state slots to retry allocation");
-          save_state_clear_all(&priv);
-          if(!ensure_buffers()) {
-            show_status_message("Save failed: out of memory", StatusMessageKind::Error);
-            return false;
-          }
-        }
-      }
-    }
+  write_block(&header, sizeof(header));
+  write_block(&gb, sizeof(gb));
+  write_block(gb.wram, WRAM_TOTAL_SIZE);
+  write_block(gb.vram, VRAM_TOTAL_SIZE);
+  write_block(gb.oam, OAM_SIZE);
+  write_block(gb.hram_io, HRAM_IO_SIZE);
+  if(priv.cart_ram != nullptr && priv.cart_ram_size > 0) {
+    write_block(priv.cart_ram, priv.cart_ram_size);
   }
 
-  memcpy(&slot.core_state, &gb, sizeof(gb));
-  memcpy(slot.wram, gb.wram, WRAM_TOTAL_SIZE);
-  memcpy(slot.vram, gb.vram, VRAM_TOTAL_SIZE);
-  memcpy(slot.oam, gb.oam, OAM_SIZE);
-  memcpy(slot.hram_io, gb.hram_io, HRAM_IO_SIZE);
+  if(ok) {
+    file.flush();
+  }
+  file.close();
 
-  if(priv.cart_ram != nullptr && priv.cart_ram_size > 0 && slot.cart_ram != nullptr) {
-    memcpy(slot.cart_ram, priv.cart_ram, priv.cart_ram_size);
+  if(!ok) {
+    Serial.printf("Save-state write failed: %s\n", path);
+    SD.remove(path);
+    show_status_message("Save failed: SD write", StatusMessageKind::Error);
+    return false;
   }
 
-  slot.timestamp_us = micros64();
+  SaveStateSlot &slot = priv.save_slots[slot_index];
+  strncpy(slot.path, path, sizeof(slot.path) - 1);
+  slot.path[sizeof(slot.path) - 1] = '\0';
   slot.valid = true;
+  slot.timestamp_us = header.timestamp_us;
+  slot.cart_ram_size = priv.cart_ram_size;
+  slot.version = SAVE_STATE_FILE_VERSION;
 
   char message[48];
   snprintf(message, sizeof(message), "%s saved", save_state_slot_label(slot_index));
   show_status_message(message, StatusMessageKind::Success);
-
-  const bool need_display_restore = display_cache_disabled_for_save && display_cache_initially_enabled;
-  const bool need_rom_restore = (!priv.rom_cache.use_memory) &&
-                                (original_rom_cache_banks > 0) &&
-                                (priv.rom_cache.bank_count < original_rom_cache_banks);
-
-  if(need_display_restore || need_rom_restore) {
-    const size_t desired_banks = need_rom_restore ? original_rom_cache_banks : priv.rom_cache.bank_count;
-    request_cache_recovery(need_display_restore, desired_banks);
-  }
-
   return true;
 }
 
@@ -1895,35 +1872,124 @@ static bool save_state_load_slot(size_t slot_index) {
     return false;
   }
 
+  if(!save_states_supported()) {
+    show_status_message("Load failed: SD required", StatusMessageKind::Error);
+    return false;
+  }
+
   if(gb.wram == nullptr || gb.vram == nullptr || gb.oam == nullptr || gb.hram_io == nullptr) {
     show_status_message("Load failed: buffers not ready", StatusMessageKind::Error);
     return false;
   }
 
-  if(slot.cart_ram_size != priv.cart_ram_size) {
-    if(!(slot.cart_ram_size == 0 && priv.cart_ram_size == 0)) {
-      show_status_message("Load failed: incompatible cart RAM", StatusMessageKind::Error);
-      return false;
+  char path[MAX_PATH_LEN];
+  if(!build_save_state_path(&priv, slot_index, path, sizeof(path))) {
+    show_status_message("Load failed: path error", StatusMessageKind::Error);
+    return false;
+  }
+  strncpy(slot.path, path, sizeof(slot.path) - 1);
+  slot.path[sizeof(slot.path) - 1] = '\0';
+
+  File file = SD.open(slot.path, FILE_READ);
+  if(!file) {
+    Serial.printf("Save-state missing: %s\n", slot.path);
+    slot.valid = false;
+    show_status_message("Load failed: file missing", StatusMessageKind::Error);
+    return false;
+  }
+
+  SaveStateFileHeader header = {};
+  int read_bytes = file.read(reinterpret_cast<uint8_t *>(&header), sizeof(header));
+  if(read_bytes != static_cast<int>(sizeof(header))) {
+    file.close();
+    Serial.printf("Save-state header read failed (%d/%u): %s\n",
+                  read_bytes,
+                  static_cast<unsigned>(sizeof(header)),
+                  slot.path);
+    show_status_message("Load failed: corrupt header", StatusMessageKind::Error);
+    slot.valid = false;
+    return false;
+  }
+
+  if(header.magic != SAVE_STATE_FILE_MAGIC) {
+    file.close();
+    Serial.printf("Save-state magic mismatch: %s\n", slot.path);
+    show_status_message("Load failed: invalid file", StatusMessageKind::Error);
+    slot.valid = false;
+    return false;
+  }
+
+  if(header.version > SAVE_STATE_FILE_VERSION) {
+    file.close();
+    Serial.printf("Save-state version unsupported (%u>%u): %s\n",
+                  static_cast<unsigned>(header.version),
+                  static_cast<unsigned>(SAVE_STATE_FILE_VERSION),
+                  slot.path);
+    show_status_message("Load failed: newer format", StatusMessageKind::Error);
+    return false;
+  }
+
+  if(header.core_size != sizeof(gb) ||
+     header.wram_size != WRAM_TOTAL_SIZE ||
+     header.vram_size != VRAM_TOTAL_SIZE ||
+     header.oam_size != OAM_SIZE ||
+     header.hram_size != HRAM_IO_SIZE) {
+    file.close();
+    Serial.printf("Save-state size mismatch: %s\n", slot.path);
+    show_status_message("Load failed: incompatible build", StatusMessageKind::Error);
+    return false;
+  }
+
+  if(header.cart_ram_size != static_cast<uint32_t>(priv.cart_ram_size)) {
+    file.close();
+    Serial.printf("Save-state cart RAM mismatch (saved=%u, current=%u): %s\n",
+                  static_cast<unsigned>(header.cart_ram_size),
+                  static_cast<unsigned>(priv.cart_ram_size),
+                  slot.path);
+    show_status_message("Load failed: cart RAM mismatch", StatusMessageKind::Error);
+    return false;
+  }
+
+  struct gb_s core_buffer;
+  bool ok = true;
+  auto read_block = [&](void *dest, size_t bytes) {
+    if(!ok) {
+      return;
+    }
+    int got = file.read(reinterpret_cast<uint8_t *>(dest), bytes);
+    if(got != static_cast<int>(bytes)) {
+      ok = false;
+    }
+  };
+
+  read_block(&core_buffer, sizeof(core_buffer));
+  read_block(gb.wram, WRAM_TOTAL_SIZE);
+  read_block(gb.vram, VRAM_TOTAL_SIZE);
+  read_block(gb.oam, OAM_SIZE);
+  read_block(gb.hram_io, HRAM_IO_SIZE);
+
+  if(priv.cart_ram_size > 0) {
+    if(priv.cart_ram == nullptr) {
+      ok = false;
+    } else {
+      read_block(priv.cart_ram, priv.cart_ram_size);
     }
   }
 
-  if(slot.cart_ram_size > 0 && slot.cart_ram == nullptr) {
-    show_status_message("Load failed: slot missing cart RAM", StatusMessageKind::Error);
+  file.close();
+
+  if(!ok) {
+    Serial.printf("Save-state payload read failed: %s\n", slot.path);
+    show_status_message("Load failed: corrupt data", StatusMessageKind::Error);
+    slot.valid = false;
     return false;
   }
 
-  if(slot.cart_ram_size > 0 && (priv.cart_ram == nullptr || priv.cart_ram_size == 0)) {
-    show_status_message("Load failed: cart RAM unavailable", StatusMessageKind::Error);
-    return false;
-  }
-
-  memcpy(&gb, &slot.core_state, sizeof(gb));
+  memcpy(&gb, &core_buffer, sizeof(gb));
   gb.gb_rom_read = &gb_rom_read;
   gb.gb_cart_ram_read = &gb_cart_ram_read;
   gb.gb_cart_ram_write = &gb_cart_ram_write;
   gb.gb_error = &gb_error;
-  gb.gb_serial_tx = &gb_printer_serial_tx;
-  gb.gb_serial_rx = &gb_printer_serial_rx;
   gb.direct.priv = &priv;
 
 #if ENABLE_MBC7
@@ -1932,13 +1998,7 @@ static bool save_state_load_slot(size_t slot_index) {
   }
 #endif
 
-  memcpy(gb.wram, slot.wram, WRAM_TOTAL_SIZE);
-  memcpy(gb.vram, slot.vram, VRAM_TOTAL_SIZE);
-  memcpy(gb.oam, slot.oam, OAM_SIZE);
-  memcpy(gb.hram_io, slot.hram_io, HRAM_IO_SIZE);
-
-  if(priv.cart_ram != nullptr && priv.cart_ram_size > 0 && slot.cart_ram != nullptr) {
-    memcpy(priv.cart_ram, slot.cart_ram, priv.cart_ram_size);
+  if(priv.cart_ram != nullptr && priv.cart_ram_size > 0) {
     priv.cart_ram_dirty = true;
     priv.cart_ram_loaded = true;
     priv.cart_ram_last_flush_ms = millis();
@@ -1954,6 +2014,11 @@ static bool save_state_load_slot(size_t slot_index) {
   if(swap_fb_enabled) {
     memset(swap_row_hash, 0, sizeof(swap_row_hash));
   }
+
+  slot.valid = true;
+  slot.version = header.version;
+  slot.timestamp_us = header.timestamp_us;
+  slot.cart_ram_size = header.cart_ram_size;
 
   char message[48];
   snprintf(message, sizeof(message), "%s loaded", save_state_slot_label(slot_index));
@@ -1982,14 +2047,18 @@ static int save_state_slot_from_key(char key) {
 }
 
 static bool handle_save_state_shortcuts(const Keyboard_Class::KeysState &status) {
-  if(!status.fn) {
+  const bool save_mode = status.fn;
+  const bool load_mode = status.ctrl;
+
+  if(!save_mode && !load_mode) {
     g_save_state_hotkey_mask = 0;
     return false;
   }
 
   uint16_t current_mask = 0;
   bool handled = false;
-  const bool load_mode = status.shift || status.ctrl || status.alt || status.opt;
+  const bool perform_load = load_mode;
+  const bool perform_save = save_mode && !load_mode;
 
   for(char key : status.word) {
     const int slot = save_state_slot_from_key(key);
@@ -2001,17 +2070,22 @@ static bool handle_save_state_shortcuts(const Keyboard_Class::KeysState &status)
     if((g_save_state_hotkey_mask & bit) != 0) {
       continue;
     }
-    if(load_mode) {
+    if(perform_load) {
       save_state_load_slot(static_cast<size_t>(slot));
-    } else {
-      save_state_store_slot(static_cast<size_t>(slot));
+      handled = true;
+      continue;
     }
-    handled = true;
+    if(perform_save) {
+      save_state_store_slot(static_cast<size_t>(slot));
+      handled = true;
+      continue;
+    }
   }
 
   g_save_state_hotkey_mask = current_mask;
   return handled;
 }
+
 
 static void apply_default_button_mapping() {
   memcpy(g_settings.button_mapping,
@@ -2740,6 +2814,15 @@ static void poll_keyboard() {
       return;
     }
     const char normalized = static_cast<char>(std::tolower(static_cast<unsigned char>(key)));
+
+    // Provide a few ergonomic aliases so common keys still trigger Start/Select
+    // even if the default keyboard mapping expects the tiny number row.
+    if(key == '\n' || key == '\r') {
+      press_button(JoypadButton::Start);
+    } else if(key == ' ') {
+      press_button(JoypadButton::Select);
+    }
+
     for(size_t i = 0; i < JOYPAD_BUTTON_COUNT; ++i) {
       const uint8_t binding = g_settings.button_mapping[i];
       if(binding == 0) {
@@ -2751,22 +2834,13 @@ static void poll_keyboard() {
     }
   };
 
+  const bool save_hotkeys_active = status.fn;
+  const bool load_hotkeys_active = status.ctrl;
+
   if(local_keyboard_pressed) {
     for(auto key : status.word) {
-      if(status.fn) {
-        switch(key) {
-          case '1':
-          case '2':
-          case '3':
-          case '4':
-          case '!':
-          case '@':
-          case '#':
-          case '$':
-            continue;
-          default:
-            break;
-        }
+      if((save_hotkeys_active || load_hotkeys_active) && save_state_slot_from_key(key) >= 0) {
+        continue;
       }
       handle_key(key);
     }
@@ -2776,8 +2850,8 @@ static void poll_keyboard() {
   ExternalInput::instance().apply([&](uint8_t keycode) {
     char translated = hid_keycode_to_ascii(keycode);
     if(translated != 0) {
-      if(!(status.fn && (translated == '1' || translated == '2' ||
-                         translated == '3' || translated == '4'))) {
+      if(!((save_hotkeys_active || load_hotkeys_active) &&
+           save_state_slot_from_key(translated) >= 0)) {
         handle_key(translated);
       }
     }
@@ -2911,20 +2985,6 @@ void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr,
   p->cart_ram[addr] = val;
   p->cart_ram_dirty = true;
   p->cart_save_write_failed = false;
-}
-
-static void gb_printer_serial_tx(struct gb_s *gb, const uint8_t tx) {
-  (void)gb;
-  g_printer.onTransmit(tx);
-}
-
-static enum gb_serial_rx_ret_e gb_printer_serial_rx(struct gb_s *gb, uint8_t *rx) {
-  (void)gb;
-  if(rx == nullptr) {
-    return GB_SERIAL_RX_NO_CONNECTION;
-  }
-  *rx = g_printer.lastResponse();
-  return GB_SERIAL_RX_SUCCESS;
 }
 
 /**
@@ -4530,19 +4590,24 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
         src_y = max_src;
       }
 
-      int y0 = static_cast<int>(src_y);
-      float frac = src_y - static_cast<float>(y0);
-
-      if(frac >= 0.5f && y0 < LCD_HEIGHT - 1) {
-        y0 += 1;
+      int y0 = static_cast<int>(floorf(src_y));
+      if(y0 < 0) {
+        y0 = 0;
       }
 
-      if(y0 >= LCD_HEIGHT) {
+      float frac = src_y - static_cast<float>(y0);
+      if(y0 >= static_cast<int>(LCD_HEIGHT - 1)) {
         y0 = LCD_HEIGHT - 1;
+        frac = 0.0f;
+      }
+
+      uint16_t weight = static_cast<uint16_t>(frac * 256.0f + 0.5f);
+      if(weight > 256) {
+        weight = 256;
       }
 
       frame_row_map[j] = static_cast<uint8_t>(y0);
-      frame_row_weight[j] = 0;
+      frame_row_weight[j] = weight;
     }
     frame_row_map_initialised = true;
   }
@@ -6605,7 +6670,6 @@ void setup() {
   Serial.println("Cardputer firmware booting...");
   configure_performance_profile();
   reset_save_state(&priv);
-  g_printer.reset(true);
 
   bool psram_ok = psramInit();
   Serial.printf("PSRAM init: %s, size=%u bytes, free=%u bytes\n",
@@ -6693,7 +6757,6 @@ void setup() {
   // Initialize GameBoy emulation context.
   enum gb_init_error_e ret = GB_INIT_NO_ERROR;
   while(true) {
-    g_printer.reset(false);
     palette_apply_dmg(&priv.palette);
     priv.rom_is_cgb = false;
     priv.rom_is_cgb_only = false;
@@ -6767,6 +6830,7 @@ void setup() {
             debugPrint("CGB-only ROM support is experimental");
             delay(500);
           }
+          save_state_refresh_metadata(&priv);
           rom_ready = true;
           continue;
         } else {
@@ -6851,6 +6915,7 @@ void setup() {
             debugPrint("CGB-only ROM support is experimental");
             delay(500);
           }
+          save_state_refresh_metadata(&priv);
           rom_ready = true;
           continue;
         } else {
@@ -6903,6 +6968,7 @@ void setup() {
           debugPrint("CGB-only ROM support is experimental");
           delay(500);
         }
+        save_state_refresh_metadata(&priv);
         rom_ready = true;
       } else {
         clear_sd_rom_path(&priv);
@@ -6971,11 +7037,6 @@ void setup() {
     priv.rom_source = RomSource::None;
     priv.embedded_rom = nullptr;
     priv.embedded_rom_size = 0;
-  }
-
-  if(ret == GB_INIT_NO_ERROR) {
-    g_printer.reset(false);
-    gb_init_serial(&gb, &gb_printer_serial_tx, &gb_printer_serial_rx);
   }
 
   if(ret == GB_INIT_NO_ERROR && priv.rom_is_cgb) {
@@ -7185,7 +7246,8 @@ void setup() {
 #endif
 
   const bool uses_mbc7_eeprom = (ENABLE_MBC7 != 0) && (gb.mbc == 7);
-  const size_t requested_cart_ram = gb_get_save_size(&gb);
+  size_t requested_cart_ram = 0;
+  gb_get_save_size_s(&gb, &requested_cart_ram);
   bool cart_ram_required = (requested_cart_ram > 0);
 
   priv.cart_ram_size = 0;
