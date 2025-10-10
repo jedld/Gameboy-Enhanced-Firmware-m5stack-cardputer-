@@ -1,16 +1,5 @@
-For submittting bug reports or for other inquries, I have been using gameboyenhancedfirmware@gmail.com. I am also active in the Cardputer reddit and discord.
-
-*Note: There has been some confusion regarding my releases on Github and source code. I have not uploaded the main projects source code as plans have changed along the way. Originally I was going to polish the implementation and release it to be finished by the community, but just as I begun the project was archived by the original author. This resulted in a very low-effort release of the same firmware without credit to the original author for their implementation landing on m5burner at approximately the same time as my version. As this is my return to coding after a 14 year hiatus, I've decided that rather than have my additions copied with no meaningful contributions or acknowledgement, that I'd just finish the entire emulator myself and release full source code after I have finished my work and had my fun with this project. This seems preferable to having my passion for the project deflated. I've been sharing detailed change logs, and under /rCardputer on reddit and the Cardputer Discord, I am always willing to go into further detail of the specifics of the solutions I have employed in the interest of helping the budding developer. In addition, the cgb.h & sgb.h files shows how I am handling palettes. The CGB palettes aren't great, but they are the accurate. The SGB.h file contains the official 32 included palettes, in addition to palettes that I have gathered from a variety of sources(by hand using screenshots & community created palettes) along with the title mapping information that similary was gathered from a variety of sources. The format is ob0 0 1 2 3 ob1 0 1 2 3 bg 0 1 2 3  for the 12 colour palettes in RGB888. These are converted to RGB565 when a palettte is selected. sgb.h is in 12 color format which may seem confusing, this is for consitency with other colour modes within the emulator and could be reduced to 4 color paletttes. Since there are so few of them, and they are stored in the firmwares ROM, it hasn't been a concern. DMG.h contains a copy of the open source boot rom https://github.com/Hacktix/Bootix for use with Peanut_GB
-
-Finally, in order to share the lessons I've learned during the course of this project, I've created an Unofficial Cardputer Developer Reference Manual. The work I've done on this project directly influenced the guide I've written under the 'Game Development on the CardPuter' heading in the navigation panel. These are topics that have direct application for game projects on the cardputer, but also may be helpful for other projects. 'Arduino Development Specifics' contains some detail on customizing the runtime environment of your sketch by adjusting the stacksize and priority of the main thread and changing the behaviour of the watchdog timers.
-
-http://cardputer.free.nf/
-
-This is a resource I have created to help other developers learn and develop quality software for the CardPuter. If your frustrated at the lack of source code of the main project, oh well, I'm sharing with the community in my own way.
-
-![image](https://github.com/Mr-PauI/gb_cardputer_mod/assets/169319235/5a9bf85b-0a44-4f37-931b-c06ac70d62a3)
-
-Updates are more frequent on m5burner than github, but I'm trying to drop a binary here now and then.
+This is a fork of https://github.com/Mr-PauI/Gameboy-Enhanced-Firmware-m5stack-cardputer- with
+an emphasis on Gameboy Color support.
 
 Gameboy Emulator; complete with audio, configurable controls, display and performance options, savegames, save states, filesystem navigation and no .gb ROM file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. DMG titles automatically receive authentic Game Boy Color colourisation, including the original boot-time button combos for palette selection. The Options menu also exposes a stretch-to-width toggle if you prefer filling the Cardputer display over pillarboxed output. A four-slot quick save-state system with on-screen feedback lets you checkpoint and recover progress without leaving the emulator loop.
 
@@ -145,7 +134,7 @@ arduino-cli upload --fqbn m5stack:esp32:m5stack_cardputer -p /dev/ttyACM0 gb_car
 
 Adjust the serial port (`-p`) to match your system. The first two commands only need to be executed once per environment.
 
-Pokemon Silver/Gold,  Dragon Warrior I&II and Azure dreams are the only confirmed fully supported .gbc titles, backwards compatible with the original gameboy and run in that mode. Emulator will behave as if you placed a gameboy colour cartridge into an original gameboy in most instances. Feel free to try other backwards compatible gbc games, but no garuntees on compatiblity. All *.gb and *.gbc files are listed by the file explorer in the current directory. 
+Gameboy Color support is experimental and there would probably be performance issues, glitches, corruption and unexpected behavior. All `.gb` and `.gbc` files are listed by the file explorer in the current directory. 
 
 Read the instructions at the bottom for controls or refer to the graphic guide below. Forked from original gb_cardputer implementation. No bootloader has been merged with this firmware (at this time), so if you are having issues try using m5launcher to install.
 
@@ -157,7 +146,7 @@ Read the instructions at the bottom for controls or refer to the graphic guide b
 List of SGB and Analogue Pocket enhanced titles:
 * Adventures of Lolo
 * Alleyway
-* Arcade Classics No 1: Missle Command & Asteroids
+* Arcade Classics No 1: Missile Command & Asteroids
 * Arcade Classics No 2: Centipede and Millipede
 * Balloon kid
 * Baseball
@@ -204,6 +193,11 @@ List of SGB and Analogue Pocket enhanced titles:
 * Yakyuman
 * Yoshi
 
+10.10.2025:0.1
+
+* Forked jedld version
+* sync with latest peanut_gb
+* save states
 
 24.07.2024:0.78
 
@@ -238,7 +232,7 @@ sound as the next game starts. This is just left over audio buffer info from the
 
 25.06.2024:v0.75
 * Firmware now contains bootloader so it can be loaded without a launcher/direct from m5burner
-* Added SGP & AP support for Mega Man I/II and Mystic Quest
+* Added SGB & AP support for Mega Man I/II and Mystic Quest
 * Added USB serial debug output to the entire function chain leading up to the main emulator loop. This should hopefully aid in helping debug games, and provide more comprehensive information for trouble shooting.
 * Added CPU mode to settings menu (CPU MODE: FAST/COMPATIBLE), defaults to fast. Enabled automatically for titles known to need this: Battlezone so far, will add any reported titles. For now it takes effect only upon restart of the emulator (will take effect immediately in future update). This disables all speed hacks,and forces rendering of every line of every frame.
 * BLE gamepad support only stable in file picker, causes restart during emulation so still disabled.
@@ -263,7 +257,7 @@ sound as the next game starts. This is just left over audio buffer info from the
   
 18.05.2024:v0.71
 * Added SGB profiles for Alleyway, Baseball, Dr. Mario, Game Boy Wars, Kaeru no Tame, Kirbys Dream Land, Mario and Yoshi,Qix,Tennis,X,Yakyuman,Yoshi
-(note: not all of these are compatible, but it almost completes the built in SGB maps that were included in the SGB hardware; future core updates may improve compatibilty)
+(note: not all of these are compatible, but it almost completes the built-in SGB maps that were included in the SGB hardware; future core updates may improve compatibility)
 * Added AP profiles for Alleyway, Baseball, Dr. Mario
 * Added bluetooth library to the emulator, this has a fairly substantial memory cost and will be disabled until ready for deployment; made inclusion of the BLE code optional when compiling.
 * Added initial hooks for gamepad support.
@@ -286,13 +280,14 @@ sound as the next game starts. This is just left over audio buffer info from the
 * Added Metroid II SGB & AP support
 * Added Golf SGB & AP support
 * Added Solar Striker SGB & AP support
-* Added Missle Command/Asteroids SGB and AP support w/ border
+* Added Missile Command/Asteroids SGB and AP support w/ border
 * Added Space Invaders SGB & SP support w/ Border
 
 10.10.2025:Cardputer port
 * Added four quick save-state slots with Fn hotkeys and modifier-based loading.
 * Added an in-game status message overlay for save/load feedback and other system notices.
 * Save-state buffers now auto-dispose when switching ROMs to reclaim PSRAM instantly.
+* Refined LCD scaling so downsampled text retains its full outline on the Cardputer display.
 
 01.10.2025:Cardputer port
 * Automatically detects Game Boy Color compatible ROMs on the Cardputer port and enables colour palettes based on the ROM header hash.
@@ -348,7 +343,7 @@ No issue with long file names, the memsub_malloc() has 65k roughly allocated per
 * Added mute and volume half/max contols to Fn+Left/Right keys
   
 01.05.2024:v0.621
-* Experimented with an inline version of the ganeboy CPU its various functions but they yeilded no performance gain
+* Experimented with an inline version of the Game Boy CPU and its various functions but they yielded no performance gain
 * CPU step loop moved inside of peanut_gb to reduce function calls, essentially the same as inline but with no memory penalty
   
 30.05.2024.v0.62
