@@ -10,6 +10,11 @@ Gameboy Emulator; complete with audio, configurable controls, display and perfor
 * Each action confirms with a colour-coded banner (green = saved, grey = empty slot, red = failure) rendered directly over the gameplay framebuffer.
 * Slots persist per cartridge and reload automatically after a reset or power cycle; switch to a different ROM to start with fresh slots. Battery-backed saves continue to flush automatically in the background.
 
+### Screenshots
+
+* Hold `Fn` and tap `P` to capture the current gameplay frame.
+* Screenshots are stored as 24-bit BMP files under `/screenshots/` on the SD card and are named `<rom>_<timestamp>.bmp` for easy sorting.
+
 ## Compiling the firmware for the M5Stack Cardputer
 
 ### Prerequisites

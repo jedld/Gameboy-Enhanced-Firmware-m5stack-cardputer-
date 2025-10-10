@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <limits.h>
+#include <time.h>
 #include <esp_heap_caps.h>
 #include <esp_attr.h>
 #include <esp32-hal-psram.h>
@@ -183,6 +184,9 @@ static uint16_t frame_row_weight[DEST_H];
 static uint32_t swap_row_hash[DEST_H];
 static constexpr unsigned int FALLBACK_SEGMENT_ROWS = 4;
 static uint16_t fallback_segment_buffer[FALLBACK_SEGMENT_ROWS * DEST_W];
+static uint8_t g_last_display_fb_index = 0;
+static bool g_last_display_frame_valid = false;
+static uint64_t g_last_display_frame_timestamp_us = 0;
 
 static void disable_display_cache() {
   if(swap_fb_enabled) {
@@ -314,6 +318,8 @@ static constexpr const char *SETTINGS_FILE_PATH = "/config/cardputer_settings.in
 static constexpr const char *SAVES_DIR = "/saves";
 static constexpr const char *SAVE_FILE_EXTENSION = ".sav";
 static constexpr const char *MBC7_FILE_EXTENSION = ".mbc7";
+static constexpr const char *SCREENSHOT_DIR = "/screenshots";
+static constexpr const char *SCREENSHOT_EXTENSION = ".bmp";
 static constexpr uint32_t SAVE_AUTO_FLUSH_INTERVAL_MS = 4000;
 static constexpr uint32_t SAVE_FLUSH_RETRY_DELAY_MS = 1000;
 static constexpr size_t MBC7_EEPROM_WORD_COUNT = 128;
@@ -2086,6 +2092,311 @@ static bool handle_save_state_shortcuts(const Keyboard_Class::KeysState &status)
   return handled;
 }
 
+static bool ensure_screenshot_dir() {
+  if(!ensure_sd_card(false)) {
+    return false;
+  }
+  if(SD.exists(SCREENSHOT_DIR)) {
+    return true;
+  }
+  if(SD.mkdir(SCREENSHOT_DIR)) {
+    return true;
+  }
+  Serial.println("Failed to create screenshots directory on SD");
+  return false;
+}
+
+static void build_screenshot_identifier(const struct priv_t *priv_ctx,
+                                        char *output,
+                                        size_t output_len) {
+  if(output == nullptr || output_len == 0) {
+    return;
+  }
+  output[0] = '\0';
+  if(priv_ctx == nullptr) {
+    return;
+  }
+
+  if(priv_ctx->rom_source == RomSource::SdCard && priv_ctx->sd_rom_path_valid) {
+    char buffer[MAX_PATH_LEN];
+    strncpy(buffer, priv_ctx->sd_rom_path, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+    char *name = strrchr(buffer, '/');
+    name = (name != nullptr && name[1] != '\0') ? name + 1 : buffer;
+    char base[128];
+    strncpy(base, name, sizeof(base) - 1);
+    base[sizeof(base) - 1] = '\0';
+    char *dot = strrchr(base, '.');
+    if(dot != nullptr) {
+      *dot = '\0';
+    }
+    sanitise_identifier(base, output, output_len);
+  } else if(priv_ctx->rom_source == RomSource::Embedded && priv_ctx->embedded_rom_entry != nullptr) {
+    const EmbeddedRomEntry *entry = priv_ctx->embedded_rom_entry;
+    const char *identifier_source = nullptr;
+    if(entry->id != nullptr && entry->id[0] != '\0') {
+      identifier_source = entry->id;
+    } else if(entry->name != nullptr && entry->name[0] != '\0') {
+      identifier_source = entry->name;
+    }
+    sanitise_identifier(identifier_source, output, output_len);
+  }
+
+  if(output[0] == '\0') {
+    strncpy(output, "screenshot", output_len - 1);
+    output[output_len - 1] = '\0';
+  }
+}
+
+static void format_screenshot_timestamp(char *buffer, size_t buffer_len) {
+  if(buffer == nullptr || buffer_len == 0) {
+    return;
+  }
+  buffer[0] = '\0';
+
+  time_t now = time(nullptr);
+  struct tm tm_info;
+  if(now != static_cast<time_t>(-1) && localtime_r(&now, &tm_info) != nullptr && tm_info.tm_year >= 70) {
+    if(strftime(buffer, buffer_len, "%Y%m%d-%H%M%S", &tm_info) > 0) {
+      return;
+    }
+  }
+
+  const unsigned long long fallback = static_cast<unsigned long long>(g_last_display_frame_timestamp_us != 0
+                                                                           ? g_last_display_frame_timestamp_us
+                                                                           : micros64());
+  snprintf(buffer, buffer_len, "t%llu", fallback);
+}
+
+static bool build_screenshot_path(char *out, size_t out_len) {
+  if(out == nullptr || out_len == 0) {
+    return false;
+  }
+
+  char identifier[64];
+  build_screenshot_identifier(&priv, identifier, sizeof(identifier));
+
+  char timestamp[32];
+  format_screenshot_timestamp(timestamp, sizeof(timestamp));
+
+  int written = snprintf(out,
+                         out_len,
+                         "%s/%s_%s%s",
+                         SCREENSHOT_DIR,
+                         identifier,
+                         timestamp,
+                         SCREENSHOT_EXTENSION);
+  if(written <= 0 || static_cast<size_t>(written) >= out_len) {
+    return false;
+  }
+  if(!SD.exists(out)) {
+    return true;
+  }
+
+  for(uint32_t index = 1; index < 1000; ++index) {
+    written = snprintf(out,
+                       out_len,
+                       "%s/%s_%s_%02u%s",
+                       SCREENSHOT_DIR,
+                       identifier,
+                       timestamp,
+                       static_cast<unsigned>(index),
+                       SCREENSHOT_EXTENSION);
+    if(written > 0 && static_cast<size_t>(written) < out_len && !SD.exists(out)) {
+      return true;
+    }
+  }
+
+  Serial.println("Failed to allocate unique screenshot filename");
+  return false;
+}
+
+static bool capture_screenshot() {
+  if(!ensure_screenshot_dir()) {
+    show_status_message("Screenshot failed: SD missing", StatusMessageKind::Error);
+    return false;
+  }
+
+  const uint16_t *source = nullptr;
+  if(g_last_display_frame_valid) {
+    uint8_t index = g_last_display_fb_index;
+    if(index < 2 && priv.framebuffers[index] != nullptr) {
+      source = priv.framebuffers[index];
+    }
+  }
+  if(source == nullptr && priv.framebuffers[priv.write_fb_index] != nullptr) {
+    source = priv.framebuffers[priv.write_fb_index];
+  }
+  if(source == nullptr) {
+    show_status_message("Screenshot failed: no frame", StatusMessageKind::Error);
+    return false;
+  }
+
+  const size_t pixel_count = LCD_WIDTH * LCD_HEIGHT;
+  const size_t copy_bytes = pixel_count * sizeof(uint16_t);
+  uint16_t *frame_copy = (uint16_t *)heap_caps_malloc(copy_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if(frame_copy == nullptr) {
+    frame_copy = (uint16_t *)heap_caps_malloc(copy_bytes, MALLOC_CAP_8BIT);
+  }
+  if(frame_copy == nullptr) {
+    show_status_message("Screenshot failed: out of memory", StatusMessageKind::Error);
+    return false;
+  }
+  memcpy(frame_copy, source, copy_bytes);
+
+  const size_t row_stride = ((LCD_WIDTH * 3u) + 3u) & ~3u;
+  const size_t bmp_bytes = row_stride * LCD_HEIGHT;
+  uint8_t *bmp_buffer = (uint8_t *)heap_caps_malloc(bmp_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if(bmp_buffer == nullptr) {
+    bmp_buffer = (uint8_t *)heap_caps_malloc(bmp_bytes, MALLOC_CAP_8BIT);
+  }
+  if(bmp_buffer == nullptr) {
+    heap_caps_free(frame_copy);
+    show_status_message("Screenshot failed: out of memory", StatusMessageKind::Error);
+    return false;
+  }
+  memset(bmp_buffer, 0, bmp_bytes);
+
+  for(size_t y = 0; y < LCD_HEIGHT; ++y) {
+    const size_t src_y = LCD_HEIGHT - 1 - y;
+    const uint16_t *src_row = frame_copy + (src_y * LCD_WIDTH);
+    uint8_t *dst = bmp_buffer + y * row_stride;
+    for(size_t x = 0; x < LCD_WIDTH; ++x) {
+      const uint16_t pixel = src_row[x];
+      const uint8_t r5 = static_cast<uint8_t>((pixel >> 11) & 0x1F);
+      const uint8_t g6 = static_cast<uint8_t>((pixel >> 5) & 0x3F);
+      const uint8_t b5 = static_cast<uint8_t>(pixel & 0x1F);
+      const size_t dst_index = x * 3u;
+      dst[dst_index + 0] = static_cast<uint8_t>((b5 << 3) | (b5 >> 2));
+      dst[dst_index + 1] = static_cast<uint8_t>((g6 << 2) | (g6 >> 4));
+      dst[dst_index + 2] = static_cast<uint8_t>((r5 << 3) | (r5 >> 2));
+    }
+  }
+
+  heap_caps_free(frame_copy);
+
+  char path[MAX_PATH_LEN];
+  if(!build_screenshot_path(path, sizeof(path))) {
+    heap_caps_free(bmp_buffer);
+    show_status_message("Screenshot failed: name", StatusMessageKind::Error);
+    return false;
+  }
+
+  struct __attribute__((packed)) ScreenshotBmpFileHeader {
+    uint16_t type;
+    uint32_t size;
+    uint16_t reserved1;
+    uint16_t reserved2;
+    uint32_t offset;
+  } file_header;
+
+  struct __attribute__((packed)) ScreenshotBmpInfoHeader {
+    uint32_t size;
+    int32_t width;
+    int32_t height;
+    uint16_t planes;
+    uint16_t bit_count;
+    uint32_t compression;
+    uint32_t image_size;
+    int32_t x_ppm;
+    int32_t y_ppm;
+    uint32_t colours_used;
+    uint32_t colours_important;
+  } info_header;
+
+  const uint32_t headers_size = sizeof(file_header) + sizeof(info_header);
+  file_header.type = 0x4D42;
+  file_header.size = headers_size + static_cast<uint32_t>(bmp_bytes);
+  file_header.reserved1 = 0;
+  file_header.reserved2 = 0;
+  file_header.offset = headers_size;
+
+  info_header.size = sizeof(info_header);
+  info_header.width = static_cast<int32_t>(LCD_WIDTH);
+  info_header.height = static_cast<int32_t>(LCD_HEIGHT);
+  info_header.planes = 1;
+  info_header.bit_count = 24;
+  info_header.compression = 0;
+  info_header.image_size = static_cast<uint32_t>(bmp_bytes);
+  info_header.x_ppm = 2835;
+  info_header.y_ppm = 2835;
+  info_header.colours_used = 0;
+  info_header.colours_important = 0;
+
+  File file = SD.open(path, FILE_WRITE);
+  if(!file) {
+    heap_caps_free(bmp_buffer);
+    show_status_message("Screenshot failed: SD write", StatusMessageKind::Error);
+    Serial.printf("Screenshot: failed to open %s for write\n", path);
+    return false;
+  }
+
+  bool ok = true;
+  if(file.write(reinterpret_cast<const uint8_t *>(&file_header), sizeof(file_header)) != sizeof(file_header)) {
+    ok = false;
+  }
+  if(ok && file.write(reinterpret_cast<const uint8_t *>(&info_header), sizeof(info_header)) != sizeof(info_header)) {
+    ok = false;
+  }
+  if(ok && file.write(bmp_buffer, bmp_bytes) != static_cast<int>(bmp_bytes)) {
+    ok = false;
+  }
+  file.close();
+  heap_caps_free(bmp_buffer);
+
+  if(!ok) {
+    SD.remove(path);
+    show_status_message("Screenshot failed: SD write", StatusMessageKind::Error);
+    Serial.printf("Screenshot: failed during write %s\n", path);
+    return false;
+  }
+
+  const char *basename = strrchr(path, '/');
+  basename = (basename != nullptr && basename[1] != '\0') ? basename + 1 : path;
+
+  char message[64];
+  snprintf(message, sizeof(message), "Screenshot saved: %s", basename);
+  show_status_message(message, StatusMessageKind::Success);
+  Serial.printf("Screenshot saved to %s (%ux%u)\n",
+                path,
+                static_cast<unsigned>(LCD_WIDTH),
+                static_cast<unsigned>(LCD_HEIGHT));
+  return true;
+}
+
+static bool handle_screenshot_shortcut(const Keyboard_Class::KeysState &status,
+                                       bool *out_consume_key) {
+  static bool hotkey_latched = false;
+  if(out_consume_key != nullptr) {
+    *out_consume_key = false;
+  }
+
+  bool has_trigger_key = false;
+  for(char key : status.word) {
+    if(key == 'p' || key == 'P') {
+      has_trigger_key = true;
+      break;
+    }
+  }
+
+  const bool modifier_active = status.fn;
+  if(out_consume_key != nullptr) {
+    *out_consume_key = modifier_active && has_trigger_key;
+  }
+
+  if(modifier_active && has_trigger_key) {
+    if(!hotkey_latched) {
+      hotkey_latched = true;
+      capture_screenshot();
+      return true;
+    }
+  } else {
+    hotkey_latched = false;
+  }
+
+  return false;
+}
+
 
 static void apply_default_button_mapping() {
   memcpy(g_settings.button_mapping,
@@ -2774,6 +3085,8 @@ static void poll_keyboard() {
   Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
   handle_volume_keys(status);
   handle_save_state_shortcuts(status);
+  bool consume_screenshot_key = false;
+  handle_screenshot_shortcut(status, &consume_screenshot_key);
   const bool local_keyboard_pressed = M5Cardputer.Keyboard.isPressed();
 
 #if ENABLE_BLUETOOTH_CONTROLLERS
@@ -2839,6 +3152,9 @@ static void poll_keyboard() {
 
   if(local_keyboard_pressed) {
     for(auto key : status.word) {
+      if(consume_screenshot_key && (key == 'p' || key == 'P')) {
+        continue;
+      }
       if((save_hotkeys_active || load_hotkeys_active) && save_state_slot_from_key(key) >= 0) {
         continue;
       }
@@ -4553,6 +4869,26 @@ static void ensure_stretch_map() {
   stretch_col_map_initialised = true;
 }
 
+static void mark_last_display_frame(const uint16_t *fb) {
+  if(fb == nullptr) {
+    return;
+  }
+  for(uint8_t i = 0; i < 2; ++i) {
+    if(priv.framebuffers[i] == fb && priv.framebuffers[i] != nullptr) {
+      g_last_display_fb_index = i;
+      g_last_display_frame_valid = true;
+      g_last_display_frame_timestamp_us = micros64();
+      return;
+    }
+  }
+
+  if(priv.single_buffer_mode && priv.framebuffers[0] != nullptr) {
+    g_last_display_fb_index = 0;
+    g_last_display_frame_valid = true;
+    g_last_display_frame_timestamp_us = micros64();
+  }
+}
+
 // Draw a frame to the display while scaling it to fit.
 // This is needed as the Cardputer's display has a height of 135px,
 // while the GameBoy's has a height of 144px.
@@ -4807,6 +5143,7 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
   profiler_add_render_sample(micros64() - render_start, rows_written, segments_flushed);
 #endif
 
+  mark_last_display_frame(fb);
   render_status_message_overlay();
   return;
   }
@@ -4894,6 +5231,7 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
   profiler_add_render_sample(micros64() - render_start, rows_written, segments_flushed);
 #endif
 
+  mark_last_display_frame(fb);
   render_status_message_overlay();
 }
 
