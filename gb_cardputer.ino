@@ -36,6 +36,11 @@
 #include <cmath>
 #include <limits.h>
 #include <time.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <esp_heap_caps.h>
 #include <esp_attr.h>
 #include <esp32-hal-psram.h>
@@ -100,6 +105,13 @@ struct RomCacheProfiler {
   size_t last_hits;
   size_t last_misses;
   size_t last_swaps;
+  uint64_t bank_load_total_us;
+  uint64_t bank_load_max_us;
+  uint32_t bank_loads;
+  uint32_t posix_bank_loads;
+  uint32_t fallback_bank_loads;
+  uint32_t posix_error_events;
+  uint32_t posix_disable_events;
 };
 
 static MainLoopProfiler g_main_profiler = {};
@@ -142,7 +154,8 @@ static constexpr uint32_t AUDIO_TASK_STACK_SIZE = 2048;
 // ROM streaming helpers.
 static constexpr size_t ROM_STREAM_BLOCK_SIZE = 0x1000;
 static constexpr size_t ROM_CACHE_BANK_MAX = 24;
-static constexpr size_t ROM_CACHE_BANK_LIMIT_NO_PSRAM = 9;
+static constexpr size_t ROM_CACHE_BANK_LIMIT_NO_PSRAM = 5;
+static constexpr size_t ROM_CACHE_POSIX_ERROR_THRESHOLD = 3;
 
 static const uint16_t DMG_DEFAULT_PALETTE_RGB565[4] = { 0xFFFF, 0xAD55, 0x528A, 0x0000 };
 static constexpr uint16_t FALLBACK_COLOUR_RGB565 = 0x0000;
@@ -261,6 +274,11 @@ struct RomCacheBank {
 
 struct RomCache {
   File file;
+  int file_descriptor;
+  bool posix_fast_path;
+  size_t posix_error_count;
+  char file_path[MAX_PATH_LEN];
+  char posix_path[MAX_PATH_LEN];
   size_t size;
   const uint8_t *memory_rom;
   size_t memory_size;
@@ -315,6 +333,10 @@ static constexpr uint8_t SETTINGS_VERSION = 4;
 static constexpr uint8_t VOLUME_STEP = 16;
 static constexpr const char *SETTINGS_DIR = "/config";
 static constexpr const char *SETTINGS_FILE_PATH = "/config/cardputer_settings.ini";
+static constexpr const char *SD_MOUNT_POINT = "/sd";
+static constexpr uint32_t SD_SPI_FAST_FREQUENCY_HZ = 25000000;
+static constexpr uint32_t SD_SPI_MEDIUM_FREQUENCY_HZ = 20000000;
+static constexpr uint32_t SD_SPI_SAFE_FREQUENCY_HZ = 10000000;
 static constexpr const char *SAVES_DIR = "/saves";
 static constexpr const char *SAVE_FILE_EXTENSION = ".sav";
 static constexpr const char *MBC7_FILE_EXTENSION = ".mbc7";
@@ -392,6 +414,8 @@ static uint16_t g_status_message_bg = 0x0000;
 static uint16_t g_save_state_hotkey_mask = 0;
 static bool g_psram_available = false;
 static bool g_sd_mounted = false;
+static uint32_t g_sd_active_frequency_hz = SD_SPI_FAST_FREQUENCY_HZ;
+static uint8_t g_sd_frequency_preference_index = 0;
 static bool g_spi2_initialised = false;
 static bool g_settings_loaded = false;
 static bool g_settings_dirty = false;
@@ -748,6 +772,8 @@ static void rom_cache_close(RomCache *cache);
 static uint8_t rom_cache_cgb_flag(const RomCache *cache);
 static uint8_t* rom_cache_alloc_block(size_t bytes, bool prefer_internal_first);
 static inline int16_t IRAM_ATTR rom_cache_bank_index(const RomCache *cache, const RomCacheBank *bank);
+static void rom_cache_disable_posix(RomCache *cache);
+static bool rom_cache_ensure_file_stream(RomCache *cache);
 static inline void IRAM_ATTR rom_cache_detach_entry(RomCache *cache, int16_t index);
 static inline void IRAM_ATTR rom_cache_attach_front(RomCache *cache, int16_t index, RomCacheSegment segment);
 static inline void IRAM_ATTR rom_cache_touch_hit(RomCache *cache, int16_t index);
@@ -802,25 +828,71 @@ static bool ensure_sd_card(bool blocking) {
     g_spi2_initialised = true;
   }
 
-  const int cs_pin = M5.getPin(m5::pin_name_t::sd_spi_ss);
-  uint32_t attempt_counter = 0;
+  static constexpr uint32_t kFrequencies[] = {
+      SD_SPI_FAST_FREQUENCY_HZ,
+      SD_SPI_MEDIUM_FREQUENCY_HZ,
+      SD_SPI_SAFE_FREQUENCY_HZ
+  };
+  static constexpr uint8_t kFrequencyCount = sizeof(kFrequencies) / sizeof(kFrequencies[0]);
 
-  while(true) {
-    if(SD.begin(cs_pin, SPI2)) {
+  const int cs_pin = M5.getPin(m5::pin_name_t::sd_spi_ss);
+  uint32_t wait_message_counter = 0;
+  uint8_t frequency_index = g_sd_frequency_preference_index;
+  if(frequency_index >= kFrequencyCount) {
+    frequency_index = kFrequencyCount - 1;
+    g_sd_frequency_preference_index = frequency_index;
+  }
+
+  auto attempt_mount = [&](uint8_t index) -> bool {
+    const uint32_t frequency = kFrequencies[index];
+    SD.end();
+    if(SD.begin(cs_pin, SPI2, frequency)) {
       g_sd_mounted = true;
-      Serial.println("SD card mounted");
+      g_sd_active_frequency_hz = frequency;
+      g_sd_frequency_preference_index = index;
+      Serial.printf("SD card mounted @ %.2f MHz\n", frequency / 1000000.0f);
       return true;
     }
+    return false;
+  };
+
+  while(true) {
+    if(attempt_mount(frequency_index)) {
+      return true;
+    }
+
+    if(frequency_index < (kFrequencyCount - 1)) {
+      const uint32_t current_freq = kFrequencies[frequency_index];
+      frequency_index++;
+      g_sd_frequency_preference_index = frequency_index;
+      if(blocking) {
+        const uint32_t next_freq = kFrequencies[frequency_index];
+        Serial.printf("SD init failed @ %.2f MHz, retrying @ %.2f MHz\n",
+                      current_freq / 1000000.0f,
+                      next_freq / 1000000.0f);
+      }
+
+      if(!blocking) {
+        return false;
+      }
+      continue;
+    }
+
+    g_sd_frequency_preference_index = kFrequencyCount - 1;
 
     if(!blocking) {
       return false;
     }
 
-    attempt_counter++;
-    if((attempt_counter % 1000) == 0) {
-      Serial.println("Waiting for SD card...");
+    wait_message_counter++;
+    if((wait_message_counter % 1000) == 0) {
+      Serial.printf("Waiting for SD card (retry @ %.2f MHz)\n",
+                    kFrequencies[frequency_index] / 1000000.0f);
     }
     delay(1);
+
+    // Restart attempts from the currently preferred (slowest) frequency.
+    frequency_index = g_sd_frequency_preference_index;
   }
 }
 
@@ -3449,6 +3521,45 @@ static inline void rom_cache_update_segment_targets(RomCache *cache) {
   }
 }
 
+static void rom_cache_disable_posix(RomCache *cache) {
+  if(cache == nullptr) {
+    return;
+  }
+
+  if(cache->file_descriptor >= 0) {
+    close(cache->file_descriptor);
+  }
+  cache->file_descriptor = -1;
+  cache->posix_fast_path = false;
+  cache->posix_path[0] = '\0';
+}
+
+static bool rom_cache_ensure_file_stream(RomCache *cache) {
+  if(cache == nullptr) {
+    return false;
+  }
+
+  if(cache->file) {
+    return true;
+  }
+
+  if(cache->file_path[0] == '\0') {
+    return false;
+  }
+
+  cache->file = SD.open(cache->file_path, FILE_READ);
+  if(!cache->file) {
+    Serial.printf("ROM cache: fallback open failed for '%s'\n", cache->file_path);
+    return false;
+  }
+
+  if(cache->size == 0) {
+    cache->size = cache->file.size();
+  }
+
+  return true;
+}
+
 static inline void IRAM_ATTR rom_cache_touch_hit(RomCache *cache, int16_t index) {
   if(index < 0 || index >= ROM_CACHE_BANK_MAX) {
     return;
@@ -3583,11 +3694,22 @@ static bool rom_cache_prepare_buffers(RomCache *cache) {
   cache->hot_bank = -1;
   cache->hot_bank_ptr = nullptr;
   cache->hot_bank_base = 0;
+  cache->file = File();
+  rom_cache_disable_posix(cache);
+  cache->posix_error_count = 0;
+  cache->file_path[0] = '\0';
   rom_cache_update_segment_targets(cache);
 #if ENABLE_PROFILING
   g_rom_profiler.last_hits = 0;
   g_rom_profiler.last_misses = 0;
   g_rom_profiler.last_swaps = 0;
+  g_rom_profiler.bank_load_total_us = 0;
+  g_rom_profiler.bank_load_max_us = 0;
+  g_rom_profiler.bank_loads = 0;
+  g_rom_profiler.posix_bank_loads = 0;
+  g_rom_profiler.fallback_bank_loads = 0;
+  g_rom_profiler.posix_error_events = 0;
+  g_rom_profiler.posix_disable_events = 0;
 #endif
 
   return true;
@@ -3622,6 +3744,11 @@ static void rom_cache_reset(RomCache *cache) {
   }
 
   cache->file = File();
+  cache->file_descriptor = -1;
+  cache->posix_fast_path = false;
+  cache->posix_error_count = 0;
+  cache->file_path[0] = '\0';
+  cache->posix_path[0] = '\0';
   cache->size = 0;
   cache->memory_rom = nullptr;
   cache->memory_size = 0;
@@ -3651,6 +3778,13 @@ static void rom_cache_reset(RomCache *cache) {
   g_rom_profiler.last_hits = 0;
   g_rom_profiler.last_misses = 0;
   g_rom_profiler.last_swaps = 0;
+  g_rom_profiler.bank_load_total_us = 0;
+  g_rom_profiler.bank_load_max_us = 0;
+  g_rom_profiler.bank_loads = 0;
+  g_rom_profiler.posix_bank_loads = 0;
+  g_rom_profiler.fallback_bank_loads = 0;
+  g_rom_profiler.posix_error_events = 0;
+  g_rom_profiler.posix_disable_events = 0;
 #endif
 }
 
@@ -3812,11 +3946,7 @@ static bool rom_cache_fill_bank(RomCache *cache, RomCacheBank *slot, uint32_t ba
     return true;
   }
 
-  if(!cache->file || base >= cache->size) {
-    return false;
-  }
-
-  if(!cache->file.seek(base)) {
+  if(base >= cache->size) {
     return false;
   }
 
@@ -3824,32 +3954,97 @@ static bool rom_cache_fill_bank(RomCache *cache, RomCacheBank *slot, uint32_t ba
   size_t to_read = remaining > block_size ? block_size : remaining;
   size_t read_total = 0;
 
-  while(read_total < to_read) {
-    int chunk = cache->file.read(slot->data + read_total, to_read - read_total);
-    if(chunk <= 0) {
-      break;
+#if ENABLE_PROFILING
+  const uint64_t load_start_us = micros64();
+  bool profile_posix_attempted = false;
+  bool profile_posix_success = false;
+  bool profile_posix_disabled = false;
+#endif
+
+  if(cache->posix_fast_path && cache->file_descriptor >= 0) {
+    ssize_t read_bytes = pread(cache->file_descriptor, slot->data, to_read, static_cast<off_t>(base));
+#if ENABLE_PROFILING
+    profile_posix_attempted = true;
+#endif
+    if(read_bytes == static_cast<ssize_t>(to_read)) {
+      read_total = to_read;
+      cache->posix_error_count = 0;
+#if ENABLE_PROFILING
+      profile_posix_success = true;
+#endif
+    } else {
+      if(read_bytes < 0) {
+        Serial.printf("ROM cache: pread failed (bank %u, errno=%d)\n",
+                      static_cast<unsigned>(bank),
+                      static_cast<int>(errno));
+      } else {
+        Serial.printf("ROM cache: pread short read (bank %u, expected %u, got %d)\n",
+                      static_cast<unsigned>(bank),
+                      static_cast<unsigned>(to_read),
+                      static_cast<int>(read_bytes));
+        if(read_bytes > 0) {
+          memset(slot->data + read_bytes, 0xFF, block_size - static_cast<size_t>(read_bytes));
+        }
+      }
+      cache->posix_error_count++;
+      if(cache->posix_error_count >= ROM_CACHE_POSIX_ERROR_THRESHOLD) {
+        Serial.println("ROM cache: disabling POSIX fast path due to repeated errors");
+#if ENABLE_PROFILING
+        profile_posix_disabled = true;
+#endif
+        rom_cache_disable_posix(cache);
+      }
     }
-    read_total += chunk;
   }
 
   if(read_total != to_read) {
-    Serial.printf("ROM cache read short (bank %u, expected %u, got %u)\n",
-                  (unsigned)bank, (unsigned)to_read, (unsigned)read_total);
-    if(read_total < block_size) {
-      memset(slot->data + read_total, 0xFF, block_size - read_total);
+    if(!rom_cache_ensure_file_stream(cache)) {
+      return false;
+    }
+
+    if(!cache->file.seek(base)) {
+      return false;
+    }
+
+    read_total = 0;
+    while(read_total < to_read) {
+      int chunk = cache->file.read(slot->data + read_total, to_read - read_total);
+      if(chunk <= 0) {
+        break;
+      }
+      read_total += chunk;
+    }
+
+    if(read_total != to_read) {
+      Serial.printf("ROM cache read short (bank %u, expected %u, got %u)\n",
+                    static_cast<unsigned>(bank),
+                    static_cast<unsigned>(to_read),
+                    static_cast<unsigned>(read_total));
     }
   }
 
-  if(to_read < block_size) {
-    memset(slot->data + to_read, 0xFF, block_size - to_read);
+  if(read_total < block_size) {
+    memset(slot->data + read_total, 0xFF, block_size - read_total);
   }
 
   slot->bank_number = bank;
   slot->valid = true;
+
+#if ENABLE_PROFILING
+  profiler_track_rom_load(micros64() - load_start_us,
+                          profile_posix_attempted,
+                          profile_posix_success,
+                          profile_posix_disabled);
+#endif
   return true;
 }
 
 static bool rom_cache_open(RomCache *cache, const char *path) {
+  if(cache == nullptr || path == nullptr || path[0] == '\0') {
+    Serial.println("ROM cache: invalid open request");
+    return false;
+  }
+
   rom_cache_close(cache);
 
   if(!rom_cache_prepare_buffers(cache)) {
@@ -3857,44 +4052,142 @@ static bool rom_cache_open(RomCache *cache, const char *path) {
     return false;
   }
 
-  cache->file = SD.open(path, FILE_READ);
-  if(!cache->file) {
-    Serial.println("Failed to open ROM file");
+  strncpy(cache->file_path, path, MAX_PATH_LEN - 1);
+  cache->file_path[MAX_PATH_LEN - 1] = '\0';
+
+  char absolute_path[MAX_PATH_LEN];
+  if(path[0] == '/') {
+    snprintf(absolute_path, MAX_PATH_LEN, "%s%s", SD_MOUNT_POINT, path);
+  } else {
+    snprintf(absolute_path, MAX_PATH_LEN, "%s/%s", SD_MOUNT_POINT, path);
+  }
+
+  int fd = open(absolute_path, O_RDONLY);
+  if(fd >= 0) {
+    struct stat st = {};
+    if(fstat(fd, &st) == 0 && st.st_size > 0) {
+      cache->file_descriptor = fd;
+      cache->posix_fast_path = true;
+      cache->posix_error_count = 0;
+      cache->size = static_cast<size_t>(st.st_size);
+      strncpy(cache->posix_path, absolute_path, MAX_PATH_LEN - 1);
+      cache->posix_path[MAX_PATH_LEN - 1] = '\0';
+    } else {
+      Serial.printf("ROM cache: fstat failed for '%s' (%d)\n",
+                    absolute_path,
+                    static_cast<int>(errno));
+      close(fd);
+      cache->file_descriptor = -1;
+      cache->posix_fast_path = false;
+      cache->posix_path[0] = '\0';
+    }
+  } else {
+    cache->file_descriptor = -1;
+  }
+
+  if(!cache->posix_fast_path) {
+    cache->file = SD.open(path, FILE_READ);
+    if(!cache->file) {
+      Serial.printf("Failed to open ROM file '%s'\n", path);
+      rom_cache_reset(cache);
+      return false;
+    }
+
+    size_t rom_size = cache->file.size();
+    if(rom_size == 0) {
+      Serial.println("ROM size is zero");
+      cache->file.close();
+      rom_cache_reset(cache);
+      return false;
+    }
+    cache->size = rom_size;
+  }
+
+  if(cache->size == 0) {
+    Serial.println("ROM cache: determined ROM size is zero");
+    rom_cache_close(cache);
     return false;
   }
 
-  size_t rom_size = cache->file.size();
-  if(rom_size == 0) {
-    Serial.println("ROM size is zero");
-    cache->file.close();
-    rom_cache_reset(cache);
-    return false;
-  }
-
-  cache->size = rom_size;
-
-  Serial.printf("Streaming ROM '%s' (%u bytes)\n", path, (unsigned)rom_size);
+  Serial.printf("Streaming ROM '%s' (%u bytes)%s\n",
+                path,
+                static_cast<unsigned>(cache->size),
+                cache->posix_fast_path ? " via POSIX fast path" : "");
   Serial.printf("ROM cache banks in use: %u\n", (unsigned)cache->bank_count);
   Serial.printf("Free PSRAM: %u bytes, Free internal heap: %u bytes\n",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
-  cache->file.seek(0);
-  size_t to_read = rom_size > cache->bank_size ? cache->bank_size : rom_size;
-  size_t read_total = 0;
-  while(read_total < to_read) {
-    int chunk = cache->file.read(cache->bank0 + read_total, to_read - read_total);
-    if(chunk <= 0) {
-      break;
+  const size_t to_read = cache->size > cache->bank_size ? cache->bank_size : cache->size;
+  memset(cache->bank0, 0xFF, cache->bank_size);
+
+#if ENABLE_PROFILING
+  const uint64_t bank0_start_us = micros64();
+  bool profile_posix_attempted = false;
+  bool profile_posix_success = false;
+  bool profile_posix_disabled = false;
+#endif
+
+  bool first_read_ok = false;
+  if(cache->posix_fast_path && cache->file_descriptor >= 0) {
+    ssize_t read_bytes = pread(cache->file_descriptor, cache->bank0, to_read, 0);
+#if ENABLE_PROFILING
+    profile_posix_attempted = true;
+#endif
+    if(read_bytes == static_cast<ssize_t>(to_read)) {
+      first_read_ok = true;
+      cache->posix_error_count = 0;
+#if ENABLE_PROFILING
+      profile_posix_success = true;
+#endif
+    } else {
+      if(read_bytes < 0) {
+        Serial.printf("ROM cache: pread bank0 failed (%d)\n", static_cast<int>(errno));
+      } else {
+        Serial.printf("ROM cache: pread bank0 short read (expected %u, got %d)\n",
+                      static_cast<unsigned>(to_read),
+                      static_cast<int>(read_bytes));
+      }
+      cache->posix_error_count++;
+      if(cache->posix_error_count >= ROM_CACHE_POSIX_ERROR_THRESHOLD) {
+        Serial.println("ROM cache: disabling POSIX fast path due to repeated errors");
+#if ENABLE_PROFILING
+        profile_posix_disabled = true;
+#endif
+        rom_cache_disable_posix(cache);
+      }
     }
-    read_total += chunk;
   }
 
-  if(read_total != to_read) {
-    Serial.printf("Failed to read first ROM bank (expected %u, got %u)\n",
-                  (unsigned)to_read, (unsigned)read_total);
-    rom_cache_close(cache);
-    return false;
+  if(!first_read_ok) {
+    if(!rom_cache_ensure_file_stream(cache)) {
+      Serial.println("ROM cache: unable to fall back to FS stream");
+      rom_cache_close(cache);
+      return false;
+    }
+
+    if(!cache->file.seek(0)) {
+      Serial.println("ROM cache: failed to seek ROM file for bank0");
+      rom_cache_close(cache);
+      return false;
+    }
+
+    size_t read_total = 0;
+    while(read_total < to_read) {
+      int chunk = cache->file.read(cache->bank0 + read_total, to_read - read_total);
+      if(chunk <= 0) {
+        break;
+      }
+      read_total += chunk;
+    }
+
+    if(read_total != to_read) {
+      Serial.printf("Failed to read first ROM bank (expected %u, got %u)\n",
+                    static_cast<unsigned>(to_read),
+                    static_cast<unsigned>(read_total));
+      rom_cache_close(cache);
+      return false;
+    }
   }
 
   if(to_read < cache->bank_size) {
@@ -3904,6 +4197,13 @@ static bool rom_cache_open(RomCache *cache, const char *path) {
   cache->hot_bank = 0;
   cache->hot_bank_ptr = cache->bank0;
   cache->hot_bank_base = rom_cache_bank_base(cache, 0);
+
+#if ENABLE_PROFILING
+  profiler_track_rom_load(micros64() - bank0_start_us,
+                          profile_posix_attempted,
+                          profile_posix_success,
+                          profile_posix_disabled);
+#endif
 
   return true;
 }
@@ -4132,9 +4432,14 @@ static inline uint8_t IRAM_ATTR rom_cache_read(RomCache *cache, uint32_t addr) {
 }
 
 static void rom_cache_close(RomCache *cache) {
+  if(cache == nullptr) {
+    return;
+  }
+
   if(cache->file) {
     cache->file.close();
   }
+  rom_cache_disable_posix(cache);
   rom_cache_reset(cache);
 }
 
@@ -4823,6 +5128,36 @@ static RenderProfiler profiler_consume_render_stats() {
   portEXIT_CRITICAL(&profiler_spinlock);
   return snapshot;
 }
+
+static void profiler_track_rom_load(uint64_t duration_us,
+                                    bool posix_attempted,
+                                    bool posix_success,
+                                    bool posix_disabled) {
+  portENTER_CRITICAL(&profiler_spinlock);
+  g_rom_profiler.bank_load_total_us += duration_us;
+  if(duration_us > g_rom_profiler.bank_load_max_us) {
+    g_rom_profiler.bank_load_max_us = duration_us;
+  }
+  g_rom_profiler.bank_loads++;
+  if(posix_attempted) {
+    if(posix_success) {
+      g_rom_profiler.posix_bank_loads++;
+    } else {
+      g_rom_profiler.posix_error_events++;
+    }
+  }
+  if(!posix_success) {
+    g_rom_profiler.fallback_bank_loads++;
+  }
+  if(posix_disabled) {
+    g_rom_profiler.posix_disable_events++;
+  }
+  portEXIT_CRITICAL(&profiler_spinlock);
+}
+#endif
+
+#if !ENABLE_PROFILING
+static inline void profiler_track_rom_load(uint64_t, bool, bool, bool) {}
 #endif
 
 static void ensure_stretch_map() {
@@ -5352,6 +5687,41 @@ static void profiler_log(uint64_t now) {
   const size_t rom_total = delta_hits + delta_misses;
   const double rom_hit_rate = rom_total ? (static_cast<double>(delta_hits) * 100.0 / static_cast<double>(rom_total)) : 0.0;
 
+  uint32_t rom_bank_loads = 0;
+  uint32_t rom_posix_loads = 0;
+  uint32_t rom_fallback_loads = 0;
+  uint32_t rom_posix_errors = 0;
+  uint32_t rom_posix_disable = 0;
+  uint64_t rom_bank_total_us = 0;
+  uint64_t rom_bank_max_us = 0;
+
+#if ENABLE_PROFILING
+  portENTER_CRITICAL(&profiler_spinlock);
+  rom_bank_loads = g_rom_profiler.bank_loads;
+  rom_posix_loads = g_rom_profiler.posix_bank_loads;
+  rom_fallback_loads = g_rom_profiler.fallback_bank_loads;
+  rom_posix_errors = g_rom_profiler.posix_error_events;
+  rom_posix_disable = g_rom_profiler.posix_disable_events;
+  rom_bank_total_us = g_rom_profiler.bank_load_total_us;
+  rom_bank_max_us = g_rom_profiler.bank_load_max_us;
+  g_rom_profiler.bank_load_total_us = 0;
+  g_rom_profiler.bank_load_max_us = 0;
+  g_rom_profiler.bank_loads = 0;
+  g_rom_profiler.posix_bank_loads = 0;
+  g_rom_profiler.fallback_bank_loads = 0;
+  g_rom_profiler.posix_error_events = 0;
+  g_rom_profiler.posix_disable_events = 0;
+  portEXIT_CRITICAL(&profiler_spinlock);
+#endif
+
+  double rom_avg_load_us = 0.0;
+  double rom_max_load_us = static_cast<double>(rom_bank_max_us);
+  double rom_posix_share = 0.0;
+  if(rom_bank_loads > 0) {
+    rom_avg_load_us = static_cast<double>(rom_bank_total_us) / static_cast<double>(rom_bank_loads);
+    rom_posix_share = static_cast<double>(rom_posix_loads) * 100.0 / static_cast<double>(rom_bank_loads);
+  }
+
   uint32_t queue_depth = 0;
   if(priv.frame_queue != nullptr) {
     queue_depth = uxQueueMessagesWaiting(priv.frame_queue);
@@ -5366,7 +5736,7 @@ static void profiler_log(uint64_t now) {
   const int cgb_double_speed = gb.cgb.speed_double ? 1 : 0;
 
   Serial.printf(
-    "[PROF] fps=%.2f frame(avg=%.1f max=%llu) poll=%.1f emu=%.1f handoff=%.1f idle=%.1f/%.1f render=%.1f/%.1f (rows=%.1f seg=%.1f) over=%u/%u queue=%u rom=%.1f%% (H=%u M=%u S=%u) audioQ=%u swapFb=%d cgb2x=%d\n",
+    "[PROF] fps=%.2f frame(avg=%.1f max=%llu) poll=%.1f emu=%.1f handoff=%.1f idle=%.1f/%.1f render=%.1f/%.1f (rows=%.1f seg=%.1f) over=%u/%u queue=%u rom=%.1f%% (H=%u M=%u S=%u) romLoad(avg=%.1f us max=%.1f us posix=%.0f%% err=%u/%u fb=%u) audioQ=%u swapFb=%d cgb2x=%d\n",
     fps,
     avg_frame,
     static_cast<unsigned long long>(g_main_profiler.max_frame_us),
@@ -5385,9 +5755,15 @@ static void profiler_log(uint64_t now) {
     rom_hit_rate,
     static_cast<unsigned>(delta_hits),
     static_cast<unsigned>(delta_misses),
-  static_cast<unsigned>(delta_swaps),
+    static_cast<unsigned>(delta_swaps),
+    rom_avg_load_us,
+    rom_max_load_us,
+    rom_posix_share,
+    static_cast<unsigned>(rom_posix_errors),
+    static_cast<unsigned>(rom_posix_disable),
+    static_cast<unsigned>(rom_fallback_loads),
     static_cast<unsigned>(audio_backlog),
-    (int)swap_fb_enabled,
+    static_cast<int>(swap_fb_enabled),
     cgb_double_speed);
 
   profiler_reset_main(now);
