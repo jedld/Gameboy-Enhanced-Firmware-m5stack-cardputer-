@@ -2029,6 +2029,29 @@ static bool save_state_load_slot(size_t slot_index) {
   }
 
   struct gb_s core_buffer;
+  struct PointerSnapshot {
+    uint8_t *wram;
+    uint8_t *vram;
+    uint8_t *oam;
+    uint8_t *hram_io;
+    void (*lcd_draw_line)(struct gb_s *, const uint8_t *, const uint_fast8_t);
+    void (*serial_tx)(struct gb_s *, const uint8_t);
+    enum gb_serial_rx_ret_e (*serial_rx)(struct gb_s *, uint8_t *);
+    uint8_t (*bootrom_read)(struct gb_s *, const uint_fast16_t);
+    mbc7_accel_read_t mbc7_accel_read;
+    void *direct_priv;
+  } snapshot = {
+    gb.wram,
+    gb.vram,
+    gb.oam,
+    gb.hram_io,
+    gb.display.lcd_draw_line,
+    gb.gb_serial_tx,
+    gb.gb_serial_rx,
+    gb.gb_bootrom_read,
+    gb.mbc7_accel_read,
+    gb.direct.priv
+  };
   bool ok = true;
   auto read_block = [&](void *dest, size_t bytes) {
     if(!ok) {
@@ -2064,11 +2087,20 @@ static bool save_state_load_slot(size_t slot_index) {
   }
 
   memcpy(&gb, &core_buffer, sizeof(gb));
+  gb.wram = snapshot.wram;
+  gb.vram = snapshot.vram;
+  gb.oam = snapshot.oam;
+  gb.hram_io = snapshot.hram_io;
+  gb.display.lcd_draw_line = snapshot.lcd_draw_line;
+  gb.gb_serial_tx = snapshot.serial_tx;
+  gb.gb_serial_rx = snapshot.serial_rx;
+  gb.gb_bootrom_read = snapshot.bootrom_read;
+  gb.mbc7_accel_read = snapshot.mbc7_accel_read;
+  gb.direct.priv = snapshot.direct_priv;
   gb.gb_rom_read = &gb_rom_read;
   gb.gb_cart_ram_read = &gb_cart_ram_read;
   gb.gb_cart_ram_write = &gb_cart_ram_write;
   gb.gb_error = &gb_error;
-  gb.direct.priv = &priv;
 
 #if ENABLE_MBC7
   if(gb.mbc == 7) {
@@ -2306,50 +2338,39 @@ static bool capture_screenshot() {
 
   const size_t pixel_count = LCD_WIDTH * LCD_HEIGHT;
   const size_t copy_bytes = pixel_count * sizeof(uint16_t);
-  uint16_t *frame_copy = (uint16_t *)heap_caps_malloc(copy_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if(frame_copy == nullptr) {
-    frame_copy = (uint16_t *)heap_caps_malloc(copy_bytes, MALLOC_CAP_8BIT);
+  auto allocate_frame_copy = [&](void) -> uint16_t * {
+    uint16_t *buffer = (uint16_t *)heap_caps_malloc(copy_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if(buffer == nullptr) {
+      buffer = (uint16_t *)heap_caps_malloc(copy_bytes, MALLOC_CAP_8BIT);
+    }
+    return buffer;
+  };
+
+  bool display_cache_disabled = false;
+  uint16_t *frame_copy = allocate_frame_copy();
+  if(frame_copy == nullptr && swap_fb_enabled) {
+    disable_display_cache();
+    display_cache_disabled = true;
+    frame_copy = allocate_frame_copy();
   }
   if(frame_copy == nullptr) {
+    if(display_cache_disabled) {
+      request_cache_recovery(true, priv.rom_cache.bank_count);
+    }
     show_status_message("Screenshot failed: out of memory", StatusMessageKind::Error);
     return false;
   }
   memcpy(frame_copy, source, copy_bytes);
 
-  const size_t row_stride = ((LCD_WIDTH * 3u) + 3u) & ~3u;
-  const size_t bmp_bytes = row_stride * LCD_HEIGHT;
-  uint8_t *bmp_buffer = (uint8_t *)heap_caps_malloc(bmp_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if(bmp_buffer == nullptr) {
-    bmp_buffer = (uint8_t *)heap_caps_malloc(bmp_bytes, MALLOC_CAP_8BIT);
-  }
-  if(bmp_buffer == nullptr) {
-    heap_caps_free(frame_copy);
-    show_status_message("Screenshot failed: out of memory", StatusMessageKind::Error);
-    return false;
-  }
-  memset(bmp_buffer, 0, bmp_bytes);
-
-  for(size_t y = 0; y < LCD_HEIGHT; ++y) {
-    const size_t src_y = LCD_HEIGHT - 1 - y;
-    const uint16_t *src_row = frame_copy + (src_y * LCD_WIDTH);
-    uint8_t *dst = bmp_buffer + y * row_stride;
-    for(size_t x = 0; x < LCD_WIDTH; ++x) {
-      const uint16_t pixel = src_row[x];
-      const uint8_t r5 = static_cast<uint8_t>((pixel >> 11) & 0x1F);
-      const uint8_t g6 = static_cast<uint8_t>((pixel >> 5) & 0x3F);
-      const uint8_t b5 = static_cast<uint8_t>(pixel & 0x1F);
-      const size_t dst_index = x * 3u;
-      dst[dst_index + 0] = static_cast<uint8_t>((b5 << 3) | (b5 >> 2));
-      dst[dst_index + 1] = static_cast<uint8_t>((g6 << 2) | (g6 >> 4));
-      dst[dst_index + 2] = static_cast<uint8_t>((r5 << 3) | (r5 >> 2));
-    }
-  }
-
-  heap_caps_free(frame_copy);
+  constexpr size_t row_stride = ((LCD_WIDTH * 3u) + 3u) & ~3u;
+  uint8_t row_buffer[row_stride];
 
   char path[MAX_PATH_LEN];
   if(!build_screenshot_path(path, sizeof(path))) {
-    heap_caps_free(bmp_buffer);
+    heap_caps_free(frame_copy);
+    if(display_cache_disabled) {
+      request_cache_recovery(true, priv.rom_cache.bank_count);
+    }
     show_status_message("Screenshot failed: name", StatusMessageKind::Error);
     return false;
   }
@@ -2378,7 +2399,7 @@ static bool capture_screenshot() {
 
   const uint32_t headers_size = sizeof(file_header) + sizeof(info_header);
   file_header.type = 0x4D42;
-  file_header.size = headers_size + static_cast<uint32_t>(bmp_bytes);
+  file_header.size = headers_size + static_cast<uint32_t>(row_stride * LCD_HEIGHT);
   file_header.reserved1 = 0;
   file_header.reserved2 = 0;
   file_header.offset = headers_size;
@@ -2389,7 +2410,7 @@ static bool capture_screenshot() {
   info_header.planes = 1;
   info_header.bit_count = 24;
   info_header.compression = 0;
-  info_header.image_size = static_cast<uint32_t>(bmp_bytes);
+  info_header.image_size = static_cast<uint32_t>(row_stride * LCD_HEIGHT);
   info_header.x_ppm = 2835;
   info_header.y_ppm = 2835;
   info_header.colours_used = 0;
@@ -2397,7 +2418,10 @@ static bool capture_screenshot() {
 
   File file = SD.open(path, FILE_WRITE);
   if(!file) {
-    heap_caps_free(bmp_buffer);
+    heap_caps_free(frame_copy);
+    if(display_cache_disabled) {
+      request_cache_recovery(true, priv.rom_cache.bank_count);
+    }
     show_status_message("Screenshot failed: SD write", StatusMessageKind::Error);
     Serial.printf("Screenshot: failed to open %s for write\n", path);
     return false;
@@ -2410,11 +2434,30 @@ static bool capture_screenshot() {
   if(ok && file.write(reinterpret_cast<const uint8_t *>(&info_header), sizeof(info_header)) != sizeof(info_header)) {
     ok = false;
   }
-  if(ok && file.write(bmp_buffer, bmp_bytes) != static_cast<int>(bmp_bytes)) {
-    ok = false;
+  if(ok) {
+    for(size_t y = 0; y < LCD_HEIGHT && ok; ++y) {
+      const size_t src_y = LCD_HEIGHT - 1 - y;
+      const uint16_t *src_row = frame_copy + (src_y * LCD_WIDTH);
+      for(size_t x = 0; x < LCD_WIDTH; ++x) {
+        const uint16_t pixel = src_row[x];
+        const uint8_t r5 = static_cast<uint8_t>((pixel >> 11) & 0x1F);
+        const uint8_t g6 = static_cast<uint8_t>((pixel >> 5) & 0x3F);
+        const uint8_t b5 = static_cast<uint8_t>(pixel & 0x1F);
+        const size_t dst_index = x * 3u;
+        row_buffer[dst_index + 0] = static_cast<uint8_t>((b5 << 3) | (b5 >> 2));
+        row_buffer[dst_index + 1] = static_cast<uint8_t>((g6 << 2) | (g6 >> 4));
+        row_buffer[dst_index + 2] = static_cast<uint8_t>((r5 << 3) | (r5 >> 2));
+      }
+      if(file.write(row_buffer, row_stride) != static_cast<int>(row_stride)) {
+        ok = false;
+      }
+    }
   }
   file.close();
-  heap_caps_free(bmp_buffer);
+  heap_caps_free(frame_copy);
+  if(display_cache_disabled) {
+    request_cache_recovery(true, priv.rom_cache.bank_count);
+  }
 
   if(!ok) {
     SD.remove(path);
