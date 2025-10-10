@@ -71,6 +71,12 @@
 
 struct PaletteState;
 
+static constexpr const char *FIRMWARE_NAME = "m5gbcemu";
+#ifndef M5GBCEMU_VERSION
+#define M5GBCEMU_VERSION "0.1.0"
+#endif
+static constexpr const char *FIRMWARE_VERSION = M5GBCEMU_VERSION;
+
 static inline uint64_t micros64() {
   return static_cast<uint64_t>(esp_timer_get_time());
 }
@@ -800,7 +806,9 @@ static void palette_configure_for_dmg(struct priv_t *priv);
 static void apply_default_button_mapping();
 static void wait_for_keyboard_release();
 static void show_home_menu();
+static void show_boot_splash();
 static void show_options_menu();
+static void show_boot_splash();
 static void show_keymap_menu();
 #if ENABLE_BLUETOOTH_CONTROLLERS
 static void show_bluetooth_menu();
@@ -2572,7 +2580,7 @@ static bool save_settings_to_sd() {
     return false;
   }
 
-  file.printf("# Cardputer firmware settings\n");
+  file.printf("# %s firmware settings\n", FIRMWARE_NAME);
   file.printf("version=%u\n", static_cast<unsigned>(SETTINGS_VERSION));
   file.printf("audio=%u\n", g_settings.audio_enabled ? 1u : 0u);
   file.printf("bootstrap=%u\n", g_settings.cgb_bootstrap_palettes ? 1u : 0u);
@@ -6660,6 +6668,80 @@ static void show_home_menu() {
   M5Cardputer.Display.clearDisplay();
 }
 
+static void show_boot_splash() {
+  M5Cardputer.Display.clearDisplay();
+  M5Cardputer.Display.fillScreen(0x0000);
+  M5Cardputer.Display.setTextColor(0xFFFF, 0x0000);
+
+  const int16_t screen_width = M5Cardputer.Display.width();
+  const int16_t screen_height = M5Cardputer.Display.height();
+
+  set_font_size(120);
+  const char *name = FIRMWARE_NAME;
+  int16_t name_width = M5Cardputer.Display.textWidth(name);
+  if(name_width < 0) {
+    name_width = 0;
+  }
+  int16_t name_x = (screen_width - name_width) / 2;
+  if(name_x < 0) {
+    name_x = 0;
+  }
+  int16_t name_y = (screen_height / 2) - 20;
+  M5Cardputer.Display.setCursor(name_x, name_y);
+  M5Cardputer.Display.print(name);
+
+  set_font_size(200);
+  char version_line[32];
+  snprintf(version_line, sizeof(version_line), "Version %s", FIRMWARE_VERSION);
+  int16_t version_width = M5Cardputer.Display.textWidth(version_line);
+  if(version_width < 0) {
+    version_width = 0;
+  }
+  int16_t version_x = (screen_width - version_width) / 2;
+  if(version_x < 0) {
+    version_x = 0;
+  }
+  int16_t version_y = name_y + 40;
+  M5Cardputer.Display.setCursor(version_x, version_y);
+  M5Cardputer.Display.print(version_line);
+
+  set_font_size(240);
+  const char *hint = "Press any key to continue";
+  int16_t hint_width = M5Cardputer.Display.textWidth(hint);
+  if(hint_width < 0) {
+    hint_width = 0;
+  }
+  int16_t hint_x = (screen_width - hint_width) / 2;
+  if(hint_x < 0) {
+    hint_x = 0;
+  }
+  int16_t hint_y = screen_height - 24;
+  if(hint_y < 0) {
+    hint_y = 0;
+  }
+  M5Cardputer.Display.setCursor(hint_x, hint_y);
+  M5Cardputer.Display.print(hint);
+
+  uint32_t start_ms = millis();
+  const uint32_t splash_duration_ms = 1800;
+  bool key_pressed = false;
+  while(millis() - start_ms < splash_duration_ms) {
+    M5Cardputer.update();
+    if(M5Cardputer.Keyboard.isPressed()) {
+      key_pressed = true;
+      wait_for_keyboard_release();
+      break;
+    }
+    delay(16);
+  }
+
+  if(!key_pressed) {
+    delay(150);
+  }
+
+  M5Cardputer.Display.clearDisplay();
+}
+
 static bool has_rom_extension(const String &file_name) {
   int dot_index = file_name.lastIndexOf('.');
   if(dot_index < 0) {
@@ -7424,7 +7506,7 @@ void setup() {
 
   Serial.begin(115200);
   delay(100);
-  Serial.println("Cardputer firmware booting...");
+  Serial.printf("%s firmware %s booting...\n", FIRMWARE_NAME, FIRMWARE_VERSION);
   configure_performance_profile();
   reset_save_state(&priv);
 
@@ -7467,6 +7549,8 @@ void setup() {
   // Set display rotation to horizontal.
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.initDMA();
+  set_font_size(80);
+  show_boot_splash();
   set_font_size(80);
 
   const size_t embedded_rom_count = kEmbeddedRomCount;

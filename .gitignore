@@ -4,4 +4,5 @@
 /downloads
 embedded_roms/
 embedded_roms.json
-.github/
+.github/*
+!.github/workflows/

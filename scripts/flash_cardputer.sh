@@ -5,7 +5,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/flash_cardputer.sh [OPTIONS]
 
-Build the Cardputer firmware with PlatformIO and flash it to an attached device.
+Build the m5gbcemu Cardputer firmware with PlatformIO and flash it to an attached device.
 
 Options:
   -p, --port <device>   Serial device to flash (e.g. /dev/ttyACM0). Auto-detected when omitted.

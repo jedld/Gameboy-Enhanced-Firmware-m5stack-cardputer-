@@ -1,7 +1,9 @@
-This is a fork of https://github.com/Mr-PauI/Gameboy-Enhanced-Firmware-m5stack-cardputer- with
+# m5gbcemu
+
+m5gbcemu is a fork of https://github.com/Mr-PauI/Gameboy-Enhanced-Firmware-m5stack-cardputer- with
 an emphasis on full Gameboy Color support (both dual mode and Game Boy Color only).
 
-Gameboy Emulator; complete with audio, configurable controls, display and performance options, savegames, save states, filesystem navigation and no .gb ROM file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. DMG titles automatically receive authentic Game Boy Color colourisation, including the original boot-time button combos for palette selection. The Options menu also exposes a stretch-to-width toggle if you prefer filling the Cardputer display over pillarboxed output. A four-slot quick save-state system with on-screen feedback lets you checkpoint and recover progress without leaving the emulator loop.
+The firmware delivers a Cardputer-native Game Boy and Game Boy Color emulator complete with audio, configurable controls, display and performance options, savegames, save states, filesystem navigation and no `.gb` ROM file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. DMG titles automatically receive authentic Game Boy Color colourisation, including the original boot-time button combos for palette selection. The Options menu also exposes a stretch-to-width toggle if you prefer filling the Cardputer display over pillarboxed output. A four-slot quick save-state system with on-screen feedback lets you checkpoint and recover progress without leaving the emulator loop.
 
 ### Quick save states & status overlay
 
