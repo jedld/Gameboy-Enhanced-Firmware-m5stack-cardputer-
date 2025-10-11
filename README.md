@@ -81,6 +81,8 @@ By default it builds and uploads the `m5stack_cardputer` environment. Pass `--no
 
 The firmware can embed multiple Game Boy or Game Boy Color ROM images so they boot without streaming data from the SD card. Embedded titles show up in the file picker under a `[FW]` label, and the one flagged for autoboot is marked `[FW★]` and launches automatically when present.
 
+> **Heads-up:** To keep the firmware image within the 2 MB partition limit, embedded payloads are disabled by default. Rebuild with `-D ENABLE_EMBEDDED_ROMS=1` (or flip the flag in `platformio.ini`) after adding ROMs if you want them baked into flash.
+
 1. Place the ROM file (`*.gb`/`*.gbc`) on your workstation.
 2. Add it to the embedded ROM manifest with the helper script:
 
@@ -104,6 +106,22 @@ The helper script exposes several sub-commands to maintain the manifest:
 * `python3 scripts/embed_rom.py generate` – rebuild the translation units from the existing manifest (handy after resolving merge conflicts).
 
 Remember to respect the legal status of any ROMs you embed—the project does not distribute copyrighted games.
+
+### Runtime-writable ROM storage
+
+If you would rather sideload cartridges without rebuilding the firmware, the partition table now dedicates everything past the 2 MB application image to a custom flash region labelled `romstorage`. You can access it from firmware code by calling the ESP-IDF partition APIs, for example:
+
+```cpp
+const esp_partition_t *rom_store = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+															0x82, // custom subtype
+															"romstorage");
+```
+
+The region spans roughly 6 MB and now backs an on-device flashing workflow:
+
+* When you launch a CGB cartridge larger than 1 MB from the SD card, the firmware offers to copy it into `romstorage`. Confirming the prompt erases any previous payload and streams the ROM directly into internal flash.
+* Once flashed, a new `[FLASH]` entry appears at the top of the ROM browser. Selecting it boots the stored image without requiring the SD card.
+* Save data and screenshots use the flashed title as their identifier, and you can re-flash at any time to overwrite the slot with another game.
 
 ### 2. Install the M5Stack Cardputer board definition (Arduino IDE only)
 

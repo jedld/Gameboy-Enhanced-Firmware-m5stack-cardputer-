@@ -1,3 +1,7 @@
 #pragma once
 
-#define EMBEDDED_ROM_MULTI_SUPPORT 1
+#ifndef ENABLE_EMBEDDED_ROMS
+#define ENABLE_EMBEDDED_ROMS 0
+#endif
+
+#define EMBEDDED_ROM_MULTI_SUPPORT 0

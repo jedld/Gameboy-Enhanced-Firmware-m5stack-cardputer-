@@ -28,6 +28,8 @@
 #define MAX_PATH_LEN 256
 
 #include <vector>
+#include <memory>
+#include <new>
 #include <cstring>
 #include <cstdio>
 #include <cstddef>
@@ -49,6 +51,9 @@
 #include "esp_pm.h"
 #include "esp_err.h"
 #endif
+#include <esp_partition.h>
+#include <esp_spi_flash.h>
+#include <esp_err.h>
 #include <esp_rom_sys.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -81,7 +86,42 @@ static inline uint64_t micros64() {
   return static_cast<uint64_t>(esp_timer_get_time());
 }
 
+SET_LOOP_TASK_STACK_SIZE(16384);
+
 static bool g_file_picker_cancelled = false;
+
+static constexpr size_t ROM_FLASH_PROMPT_THRESHOLD = 1 * 1024 * 1024;
+static constexpr size_t ROM_STORAGE_TITLE_MAX = 32;
+static constexpr uint32_t ROM_STORAGE_MAGIC = 0x4D355247; // "M5RG"
+static constexpr uint16_t ROM_STORAGE_VERSION = 1;
+static constexpr uint16_t ROM_STORAGE_FLAG_CGB_ONLY = 0x0001;
+static constexpr uint16_t ROM_STORAGE_FLAG_CGB_SUPPORTED = 0x0002;
+static constexpr size_t ROM_STORAGE_DATA_OFFSET = SPI_FLASH_SEC_SIZE;
+
+struct RomStorageHeader {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t flags;
+  uint32_t rom_size;
+  uint8_t cgb_flag;
+  uint8_t title_length;
+  char title[ROM_STORAGE_TITLE_MAX];
+  uint32_t crc32;
+} __attribute__((packed));
+
+struct RomStorageMetadata {
+  bool valid;
+  size_t rom_size;
+  uint16_t flags;
+  uint8_t cgb_flag;
+  char title[ROM_STORAGE_TITLE_MAX];
+};
+
+static RomStorageMetadata g_rom_storage_meta = {false, 0, 0, 0, {0}};
+static const esp_partition_t *g_rom_storage_partition = nullptr;
+static bool g_rom_storage_partition_checked = false;
+
+static constexpr const char *FLASHED_ROM_SENTINEL = ":flash";
 
 #if ENABLE_PROFILING
 static constexpr uint64_t PROFILER_LOG_INTERVAL_US = 5ULL * 1000 * 1000;
@@ -314,7 +354,14 @@ struct RomCache {
 enum class RomSource : uint8_t {
   None = 0,
   SdCard,
-  Embedded
+  Embedded,
+  Flashed
+};
+
+enum class FlashPromptAction : uint8_t {
+  FlashAndRun = 0,
+  RunOnly,
+  ExitToMenu
 };
 
 enum FrameSkipMode : uint8_t {
@@ -491,6 +538,14 @@ static bool load_cart_ram_from_sd(struct priv_t *priv);
 static bool save_cart_ram_to_sd(const struct priv_t *priv);
 static bool load_mbc7_eeprom_from_sd(struct priv_t *priv, struct gb_s *gb);
 static bool save_mbc7_eeprom_to_sd(const struct priv_t *priv, const struct gb_s *gb);
+static void release_flashed_rom(struct priv_t *priv);
+static bool load_flashed_rom(struct priv_t *priv);
+static bool flash_rom_to_storage(struct priv_t *priv, size_t rom_size);
+static FlashPromptAction prompt_flash_rom(size_t rom_size, const char *rom_title);
+static bool rom_storage_refresh_metadata();
+static void rom_storage_clear_metadata();
+static bool rom_storage_has_payload();
+static bool keys_state_contains_escape(const Keyboard_Class::KeysState &status);
 static void handle_volume_keys(const Keyboard_Class::KeysState &status);
 static void adjust_master_volume(int delta, bool persist, bool announce);
 static void configure_performance_profile();
@@ -996,6 +1051,11 @@ struct priv_t
   const EmbeddedRomEntry *embedded_rom_entry;
   const uint8_t *embedded_rom;
   size_t embedded_rom_size;
+  const uint8_t *flashed_rom_data;
+  size_t flashed_rom_size;
+  spi_flash_mmap_handle_t flashed_rom_handle;
+  bool flashed_rom_mapped;
+  char flashed_rom_title[ROM_STORAGE_TITLE_MAX];
   
   bool rom_is_cgb;
   bool rom_is_cgb_only;
@@ -1710,6 +1770,24 @@ static bool build_save_state_path(const struct priv_t *priv,
     return written > 0 && static_cast<size_t>(written) < out_len;
   }
 
+  if(priv->rom_source == RomSource::Flashed) {
+    const char *identifier_source = priv->flashed_rom_title;
+    char identifier[64];
+    sanitise_identifier(identifier_source, identifier, sizeof(identifier));
+    if(identifier[0] == '\0') {
+      strncpy(identifier, "flashed", sizeof(identifier) - 1);
+      identifier[sizeof(identifier) - 1] = '\0';
+    }
+
+    int written = snprintf(out,
+                           out_len,
+                           "%s/%s_slot%u.ss",
+                           SAVES_DIR,
+                           identifier,
+                           slot_number);
+    return written > 0 && static_cast<size_t>(written) < out_len;
+  }
+
   return false;
 }
 
@@ -1874,7 +1952,7 @@ static bool save_state_store_slot(size_t slot_index) {
     return false;
   }
 
-  if(priv.rom_source == RomSource::Embedded && !ensure_saves_dir()) {
+  if((priv.rom_source == RomSource::Embedded || priv.rom_source == RomSource::Flashed) && !ensure_saves_dir()) {
     show_status_message("Save failed: no saves dir", StatusMessageKind::Error);
     return false;
   }
@@ -2252,6 +2330,8 @@ static void build_screenshot_identifier(const struct priv_t *priv_ctx,
       identifier_source = entry->name;
     }
     sanitise_identifier(identifier_source, output, output_len);
+  } else if(priv_ctx->rom_source == RomSource::Flashed) {
+    sanitise_identifier(priv_ctx->flashed_rom_title, output, output_len);
   }
 
   if(output[0] == '\0') {
@@ -2730,6 +2810,8 @@ static void reset_save_state(struct priv_t *priv) {
 
   save_state_clear_all(priv);
 
+  release_flashed_rom(priv);
+
   priv->cart_ram_size = 0;
   priv->cart_ram_dirty = false;
   priv->cart_ram_loaded = false;
@@ -2745,6 +2827,7 @@ static void reset_save_state(struct priv_t *priv) {
   priv->mbc7_save_write_failed = false;
   priv->sd_rom_path[0] = '\0';
   priv->sd_rom_path_valid = false;
+  priv->flashed_rom_title[0] = '\0';
 }
 
 static void set_sd_rom_path(struct priv_t *priv, const char *path) {
@@ -2912,6 +2995,42 @@ static bool derive_save_paths(struct priv_t *priv, bool uses_mbc7) {
     return any_valid;
   }
 
+  if(priv->rom_source == RomSource::Flashed) {
+    const char *identifier_source = priv->flashed_rom_title;
+    char identifier[64];
+    sanitise_identifier(identifier_source, identifier, sizeof(identifier));
+    if(identifier[0] == '\0') {
+      strncpy(identifier, "flashed", sizeof(identifier) - 1);
+      identifier[sizeof(identifier) - 1] = '\0';
+    }
+
+    int written = snprintf(priv->cart_save_path,
+                           sizeof(priv->cart_save_path),
+                           "%s/%s%s",
+                           SAVES_DIR,
+                           identifier,
+                           SAVE_FILE_EXTENSION);
+    if(written > 0 && static_cast<size_t>(written) < sizeof(priv->cart_save_path)) {
+      priv->cart_save_path_valid = true;
+      any_valid = true;
+    }
+
+    if(uses_mbc7) {
+      written = snprintf(priv->mbc7_save_path,
+                         sizeof(priv->mbc7_save_path),
+                         "%s/%s%s",
+                         SAVES_DIR,
+                         identifier,
+                         MBC7_FILE_EXTENSION);
+      if(written > 0 && static_cast<size_t>(written) < sizeof(priv->mbc7_save_path)) {
+        priv->mbc7_save_path_valid = true;
+        any_valid = true;
+      }
+    }
+
+    return any_valid;
+  }
+
   return any_valid;
 }
 
@@ -2966,7 +3085,7 @@ static bool save_cart_ram_to_sd(const struct priv_t *priv) {
     return false;
   }
 
-  if(priv->rom_source == RomSource::Embedded && !ensure_saves_dir()) {
+  if((priv->rom_source == RomSource::Embedded || priv->rom_source == RomSource::Flashed) && !ensure_saves_dir()) {
     return false;
   }
 
@@ -3054,7 +3173,7 @@ static bool save_mbc7_eeprom_to_sd(const struct priv_t *priv, const struct gb_s 
     return false;
   }
 
-  if(priv->rom_source == RomSource::Embedded && !ensure_saves_dir()) {
+  if((priv->rom_source == RomSource::Embedded || priv->rom_source == RomSource::Flashed) && !ensure_saves_dir()) {
     return false;
   }
 
@@ -3314,6 +3433,9 @@ static inline size_t rom_source_size(const struct priv_t *priv) {
   if(priv->rom_source == RomSource::Embedded) {
     return priv->embedded_rom_size;
   }
+  if(priv->rom_source == RomSource::Flashed) {
+    return priv->flashed_rom_size;
+  }
   if(priv->rom_source == RomSource::SdCard) {
     return priv->rom_cache.size;
   }
@@ -3340,6 +3462,15 @@ static inline uint8_t rom_source_read_byte(const struct priv_t *priv, uint32_t a
   if(priv->rom_source == RomSource::SdCard) {
     RomCache *cache = const_cast<RomCache *>(&priv->rom_cache);
     return rom_cache_read(cache, addr);
+  }
+
+  if(priv->rom_source == RomSource::Flashed) {
+    if(priv->flashed_rom_data == nullptr || addr >= priv->flashed_rom_size) {
+      return 0xFF;
+    }
+    RomCache *cache = const_cast<RomCache *>(&priv->rom_cache);
+    cache->cache_hits++;
+    return pgm_read_byte(priv->flashed_rom_data + addr);
   }
 
   return 0xFF;
@@ -3764,6 +3895,51 @@ static bool rom_cache_prepare_buffers(RomCache *cache) {
 #endif
 
   return true;
+}
+
+static void extract_rom_title_from_cache(const RomCache *cache, char *out, size_t out_len) {
+  if(out == nullptr || out_len == 0) {
+    return;
+  }
+
+  out[0] = '\0';
+  if(cache == nullptr) {
+    return;
+  }
+
+  size_t index = 0;
+  for(uint32_t addr = 0x0134; addr <= 0x0143 && (index + 1) < out_len; ++addr) {
+    uint8_t value = 0x00;
+    if(cache->memory_rom != nullptr && addr < cache->memory_size) {
+      value = pgm_read_byte(cache->memory_rom + addr);
+    } else if(cache->bank0 != nullptr && cache->bank_size > addr) {
+      value = cache->bank0[addr];
+    } else {
+      RomCache *mutable_cache = const_cast<RomCache *>(cache);
+      value = rom_cache_read(mutable_cache, addr);
+    }
+
+    if(value == 0x00) {
+      break;
+    }
+
+    if(value < 0x20 || value > 0x7E) {
+      value = '_';
+    }
+
+    out[index++] = static_cast<char>(value);
+  }
+
+  while(index > 0 && out[index - 1] == ' ') {
+    --index;
+  }
+
+  out[index] = '\0';
+
+  if(out[0] == '\0') {
+    strncpy(out, "Flashed ROM", out_len - 1);
+    out[out_len - 1] = '\0';
+  }
 }
 
 static void rom_cache_reset(RomCache *cache) {
@@ -4295,6 +4471,90 @@ static bool rom_cache_open_memory(RomCache *cache, const uint8_t *data, size_t s
   return true;
 }
 
+static const esp_partition_t* rom_storage_get_partition() {
+  if(!g_rom_storage_partition_checked) {
+    g_rom_storage_partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                                       ESP_PARTITION_SUBTYPE_ANY,
+                                                       "romstorage");
+    g_rom_storage_partition_checked = true;
+    if(g_rom_storage_partition == nullptr) {
+      Serial.println("romstorage partition not found");
+    }
+  }
+  return g_rom_storage_partition;
+}
+
+static void rom_storage_clear_metadata() {
+  g_rom_storage_meta.valid = false;
+  g_rom_storage_meta.rom_size = 0;
+  g_rom_storage_meta.flags = 0;
+  g_rom_storage_meta.cgb_flag = 0;
+  memset(g_rom_storage_meta.title, 0, sizeof(g_rom_storage_meta.title));
+}
+
+static bool rom_storage_read_header(RomStorageHeader *out) {
+  if(out == nullptr) {
+    return false;
+  }
+
+  const esp_partition_t *partition = rom_storage_get_partition();
+  if(partition == nullptr) {
+    return false;
+  }
+
+  RomStorageHeader header = {};
+  esp_err_t err = esp_partition_read(partition, 0, &header, sizeof(header));
+  if(err != ESP_OK) {
+    Serial.printf("romstorage header read failed: %s\n", esp_err_to_name(err));
+    return false;
+  }
+
+  if(header.magic != ROM_STORAGE_MAGIC || header.version != ROM_STORAGE_VERSION) {
+    return false;
+  }
+
+  if(header.rom_size == 0 || header.rom_size > partition->size ||
+     header.rom_size > partition->size - ROM_STORAGE_DATA_OFFSET) {
+    return false;
+  }
+
+  header.title[ROM_STORAGE_TITLE_MAX - 1] = '\0';
+  if(header.title_length >= ROM_STORAGE_TITLE_MAX) {
+    header.title_length = ROM_STORAGE_TITLE_MAX - 1;
+  }
+  if(header.title_length < ROM_STORAGE_TITLE_MAX) {
+    header.title[header.title_length] = '\0';
+  }
+
+  *out = header;
+  return true;
+}
+
+static bool rom_storage_refresh_metadata() {
+  RomStorageHeader header = {};
+  if(!rom_storage_read_header(&header)) {
+    rom_storage_clear_metadata();
+    return false;
+  }
+
+  g_rom_storage_meta.valid = true;
+  g_rom_storage_meta.rom_size = header.rom_size;
+  g_rom_storage_meta.flags = header.flags;
+  g_rom_storage_meta.cgb_flag = header.cgb_flag;
+  strncpy(g_rom_storage_meta.title, header.title, sizeof(g_rom_storage_meta.title) - 1);
+  g_rom_storage_meta.title[sizeof(g_rom_storage_meta.title) - 1] = '\0';
+  if(g_rom_storage_meta.title[0] == '\0') {
+    strncpy(g_rom_storage_meta.title, "Flashed ROM", sizeof(g_rom_storage_meta.title) - 1);
+    g_rom_storage_meta.title[sizeof(g_rom_storage_meta.title) - 1] = '\0';
+  }
+
+  return true;
+}
+
+static bool rom_storage_has_payload() {
+  return g_rom_storage_meta.valid;
+}
+
 static inline uint8_t IRAM_ATTR rom_cache_read(RomCache *cache, uint32_t addr) {
   if(cache->size == 0 || addr >= cache->size) {
     return 0xFF;
@@ -4494,6 +4754,22 @@ static void rom_cache_close(RomCache *cache) {
   rom_cache_reset(cache);
 }
 
+static void release_flashed_rom(struct priv_t *priv) {
+  if(priv == nullptr) {
+    return;
+  }
+
+  if(priv->flashed_rom_mapped && priv->flashed_rom_handle != 0) {
+    spi_flash_munmap(priv->flashed_rom_handle);
+  }
+
+  priv->flashed_rom_handle = 0;
+  priv->flashed_rom_data = nullptr;
+  priv->flashed_rom_size = 0;
+  priv->flashed_rom_mapped = false;
+  priv->flashed_rom_title[0] = '\0';
+}
+
 static uint8_t rom_cache_cgb_flag(const RomCache *cache) {
   if(cache == nullptr || cache->size <= 0x0143) {
     return 0;
@@ -4505,6 +4781,79 @@ static uint8_t rom_cache_cgb_flag(const RomCache *cache) {
     return cache->bank0[0x0143];
   }
   return 0;
+}
+
+static bool load_flashed_rom(struct priv_t *priv) {
+  if(priv == nullptr) {
+    return false;
+  }
+
+  if(!rom_storage_refresh_metadata()) {
+    debugPrint("Flash slot empty");
+    return false;
+  }
+
+  RomStorageHeader header = {};
+  if(!rom_storage_read_header(&header)) {
+    debugPrint("Flash header invalid");
+    return false;
+  }
+
+  const esp_partition_t *partition = rom_storage_get_partition();
+  if(partition == nullptr) {
+    debugPrint("Flash partition missing");
+    return false;
+  }
+
+  release_flashed_rom(priv);
+  rom_cache_close(&priv->rom_cache);
+
+  const size_t map_length = ROM_STORAGE_DATA_OFFSET + header.rom_size;
+  const void *mapped_base = nullptr;
+  spi_flash_mmap_handle_t handle = 0;
+  esp_err_t err = esp_partition_mmap(partition,
+                                     0,
+                                     map_length,
+                                     SPI_FLASH_MMAP_DATA,
+                                     &mapped_base,
+                                     &handle);
+  if(err != ESP_OK || mapped_base == nullptr) {
+    Serial.printf("romstorage mmap failed: %s\n", esp_err_to_name(err));
+    if(handle != 0) {
+      spi_flash_munmap(handle);
+    }
+    return false;
+  }
+
+  const uint8_t *rom_ptr = static_cast<const uint8_t *>(mapped_base) + ROM_STORAGE_DATA_OFFSET;
+
+  if(!rom_cache_open_memory(&priv->rom_cache, rom_ptr, header.rom_size)) {
+    spi_flash_munmap(handle);
+    return false;
+  }
+
+  priv->flashed_rom_handle = handle;
+  priv->flashed_rom_data = rom_ptr;
+  priv->flashed_rom_size = header.rom_size;
+  priv->flashed_rom_mapped = true;
+  strncpy(priv->flashed_rom_title, header.title, sizeof(priv->flashed_rom_title) - 1);
+  priv->flashed_rom_title[sizeof(priv->flashed_rom_title) - 1] = '\0';
+  if(priv->flashed_rom_title[0] == '\0') {
+    strncpy(priv->flashed_rom_title, "Flashed ROM", sizeof(priv->flashed_rom_title) - 1);
+    priv->flashed_rom_title[sizeof(priv->flashed_rom_title) - 1] = '\0';
+  }
+  clear_sd_rom_path(priv);
+  priv->embedded_rom_entry = nullptr;
+  priv->embedded_rom = nullptr;
+  priv->embedded_rom_size = 0;
+  priv->rom_source = RomSource::Flashed;
+  priv->rom_cgb_flag = header.cgb_flag;
+  priv->rom_is_cgb = (priv->rom_cgb_flag & 0x80) != 0;
+  priv->rom_is_cgb_only = (priv->rom_cgb_flag == 0xC0);
+
+  Serial.printf("Using flashed ROM (%u bytes)\n", static_cast<unsigned>(header.rom_size));
+
+  return true;
 }
 
 static bool load_embedded_rom(struct priv_t *priv, const EmbeddedRomEntry *entry) {
@@ -4557,6 +4906,445 @@ static bool load_embedded_rom(struct priv_t *priv, const EmbeddedRomEntry *entry
     Serial.println("Warning: Embedded ROM is marked as CGB-only; compatibility is limited.");
   }
 
+  return true;
+}
+
+static FlashPromptAction prompt_flash_rom(size_t rom_size, const char *rom_title) {
+  wait_for_keyboard_release();
+
+  const float size_mb = static_cast<float>(rom_size) / (1024.0f * 1024.0f);
+
+  struct MenuOption {
+    const char *label;
+    const char *hint;
+    FlashPromptAction action;
+  };
+
+  static constexpr MenuOption options[] = {
+    {"Flash to device & run", "Writes to internal flash and reloads immediately", FlashPromptAction::FlashAndRun},
+    {"Run once from SD", "Launches now without flashing", FlashPromptAction::RunOnly},
+    {"Back to ROM browser", "Return without launching", FlashPromptAction::ExitToMenu}
+  };
+  static constexpr size_t option_count = sizeof(options) / sizeof(options[0]);
+
+  size_t selected_index = 0;
+  bool redraw = true;
+
+  while(true) {
+    if(redraw) {
+      redraw = false;
+
+      const int dispW = M5Cardputer.Display.width();
+      const int dispH = M5Cardputer.Display.height();
+      const uint16_t background_colour = M5Cardputer.Display.color565(0, 0, 0);
+      const uint16_t title_colour = M5Cardputer.Display.color565(255, 255, 255);
+      const uint16_t highlight_colour = M5Cardputer.Display.color565(70, 150, 255);
+      const uint16_t border_colour = M5Cardputer.Display.color565(60, 60, 60);
+      const uint16_t text_colour = M5Cardputer.Display.color565(210, 210, 210);
+      const uint16_t text_colour_selected = M5Cardputer.Display.color565(255, 255, 255);
+
+      auto fit_text = [&](const char *src, int max_width) -> String {
+        if(src == nullptr) {
+          return String();
+        }
+        String original(src);
+        if(original.length() == 0) {
+          return original;
+        }
+        if(M5Cardputer.Display.textWidth(original.c_str()) <= max_width) {
+          return original;
+        }
+        String trimmed = original;
+        while(trimmed.length() > 1) {
+          trimmed.remove(trimmed.length() - 1);
+          String candidate = trimmed + "...";
+          if(M5Cardputer.Display.textWidth(candidate.c_str()) <= max_width) {
+            return candidate;
+          }
+        }
+        return original.substring(0, 1);
+      };
+
+      M5Cardputer.Display.fillScreen(background_colour);
+
+      set_font_size(70);
+      M5Cardputer.Display.setTextColor(title_colour, background_colour);
+      M5Cardputer.Display.setCursor(6, 2);
+      M5Cardputer.Display.print("Flash ROM to improve performance?");
+
+
+      char size_line[255];
+      snprintf(size_line, sizeof(size_line), "%.2f MB detected. Large rom will cause\n memory swapping to SD, flashing it to\n the reserve partition can take time but\n will make it run better", size_mb);
+      set_font_size(75);
+      M5Cardputer.Display.setTextColor(M5Cardputer.Display.color565(200, 75, 75), background_colour);
+      M5Cardputer.Display.setCursor(6, 20);
+      M5Cardputer.Display.print(size_line);
+
+      int menu_start_y = 54;
+      const int menu_bottom_margin = 20;
+      int available_height = dispH - menu_start_y - menu_bottom_margin;
+      if(available_height <= 0) {
+        available_height = dispH - 20;
+        menu_start_y = 18;
+      }
+
+      set_font_size(75);
+      const int font_height = M5Cardputer.Display.fontHeight();
+      int line_height = available_height / static_cast<int>(option_count);
+      const int min_line_height = font_height + 8;
+      if(line_height < min_line_height) {
+        line_height = min_line_height;
+      }
+      const int box_height = line_height - 6;
+
+      const int box_left = 6;
+      const int box_width = dispW - (box_left * 2);
+
+      for(size_t i = 0; i < option_count; ++i) {
+        const int y = menu_start_y + static_cast<int>(i) * line_height;
+        const bool is_selected = (i == selected_index);
+
+        if(is_selected) {
+          M5Cardputer.Display.fillRoundRect(box_left,
+                                            y,
+                                            box_width,
+                                            box_height,
+                                            6,
+                                            highlight_colour);
+          M5Cardputer.Display.drawRoundRect(box_left,
+                                            y,
+                                            box_width,
+                                            box_height,
+                                            6,
+                                            border_colour);
+        } else {
+          M5Cardputer.Display.drawRoundRect(box_left,
+                                            y,
+                                            box_width,
+                                            box_height,
+                                            6,
+                                            border_colour);
+        }
+
+        set_font_size(75);
+        String option_label = fit_text(options[i].label, box_width - 20);
+        const int text_y = y + (box_height - M5Cardputer.Display.fontHeight()) / 2;
+        M5Cardputer.Display.setTextColor(is_selected ? text_colour_selected : text_colour,
+                                         is_selected ? highlight_colour : background_colour);
+        M5Cardputer.Display.setCursor(box_left + 10,
+                                      text_y < (y + 2) ? (y + 2) : text_y);
+        M5Cardputer.Display.print(option_label);
+      }
+
+      set_font_size(80);
+      const int help_line_height = M5Cardputer.Display.fontHeight();
+      int help_y = menu_start_y + static_cast<int>(option_count) * line_height + 2;
+      if(help_y + help_line_height + 4 < dispH) {
+        M5Cardputer.Display.setTextColor(M5Cardputer.Display.color565(150, 150, 150), background_colour);
+        M5Cardputer.Display.setCursor(6, help_y);
+        M5Cardputer.Display.print("Enter=Select  Esc=Back  W/S=Move");
+        help_y += help_line_height + 4;
+      }
+
+      set_font_size(80);
+      const int hint_height = M5Cardputer.Display.fontHeight();
+      int hint_y = dispH - hint_height - 4;
+      if(hint_y <= help_y) {
+        hint_y = help_y;
+      }
+      M5Cardputer.Display.setTextColor(M5Cardputer.Display.color565(200, 200, 200), background_colour);
+      String hint_text = fit_text(options[selected_index].hint, dispW - 12);
+      M5Cardputer.Display.setCursor(6, hint_y);
+      M5Cardputer.Display.print(hint_text);
+    }
+
+    M5Cardputer.update();
+
+    Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+
+    if(keys_state_contains_escape(status)) {
+      wait_for_keyboard_release();
+      return FlashPromptAction::ExitToMenu;
+    }
+
+    bool moved = false;
+    bool chosen = false;
+
+    if(M5Cardputer.Keyboard.isPressed()) {
+      for(uint8_t key : status.word) {
+        switch(key) {
+          case ';':
+          case ',':
+          case 'k':
+          case 'K':
+          case 'w':
+          case 'W':
+            if(selected_index > 0) {
+              selected_index--;
+              redraw = true;
+              moved = true;
+            }
+            break;
+          case '.':
+          case 'j':
+          case 'J':
+          case 's':
+          case 'S':
+            if(selected_index + 1 < option_count) {
+              selected_index++;
+              redraw = true;
+              moved = true;
+            }
+            break;
+          case 'l':
+          case 'L':
+            chosen = true;
+            break;
+          case 'f':
+          case 'F':
+          case 'y':
+          case 'Y':
+            selected_index = 0;
+            chosen = true;
+            break;
+          case 'r':
+          case 'R':
+          case 'n':
+          case 'N':
+            selected_index = 1;
+            chosen = true;
+            break;
+          case 'q':
+          case 'Q':
+            selected_index = 2;
+            chosen = true;
+            break;
+          default:
+            break;
+        }
+      }
+
+      if(status.enter) {
+        chosen = true;
+      }
+
+      if(chosen) {
+        wait_for_keyboard_release();
+        return options[selected_index].action;
+      }
+
+      if(moved) {
+        wait_for_keyboard_release();
+      }
+    }
+
+    delay(40);
+  }
+}
+
+static bool flash_rom_to_storage(struct priv_t *priv, size_t rom_size) {
+  if(priv == nullptr || !priv->sd_rom_path_valid) {
+    debugPrint("Flash failed: no SD path");
+    return false;
+  }
+
+  const esp_partition_t *partition = rom_storage_get_partition();
+  if(partition == nullptr) {
+    debugPrint("Flash failed: partition missing");
+    return false;
+  }
+
+  if(rom_size == 0) {
+    debugPrint("Flash failed: size zero");
+    return false;
+  }
+
+  const size_t required_bytes = ROM_STORAGE_DATA_OFFSET + rom_size;
+  if(required_bytes > partition->size) {
+    debugPrint("Flash failed: ROM too large");
+    return false;
+  }
+
+  File rom_file = SD.open(priv->sd_rom_path, FILE_READ);
+  if(!rom_file) {
+    debugPrint("Flash failed: open SD");
+    return false;
+  }
+
+  release_flashed_rom(priv);
+
+  const size_t erase_length = (required_bytes + SPI_FLASH_SEC_SIZE - 1) & ~(SPI_FLASH_SEC_SIZE - 1);
+  esp_err_t err = esp_partition_erase_range(partition, 0, erase_length);
+  if(err != ESP_OK) {
+    rom_file.close();
+    Serial.printf("Flash erase failed: %s\n", esp_err_to_name(err));
+    debugPrint("Flash failed: erase");
+    return false;
+  }
+
+  char title[ROM_STORAGE_TITLE_MAX];
+  extract_rom_title_from_cache(&priv->rom_cache, title, sizeof(title));
+
+  RomStorageHeader header = {};
+  header.magic = ROM_STORAGE_MAGIC;
+  header.version = ROM_STORAGE_VERSION;
+  header.flags = 0;
+  if(priv->rom_is_cgb) {
+    header.flags |= ROM_STORAGE_FLAG_CGB_SUPPORTED;
+  }
+  if(priv->rom_is_cgb_only) {
+    header.flags |= ROM_STORAGE_FLAG_CGB_ONLY;
+  }
+  header.rom_size = rom_size;
+  header.cgb_flag = priv->rom_cgb_flag;
+  strncpy(header.title, title, sizeof(header.title) - 1);
+  header.title[sizeof(header.title) - 1] = '\0';
+  header.title_length = static_cast<uint8_t>(strlen(header.title));
+  header.crc32 = 0;
+
+  err = esp_partition_write(partition, 0, &header, sizeof(header));
+  if(err != ESP_OK) {
+    rom_file.close();
+    Serial.printf("Flash header write failed: %s\n", esp_err_to_name(err));
+    debugPrint("Flash failed: header");
+    return false;
+  }
+
+  M5Cardputer.Display.fillScreen(M5Cardputer.Display.color565(0, 0, 0));
+  set_font_size(112);
+  M5Cardputer.Display.setTextColor(M5Cardputer.Display.color565(255, 255, 255));
+  M5Cardputer.Display.setCursor(10, 18);
+  M5Cardputer.Display.print("Flashing ROM");
+
+  set_font_size(80);
+  M5Cardputer.Display.setCursor(10, 78);
+  M5Cardputer.Display.print(title);
+
+  const uint16_t bg_colour = M5Cardputer.Display.color565(0, 0, 0);
+  const uint16_t outline_colour = M5Cardputer.Display.color565(80, 80, 80);
+  const uint16_t fill_colour = M5Cardputer.Display.color565(80, 180, 255);
+  const uint16_t text_colour = M5Cardputer.Display.color565(255, 255, 255);
+
+  const int bar_x = 12;
+  const int bar_y = 150;
+  const int bar_w = 216;
+  const int bar_h = 24;
+  M5Cardputer.Display.drawRoundRect(bar_x, bar_y, bar_w, bar_h, 6, outline_colour);
+
+  const int percent_x = 12;
+  const int percent_y = bar_y + bar_h + 26;
+  const int detail_y = percent_y + 40;
+  const int text_w = 216;
+  const int text_h = 36;
+
+  const float total_mb = static_cast<float>(rom_size) / (1024.0f * 1024.0f);
+  const char spinner_frames[] = {'|', '/', '-', '\\'};
+  uint32_t spinner_index = 0;
+  const uint64_t start_us = micros64();
+  uint64_t last_ui_update_us = 0;
+  const uint64_t UI_UPDATE_INTERVAL_US = 200000; // 200 ms cadence
+
+  size_t chunk_size = g_psram_available ? (64 * 1024) : (16 * 1024);
+  std::unique_ptr<uint8_t[]> buffer(new (std::nothrow) uint8_t[chunk_size]);
+  if(buffer == nullptr) {
+    chunk_size = 4096;
+    buffer.reset(new (std::nothrow) uint8_t[chunk_size]);
+    if(buffer == nullptr) {
+      rom_file.close();
+      debugPrint("Flash failed: OOM");
+      return false;
+    }
+  }
+
+  size_t written = 0;
+  uint32_t last_percent = UINT32_MAX;
+
+  while(written < rom_size) {
+    const size_t remaining = rom_size - written;
+    const size_t to_request = remaining < chunk_size ? remaining : chunk_size;
+    size_t read_total = 0;
+    while(read_total < to_request) {
+      int chunk = rom_file.read(buffer.get() + read_total, to_request - read_total);
+      if(chunk <= 0) {
+        break;
+      }
+      read_total += static_cast<size_t>(chunk);
+    }
+
+    if(read_total == 0) {
+      rom_file.close();
+      debugPrint("Flash failed: SD read");
+      return false;
+    }
+
+    err = esp_partition_write(partition,
+                              ROM_STORAGE_DATA_OFFSET + written,
+                              buffer.get(),
+                              read_total);
+    if(err != ESP_OK) {
+      rom_file.close();
+      Serial.printf("Flash write failed @%u: %s\n",
+                    static_cast<unsigned>(written),
+                    esp_err_to_name(err));
+      debugPrint("Flash failed: write");
+      return false;
+    }
+
+    written += read_total;
+
+    const uint32_t percent = static_cast<uint32_t>((written * 100ULL) / rom_size);
+    const uint64_t now_us = micros64();
+    if(percent != last_percent || (now_us - last_ui_update_us) >= UI_UPDATE_INTERVAL_US) {
+      last_ui_update_us = now_us;
+      last_percent = percent;
+
+      const int fill_width = static_cast<int>((static_cast<uint64_t>(bar_w - 4) * percent) / 100ULL);
+      M5Cardputer.Display.fillRoundRect(bar_x + 2,
+                                        bar_y + 2,
+                                        fill_width,
+                                        bar_h - 4,
+                                        4,
+                                        fill_colour);
+
+      set_font_size(72);
+      M5Cardputer.Display.setTextColor(text_colour, bg_colour);
+      M5Cardputer.Display.fillRect(percent_x, percent_y, text_w, text_h, bg_colour);
+      M5Cardputer.Display.setCursor(percent_x, percent_y);
+  const char spinner = spinner_frames[(spinner_index++) & 3];
+      char progress[32];
+      snprintf(progress, sizeof(progress), "%3u%% %c", percent, spinner);
+      M5Cardputer.Display.print(progress);
+
+      const float written_mb = static_cast<float>(written) / (1024.0f * 1024.0f);
+      const float elapsed_s = static_cast<float>(now_us - start_us) / 1000000.0f;
+      const float rate_mb_s = (elapsed_s > 0.05f) ? (written_mb / elapsed_s) : 0.0f;
+
+      set_font_size(64);
+      M5Cardputer.Display.fillRect(percent_x, detail_y, text_w, text_h, bg_colour);
+      M5Cardputer.Display.setCursor(percent_x, detail_y);
+      char detail[48];
+      snprintf(detail,
+               sizeof(detail),
+               "%0.2f / %0.2f MB  %0.1f MB/s",
+               written_mb,
+               total_mb,
+               rate_mb_s);
+      M5Cardputer.Display.print(detail);
+    }
+
+    M5Cardputer.update();
+  }
+
+  rom_file.close();
+
+  if(written != rom_size) {
+    debugPrint("Flash failed: size mismatch");
+    return false;
+  }
+
+  rom_storage_refresh_metadata();
+  debugPrint("Flash complete");
+  delay(600);
   return true;
 }
 
@@ -6791,11 +7579,18 @@ char* file_picker() {
     String name;
     bool isDirectory;
     bool isEmbedded;
+    bool isFlashed;
     size_t embeddedIndex;
     const EmbeddedRomEntry *embeddedEntry;
   };
 
   g_file_picker_cancelled = false;
+
+  UBaseType_t stack_before = uxTaskGetStackHighWaterMark(nullptr);
+  Serial.printf("file_picker stack avail: %u bytes\n",
+                (unsigned)(stack_before * sizeof(StackType_t)));
+
+  rom_storage_refresh_metadata();
 
   char current_path[MAX_PATH_LEN];
   strncpy(current_path, "/", MAX_PATH_LEN);
@@ -6821,7 +7616,7 @@ char* file_picker() {
 
     bool has_parent = dir_opened && strcmp(current_path, "/") != 0;
     if(has_parent) {
-      entries.push_back({String(".."), true, false, SIZE_MAX, nullptr});
+      entries.push_back({String(".."), true, false, false, SIZE_MAX, nullptr});
     }
 
     if(at_root && embedded_count > 0) {
@@ -6840,8 +7635,13 @@ char* file_picker() {
           label = "Embedded ROM";
         }
 
-        entries.push_back({String(label), false, true, i, entry});
+        entries.push_back({String(label), false, true, false, i, entry});
       }
+    }
+
+    if(at_root && rom_storage_has_payload()) {
+      const char *label = g_rom_storage_meta.title[0] != '\0' ? g_rom_storage_meta.title : "Flashed ROM";
+      entries.push_back({String(label), false, false, true, SIZE_MAX, nullptr});
     }
 
     if(dir_opened) {
@@ -6851,7 +7651,7 @@ char* file_picker() {
           break;
         }
 
-  Entry e{String(entry.name()), entry.isDirectory(), false, SIZE_MAX, nullptr};
+  Entry e{String(entry.name()), entry.isDirectory(), false, false, SIZE_MAX, nullptr};
         if(e.isDirectory || has_rom_extension(e.name)) {
           entries.push_back(e);
           if(entries.size() >= MAX_FILES) {
@@ -7055,6 +7855,8 @@ char* file_picker() {
           if(entries[entry_idx].isEmbedded) {
             const bool is_autoboot = entries[entry_idx].embeddedEntry != nullptr && entries[entry_idx].embeddedEntry->autoboot;
             indicator = is_autoboot ? "[FW★] " : "[FW] ";
+          } else if(entries[entry_idx].isFlashed) {
+            indicator = "[FLASH] ";
           } else if(entries[entry_idx].isDirectory) {
             indicator = (label == "..") ? "[UP] " : "[DIR] ";
           }
@@ -7146,6 +7948,21 @@ char* file_picker() {
       }
 
       snprintf(selected_path, needed, "%s%zu", kEmbeddedPrefix, chosen.embeddedIndex);
+      g_file_picker_cancelled = false;
+      return selected_path;
+    }
+
+    if(chosen.isFlashed) {
+      const size_t needed = strlen(FLASHED_ROM_SENTINEL) + 1;
+      char *selected_path = (char*)malloc(needed);
+      if(selected_path == NULL) {
+        debugPrint("Path alloc fail");
+        delay(500);
+        continue;
+      }
+
+      strncpy(selected_path, FLASHED_ROM_SENTINEL, needed);
+      selected_path[needed - 1] = '\0';
       g_file_picker_cancelled = false;
       return selected_path;
     }
@@ -7507,6 +8324,8 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.printf("%s firmware %s booting...\n", FIRMWARE_NAME, FIRMWARE_VERSION);
+  Serial.printf("setup stack avail (start): %u bytes\n",
+                (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
   configure_performance_profile();
   reset_save_state(&priv);
 
@@ -7576,6 +8395,8 @@ void setup() {
   }
 
   show_home_menu();
+  Serial.printf("setup stack avail (after home menu): %u bytes\n",
+                (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
 
   gb.wram = alloc_gb_buffer(WRAM_TOTAL_SIZE, "WRAM", true);
   gb.vram = alloc_gb_buffer(VRAM_TOTAL_SIZE, "VRAM", true);
@@ -7609,9 +8430,12 @@ void setup() {
     reset_save_state(&priv);
 
     debugPrint("Before filepick");
+  Serial.printf("setup stack avail (before file picker loop): %u bytes\n",
+          (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
 
     bool rom_ready = false;
     rom_cache_close(&priv.rom_cache);
+  release_flashed_rom(&priv);
     priv.rom_source = RomSource::None;
     priv.embedded_rom_entry = nullptr;
     priv.embedded_rom = nullptr;
@@ -7767,6 +8591,43 @@ void setup() {
       }
 
       debugPrint(selected_file);
+
+      if(strcmp(selected_file, FLASHED_ROM_SENTINEL) == 0) {
+        free(selected_file);
+        if(load_flashed_rom(&priv)) {
+          if(priv.rom_is_cgb) {
+            palette_disable_overrides(&priv.palette);
+          } else {
+            palette_configure_for_dmg(&priv);
+          }
+
+          const size_t rom_size = rom_source_size(&priv);
+          const char *mode_label = priv.rom_is_cgb_only ? "[CGB ONLY]" : (priv.rom_is_cgb ? "[CGB]" : "[DMG]");
+          const char *rom_label = priv.flashed_rom_title[0] != '\0' ? priv.flashed_rom_title : "Flashed ROM";
+
+          char info[96];
+          snprintf(info,
+                   sizeof(info),
+                   "%s ready %s (%u KB)",
+                   rom_label,
+                   mode_label,
+                   (unsigned)(rom_size / 1024));
+          debugPrint(info);
+          delay(250);
+          if(priv.rom_is_cgb_only) {
+            debugPrint("CGB-only ROM support is experimental");
+            delay(500);
+          }
+          save_state_refresh_metadata(&priv);
+          rom_ready = true;
+          continue;
+        } else {
+          debugPrint("Flash ROM load failed");
+          delay(1200);
+          continue;
+        }
+      }
+
       set_sd_rom_path(&priv, selected_file);
       bool opened = rom_cache_open(&priv.rom_cache, selected_file);
       free(selected_file);
@@ -7810,6 +8671,72 @@ void setup() {
           delay(500);
         }
         save_state_refresh_metadata(&priv);
+
+        bool exit_requested = false;
+        if(priv.rom_is_cgb && rom_size > ROM_FLASH_PROMPT_THRESHOLD && priv.sd_rom_path_valid && rom_storage_get_partition() != nullptr) {
+          char title_buffer[ROM_STORAGE_TITLE_MAX];
+          extract_rom_title_from_cache(&priv.rom_cache, title_buffer, sizeof(title_buffer));
+          FlashPromptAction action = prompt_flash_rom(rom_size, title_buffer);
+          switch(action) {
+            case FlashPromptAction::FlashAndRun: {
+              const bool flashed_ok = flash_rom_to_storage(&priv, rom_size);
+              if(flashed_ok) {
+                if(load_flashed_rom(&priv)) {
+                  if(priv.rom_is_cgb) {
+                    palette_disable_overrides(&priv.palette);
+                  } else {
+                    palette_configure_for_dmg(&priv);
+                  }
+
+                  const size_t flashed_size = rom_source_size(&priv);
+                  const char *mode_label = priv.rom_is_cgb_only ? "[CGB ONLY]" : (priv.rom_is_cgb ? "[CGB]" : "[DMG]");
+                  const char *rom_label = priv.flashed_rom_title[0] != '\0' ? priv.flashed_rom_title : "Flashed ROM";
+
+                  char info[96];
+                  snprintf(info,
+                           sizeof(info),
+                           "%s ready %s (%u KB)",
+                           rom_label,
+                           mode_label,
+                           (unsigned)(flashed_size / 1024));
+                  debugPrint(info);
+                  delay(250);
+                  if(priv.rom_is_cgb_only) {
+                    debugPrint("CGB-only ROM support is experimental");
+                    delay(500);
+                  }
+
+                  save_state_refresh_metadata(&priv);
+                } else {
+                  debugPrint("Flashed ROM load failed");
+                  delay(1000);
+                }
+              }
+              break;
+            }
+            case FlashPromptAction::RunOnly:
+              break;
+            case FlashPromptAction::ExitToMenu:
+              exit_requested = true;
+              break;
+          }
+        }
+
+        if(exit_requested) {
+          rom_cache_close(&priv.rom_cache);
+          clear_sd_rom_path(&priv);
+          palette_apply_dmg(&priv.palette);
+          priv.rom_source = RomSource::None;
+          priv.embedded_rom_entry = nullptr;
+          priv.embedded_rom = nullptr;
+          priv.embedded_rom_size = 0;
+          priv.rom_is_cgb = false;
+          priv.rom_is_cgb_only = false;
+          priv.rom_cgb_flag = 0;
+          rom_browser_cancelled = true;
+          break;
+        }
+
         rom_ready = true;
       } else {
         clear_sd_rom_path(&priv);

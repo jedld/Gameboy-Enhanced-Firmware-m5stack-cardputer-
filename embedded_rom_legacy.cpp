@@ -5,6 +5,8 @@
 #include "embedded_rom_config.h"
 #include "embedded_rom.h"
 
+#if defined(ENABLE_EMBEDDED_ROMS) && ENABLE_EMBEDDED_ROMS
+
 #if EMBEDDED_ROM_MULTI_SUPPORT == 0
 
 extern const bool kEmbeddedRomPresent;
@@ -60,3 +62,5 @@ const EmbeddedRomEntry *embedded_rom_find(const char *id) {
 // Multi-ROM build activated; legacy shim not required.
 
 #endif // EMBEDDED_ROM_MULTI_SUPPORT
+
+#endif // ENABLE_EMBEDDED_ROMS
