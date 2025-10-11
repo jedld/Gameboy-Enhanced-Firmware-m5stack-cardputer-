@@ -21,6 +21,8 @@ The 0.1.1 refresh adds on a an auto flashing workflow to handle large ROMs by fl
 
 ## Compiling the firmware for the M5Stack Cardputer
 
+> **M5Launcher tip:** If you prefer installing through M5Launcher/M5Burner, make sure the firmware binary is paired with the bundled partition layout found in `partitions_cardputer_fullapp.csv`. Import both the `.bin` and partition CSV when you create the launcher entry so the custom `romstorage` region is provisioned correctly. Using the stock partition table will shrink or remove the flash slot and break large-ROM flashing.
+
 ### Prerequisites
 
 * Arduino IDE 2.3 or newer (https://www.arduino.cc/en/software). You can also use the Arduino CLI if you prefer working from the terminal.
