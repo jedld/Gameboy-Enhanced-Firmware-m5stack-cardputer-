@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 
 #include "minigb_apu.h"
 
@@ -28,12 +29,159 @@
 
 #define MAX_CHAN_VOLUME		15
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 static uint32_t g_audio_sample_rate = AUDIO_DEFAULT_SAMPLE_RATE;
 static uint32_t g_freq_inc_ref = AUDIO_DEFAULT_SAMPLE_RATE * 16u;
 static uint32_t g_freq_inc_scale = 16u;
 static uint32_t g_audio_samples = 0;
 static uint32_t g_audio_nsamples = 0;
 static bool g_audio_params_ready = false;
+
+typedef struct {
+	float b0;
+	float b1;
+	float b2;
+	float a1;
+	float a2;
+	float x1;
+	float x2;
+	float y1;
+	float y2;
+} biquad_filter_t;
+
+static biquad_filter_t g_bass_filter_left = {0};
+static biquad_filter_t g_bass_filter_right = {0};
+static bool g_eq_enabled = true;
+static bool g_eq_configured = false;
+static const float g_eq_post_gain = 0.92f;
+
+static void biquad_reset(biquad_filter_t *f);
+static void audio_configure_equaliser(void);
+static void audio_ensure_params(void);
+static void audio_reset_filters(void);
+
+static void biquad_reset(biquad_filter_t *f)
+{
+	if(f == NULL) {
+		return;
+	}
+	f->x1 = f->x2 = 0.0f;
+	f->y1 = f->y2 = 0.0f;
+}
+
+static void audio_reset_filters(void)
+{
+	biquad_reset(&g_bass_filter_left);
+	biquad_reset(&g_bass_filter_right);
+	g_eq_configured = false;
+}
+
+static void biquad_configure_low_shelf(biquad_filter_t *f,
+									   double sample_rate,
+									   double cutoff_hz,
+									   double gain_db,
+									   double slope)
+{
+	if(f == NULL || sample_rate <= 0.0) {
+		return;
+	}
+
+	if(cutoff_hz < 20.0) {
+		cutoff_hz = 20.0;
+	}
+	if(cutoff_hz > sample_rate * 0.45) {
+		cutoff_hz = sample_rate * 0.45;
+	}
+
+	if(slope <= 0.0) {
+		slope = 0.707; // default moderate slope
+	}
+
+	const double A = pow(10.0, gain_db / 40.0);
+	const double w0 = 2.0 * M_PI * cutoff_hz / sample_rate;
+	const double cos_w0 = cos(w0);
+	const double sin_w0 = sin(w0);
+	const double alpha = sin_w0 / 2.0 * sqrt((A + 1.0 / A) * (1.0 / slope - 1.0) + 2.0);
+	const double beta = 2.0 * sqrt(A) * alpha;
+
+	double b0 =    A * ((A + 1.0) - (A - 1.0) * cos_w0 + beta);
+	double b1 =  2.0 * A * ((A - 1.0) - (A + 1.0) * cos_w0);
+	double b2 =    A * ((A + 1.0) - (A - 1.0) * cos_w0 - beta);
+	double a0 =        (A + 1.0) + (A - 1.0) * cos_w0 + beta;
+	double a1 =   -2.0 * ((A - 1.0) + (A + 1.0) * cos_w0);
+	double a2 =        (A + 1.0) + (A - 1.0) * cos_w0 - beta;
+
+	if(fabs(a0) < 1e-12) {
+		a0 = 1.0;
+	}
+
+	const double inv_a0 = 1.0 / a0;
+	f->b0 = (float)(b0 * inv_a0);
+	f->b1 = (float)(b1 * inv_a0);
+	f->b2 = (float)(b2 * inv_a0);
+	f->a1 = (float)(a1 * inv_a0);
+	f->a2 = (float)(a2 * inv_a0);
+
+	biquad_reset(f);
+}
+
+static inline float biquad_process(biquad_filter_t *f, float x)
+{
+	const float y = f->b0 * x + f->b1 * f->x1 + f->b2 * f->x2
+					- f->a1 * f->y1 - f->a2 * f->y2;
+	f->x2 = f->x1;
+	f->x1 = x;
+	f->y2 = f->y1;
+	f->y1 = y;
+	return y;
+}
+
+static inline int16_t clamp_to_i16(float value)
+
+{
+	if(value > (float)INT16_MAX) {
+		return INT16_MAX;
+	}
+	if(value < (float)INT16_MIN) {
+		return INT16_MIN;
+	}
+	return (int16_t)lrintf(value);
+}
+
+static void audio_configure_equaliser(void)
+{
+	if(!g_eq_enabled) {
+		audio_reset_filters();
+		return;
+	}
+
+	audio_ensure_params();
+	const double sample_rate = (double)g_audio_sample_rate;
+	if(sample_rate <= 0.0) {
+		audio_reset_filters();
+		return;
+	}
+
+	const double bass_cutoff_hz = 135.0; // tuned for Cardputer speaker
+	const double bass_gain_db = 7.0;     // gentle low shelf boost
+	const double slope = 0.75;          // smooth transition
+
+	biquad_configure_low_shelf(&g_bass_filter_left,
+				   sample_rate,
+				   bass_cutoff_hz,
+				   bass_gain_db,
+				   slope);
+	biquad_configure_low_shelf(&g_bass_filter_right,
+				   sample_rate,
+				   bass_cutoff_hz,
+				   bass_gain_db,
+				   slope);
+
+	g_eq_configured = true;
+}
 
 static void audio_recompute_timing(void)
 {
@@ -54,6 +202,9 @@ static void audio_recompute_timing(void)
 	g_audio_samples = frames;
 	g_audio_nsamples = g_audio_samples * 2u;
 	g_audio_params_ready = true;
+	g_eq_configured = false;
+	if(g_eq_enabled)
+		audio_configure_equaliser();
 }
 
 static void audio_ensure_params(void)
@@ -432,6 +583,7 @@ static void update_noise(int16_t *samples)
 void audio_callback(void *userdata, uint8_t *stream, int len)
 {
 	int16_t *samples = (int16_t *)stream;
+	const uint_fast16_t total_samples = (uint_fast16_t)(len / (int)sizeof(int16_t));
 
 	/* Appease unused variable warning. */
 	(void)userdata;
@@ -443,6 +595,33 @@ void audio_callback(void *userdata, uint8_t *stream, int len)
 	update_square(samples, 1);
 	update_wave(samples);
 	update_noise(samples);
+
+	if(g_eq_enabled) {
+		if(!g_eq_configured)
+			audio_configure_equaliser();
+	} else if(g_eq_configured) {
+		audio_reset_filters();
+	}
+
+	if(g_eq_configured) {
+		for(uint_fast16_t i = 0; (i + 1) < total_samples; i += 2) {
+			float left = (float)samples[i + 0];
+			float right = (float)samples[i + 1];
+
+			left = biquad_process(&g_bass_filter_left, left) * g_eq_post_gain;
+			right = biquad_process(&g_bass_filter_right, right) * g_eq_post_gain;
+
+			samples[i + 0] = clamp_to_i16(left);
+			samples[i + 1] = clamp_to_i16(right);
+		}
+	} else {
+		for(uint_fast16_t i = 0; (i + 1) < total_samples; i += 2) {
+			const float left = (float)samples[i + 0];
+			const float right = (float)samples[i + 1];
+			samples[i + 0] = clamp_to_i16(left);
+			samples[i + 1] = clamp_to_i16(right);
+		}
+	}
 }
 
 static void chan_trigger(uint_fast8_t i)

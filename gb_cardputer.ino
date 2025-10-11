@@ -78,7 +78,7 @@ struct PaletteState;
 
 static constexpr const char *FIRMWARE_NAME = "m5gbcemu";
 #ifndef M5GBCEMU_VERSION
-#define M5GBCEMU_VERSION "0.1.0"
+#define M5GBCEMU_VERSION "0.1.1"
 #endif
 static constexpr const char *FIRMWARE_VERSION = M5GBCEMU_VERSION;
 
@@ -90,7 +90,7 @@ SET_LOOP_TASK_STACK_SIZE(16384);
 
 static bool g_file_picker_cancelled = false;
 
-static constexpr size_t ROM_FLASH_PROMPT_THRESHOLD = 1 * 1024 * 1024;
+static constexpr size_t ROM_FLASH_PROMPT_THRESHOLD = 65536;
 static constexpr size_t ROM_STORAGE_TITLE_MAX = 32;
 static constexpr uint32_t ROM_STORAGE_MAGIC = 0x4D355247; // "M5RG"
 static constexpr uint16_t ROM_STORAGE_VERSION = 1;
