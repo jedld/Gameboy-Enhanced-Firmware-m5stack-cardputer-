@@ -5,6 +5,8 @@ an emphasis on full Gameboy Color support (both dual mode and Game Boy Color onl
 
 The firmware delivers a Cardputer-native Game Boy and Game Boy Color emulator complete with audio, configurable controls, display and performance options, savegames, save states, filesystem navigation and no `.gb` ROM file size limits imposed by memory. Various other enhancements. Accurate palettes. Partial Super Gameboy Enhancement support, including borders. Extended 12 colour mode, along with all official/original GBC palettes. 44 Analogue Pocket 12 colour community palettes included with automatic mapping of titles to AP palettes partially implemented. DMG titles automatically receive authentic Game Boy Color colourisation, including the original boot-time button combos for palette selection. The Options menu also exposes a stretch-to-width toggle if you prefer filling the Cardputer display over pillarboxed output. A four-slot quick save-state system with on-screen feedback lets you checkpoint and recover progress without leaving the emulator loop.
 
+The 0.1.1 refresh adds on a an auto flashing workflow to handle large ROMs by flashing it into a dedicated ROM partition. Enhancements to the APU with a tuned low-shelf EQ tailored to the Cardputer speaker, giving DMG basslines more weight while keeping headroom under control.
+
 ### Quick save states & status overlay
 
 * Hold `Fn` and tap `1`–`4` to capture a snapshot into the matching slot.
@@ -120,8 +122,25 @@ const esp_partition_t *rom_store = esp_partition_find_first(ESP_PARTITION_TYPE_D
 The region spans roughly 6 MB and now backs an on-device flashing workflow:
 
 * When you launch a CGB cartridge larger than 1 MB from the SD card, the firmware offers to copy it into `romstorage`. Confirming the prompt erases any previous payload and streams the ROM directly into internal flash.
-* Once flashed, a new `[FLASH]` entry appears at the top of the ROM browser. Selecting it boots the stored image without requiring the SD card.
-* Save data and screenshots use the flashed title as their identifier, and you can re-flash at any time to overwrite the slot with another game.
+* The confirmation prompt presents **Flash**, **Run from SD**, and **Back** actions using a menu that auto-scales fonts to fit the Cardputer display without clipping.
+* Once flashing completes the ROM cache remaps immediately—no reboot required—and a new `[FLASH]` entry appears at the top of the browser so you can relaunch straight from internal storage.
+* Save data and screenshots use the flashed title as their identifier, and you can re-flash at any time to overwrite the slot with another game. The UI will surface the same progress telemetry on every subsequent write.
+
+**Flash storage tips for large colour ROMs**
+
+* `romstorage` holds a single payload up to ~6 MB (enough for the 4 MB Pokémon / Zelda DX class of titles). If you attempt to flash something larger the firmware falls back to streaming from SD and shows a friendly warning.
+* The slot is fully overwritten on every flash; there is no incremental patching. Keep a copy of the original ROM on your SD card so you can restore it later.
+* Flashed games boot even if the SD card is removed. That makes it ideal for travel or when you want the fastest load times for heavy colour releases.
+* To reclaim the space, simply flash a different ROM or choose **Run from SD** to bypass the slot—the firmware leaves the previous payload untouched until something new is written.
+* Progress telemetry is persisted across retries. If a flashing session is interrupted (for example by power loss) the slot is marked empty on next boot so you can safely re-run the transfer.
+
+### Enhanced audio tuning
+
+The Cardputer’s single speaker now benefits from a purpose-built digital EQ stage that sits between the Peanut-GB APU mixer and the output buffer:
+
+* A low-shelf biquad filter boosts sub-200 Hz content by roughly +7 dB, restoring warmth to DMG-era soundtracks without drowning out higher frequencies.
+* Filter coefficients are recalculated automatically whenever you change the audio sample rate, ensuring the shelf remains anchored around 135 Hz regardless of quality mode.
+* A safety post-gain keeps the output below the clipping threshold even when multiple channels peak together.
 
 ### 2. Install the M5Stack Cardputer board definition (Arduino IDE only)
 
@@ -307,6 +326,12 @@ sound as the next game starts. This is just left over audio buffer info from the
 * Added Solar Striker SGB & AP support
 * Added Missile Command/Asteroids SGB and AP support w/ border
 * Added Space Invaders SGB & SP support w/ Border
+
+12.10.2025:Cardputer port
+* Added a full-screen flash prompt with **Flash / Run / Back** options that autosizes text to avoid truncation.
+* Added a detailed flashing HUD (progress bar, throughput, elapsed time, spinner) and blocked input while writes are in-flight.
+* Automatically remap freshly flashed ROMs into the cache and promote them to the `[FLASH]` slot without rebooting.
+* Introduced a tuned low-shelf EQ in the audio pipeline to restore low-end presence while respecting the Cardputer speaker’s limits.
 
 10.10.2025:Cardputer port
 * Added four quick save-state slots with Fn hotkeys and modifier-based loading.
