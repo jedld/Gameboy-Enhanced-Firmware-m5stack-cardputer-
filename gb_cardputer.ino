@@ -61,7 +61,11 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 #include <freertos/queue.h>
+#ifdef TARGET_LILYGO_TDECK
+#include "platform/tdeck/tdeck_cardputer.h"
+#else
 #include "M5Cardputer.h"
+#endif
 #if ENABLE_SOUND
 #include "minigb_apu_cardputer/minigb_apu.h"
 #endif
@@ -520,7 +524,8 @@ static bool g_psram_available = false;
 static bool g_sd_mounted = false;
 static uint32_t g_sd_active_frequency_hz = SD_SPI_FAST_FREQUENCY_HZ;
 static uint8_t g_sd_frequency_preference_index = 0;
-static bool g_spi2_initialised = false;
+static bool g_sd_spi_initialised = false;
+bool g_display_ready = false;
 static bool g_settings_loaded = false;
 static bool g_settings_dirty = false;
 
@@ -916,6 +921,7 @@ static void show_boot_splash();
 static void show_options_menu();
 static void show_boot_splash();
 static void show_keymap_menu();
+static void render_home_menu(uint8_t selection);
 #if ENABLE_BLUETOOTH_CONTROLLERS
 static void show_bluetooth_menu();
 #endif
@@ -925,21 +931,35 @@ static void audioPump();
 static size_t audio_queue_count = 0;
 #endif
 
-// SD card SPI class.
+// SD card SPI bus selection.
+#ifndef TARGET_LILYGO_TDECK
 SPIClass SPI2;
+#endif
+
+static SPIClass *g_sd_spi =
+#ifdef TARGET_LILYGO_TDECK
+    &SPI;
+#else
+    &SPI2;
+#endif
+    ;
 
 static bool ensure_sd_card(bool blocking) {
   if(g_sd_mounted) {
     return true;
   }
 
-  if(!g_spi2_initialised) {
-    SPI2.begin(
+  if(!g_sd_spi_initialised) {
+#ifdef TARGET_LILYGO_TDECK
+  g_sd_spi->begin(BOARD_SPI_SCK, BOARD_SPI_MISO, BOARD_SPI_MOSI, BOARD_SDCARD_CS);
+#else
+    g_sd_spi->begin(
         M5.getPin(m5::pin_name_t::sd_spi_sclk),
         M5.getPin(m5::pin_name_t::sd_spi_miso),
         M5.getPin(m5::pin_name_t::sd_spi_mosi),
         M5.getPin(m5::pin_name_t::sd_spi_ss));
-    g_spi2_initialised = true;
+#endif
+    g_sd_spi_initialised = true;
   }
 
   static constexpr uint32_t kFrequencies[] = {
@@ -949,7 +969,12 @@ static bool ensure_sd_card(bool blocking) {
   };
   static constexpr uint8_t kFrequencyCount = sizeof(kFrequencies) / sizeof(kFrequencies[0]);
 
-  const int cs_pin = M5.getPin(m5::pin_name_t::sd_spi_ss);
+  const int cs_pin =
+#ifdef TARGET_LILYGO_TDECK
+  BOARD_SDCARD_CS;
+#else
+  M5.getPin(m5::pin_name_t::sd_spi_ss);
+#endif
   uint32_t wait_message_counter = 0;
   uint8_t frequency_index = g_sd_frequency_preference_index;
   if(frequency_index >= kFrequencyCount) {
@@ -960,7 +985,7 @@ static bool ensure_sd_card(bool blocking) {
   auto attempt_mount = [&](uint8_t index) -> bool {
     const uint32_t frequency = kFrequencies[index];
     SD.end();
-    if(SD.begin(cs_pin, SPI2, frequency)) {
+  if(SD.begin(cs_pin, *g_sd_spi, frequency)) {
       g_sd_mounted = true;
       g_sd_active_frequency_hz = frequency;
       g_sd_frequency_preference_index = index;
@@ -1010,10 +1035,57 @@ static bool ensure_sd_card(bool blocking) {
   }
 }
 
+static void draw_text_block(const String &text,
+                            uint8_t text_size,
+                            uint16_t fg_colour = 0xFFFF,
+                            uint16_t bg_colour = TFT_BLACK) {
+  if(!g_display_ready) {
+    Serial.println("draw_text_block skipped (display not ready)");
+    return;
+  }
+
+  Serial.printf("draw_text_block: len=%d size=%u\n", text.length(), static_cast<unsigned>(text_size));
+
+  M5Cardputer.Display.startWrite();
+  M5Cardputer.Display.fillScreen(bg_colour);
+  M5Cardputer.Display.setTextFont(1);
+  M5Cardputer.Display.setTextColor(fg_colour, bg_colour);
+  M5Cardputer.Display.setTextSize(text_size > 0 ? text_size : 1);
+  M5Cardputer.Display.setTextWrap(true);
+  M5Cardputer.Display.setCursor(0, 0);
+
+  const int16_t line_height = std::max<int16_t>(M5Cardputer.Display.fontHeight(),
+                                                static_cast<int16_t>((text_size > 0 ? text_size : 1) * 8));
+
+  int32_t cursor_y = 0;
+  int start = 0;
+  while(start <= text.length()) {
+    int newline_index = text.indexOf('\n', start);
+    bool has_newline = newline_index != -1;
+    String line = has_newline ? text.substring(start, newline_index) : text.substring(start);
+
+    M5Cardputer.Display.setCursor(0, cursor_y);
+    if(line.length() > 0) {
+      M5Cardputer.Display.print(line);
+    }
+
+    if(!has_newline) {
+      break;
+    }
+
+    start = newline_index + 1;
+    cursor_y += line_height;
+  }
+  M5Cardputer.Display.endWrite();
+}
+
 // Prints debug info to the display.
 void debugPrint(const char* str) {
-  M5Cardputer.Display.clearDisplay();
-  M5Cardputer.Display.drawString(str, 0, 0);
+  if(str == nullptr) {
+    return;
+  }
+
+  draw_text_block(String(str) + "\n", 2);
   Serial.println(str);
 #if DEBUG_DELAY
   delay(500);
@@ -7391,7 +7463,58 @@ static void show_bluetooth_menu() {
 }
 #endif
 
+static void render_home_menu(uint8_t selection) {
+  if(!g_display_ready) {
+    Serial.printf("render_home_menu skipped (display not ready), selection=%u\n",
+                  static_cast<unsigned>(selection));
+    return;
+  }
+
+  Serial.printf("render_home_menu: selection=%u\n", static_cast<unsigned>(selection));
+
+  // Build a simple textual menu so we rely on the proven text rendering path.
+  String menu;
+  menu.reserve(256);
+
+  menu += "Main Menu\n\n";
+  menu += (selection == 0) ? "> Launch ROM browser\n" : "  Launch ROM browser\n";
+  menu += (selection == 1) ? "> Options\n" : "  Options\n";
+  menu += "\n";
+
+  menu += "Audio: ";
+  menu += g_settings.audio_enabled ? "On" : "Off";
+  menu += "\n";
+
+  menu += "Cache banks: ";
+  menu += String(static_cast<unsigned>(g_settings.rom_cache_banks));
+  menu += "\n";
+
+  menu += "Volume: ";
+  menu += String(static_cast<unsigned>(g_settings.master_volume));
+  menu += "\n\n";
+
+  menu += "J/S=Down  K/W=Up\n";
+  menu += "L/ENTER=Select  H=Prev\n";
+
+  const uint16_t menu_bg = M5Cardputer.Display.color565(255, 0, 0);
+  Serial.printf("render_home_menu: colours fg=0x%04X bg=0x%04X\n", 0xFFFF, menu_bg);
+  Serial.println("render_home_menu content:\n" + menu);
+  M5Cardputer.Display.startWrite();
+  M5Cardputer.Display.fillScreen(menu_bg);
+  M5Cardputer.Display.endWrite();
+  delay(500);
+  draw_text_block(menu, 2, 0xFFFF, menu_bg);
+}
+
 static void show_home_menu() {
+  Serial.println("show_home_menu: enter");
+  
+  // Force display reinit to ensure we can overwrite the SD prompt
+  Serial.println("show_home_menu: reinitializing display");
+  M5Cardputer.Display.begin();
+  M5Cardputer.Display.setRotation(1);
+  delay(100);
+  
   const uint8_t OPTION_LAUNCH = 0;
   const uint8_t OPTION_OPTIONS = 1;
   const uint8_t OPTION_COUNT = 2;
@@ -7403,27 +7526,8 @@ static void show_home_menu() {
   while(!launch_selected) {
     if(redraw) {
       redraw = false;
-      M5Cardputer.Display.clearDisplay();
-      set_font_size(84);
-      M5Cardputer.Display.setCursor(0, 0);
-      M5Cardputer.Display.println("Main Menu");
-
-      auto draw_option = [&](uint8_t index, const String &label) {
-        String line = (selection == index) ? ("> " + label) : ("  " + label);
-        M5Cardputer.Display.println(line);
-      };
-
-      draw_option(OPTION_LAUNCH, "Launch ROM browser");
-      draw_option(OPTION_OPTIONS, "Options");
-
-  set_font_size(200);
-      M5Cardputer.Display.println();
-      M5Cardputer.Display.println("Audio: " + String(g_settings.audio_enabled ? "On" : "Off"));
-      M5Cardputer.Display.println("Cache banks: " + String(g_settings.rom_cache_banks));
-  M5Cardputer.Display.println("Volume: " + String(g_settings.master_volume));
-      M5Cardputer.Display.println();
-  M5Cardputer.Display.println("J/S=Down  K/W=Up");
-  M5Cardputer.Display.println("L/ENTER=Select  H=Prev");
+      Serial.println("show_home_menu: redraw");
+      render_home_menu(selection);
     }
 
     M5Cardputer.update();
@@ -7768,7 +7872,9 @@ char* file_picker() {
           }
         }
         delay(1000);
-        M5.Lcd.qrcode("https://tinyurl.com/444jzbs2", 30, 20, 180, 0);
+#ifndef TARGET_LILYGO_TDECK
+  M5.Lcd.qrcode("https://tinyurl.com/444jzbs2", 30, 20, 180, 0);
+#endif
       } else {
         char *slash = strrchr(current_path, '/');
         if(slash != NULL) {
@@ -8640,13 +8746,18 @@ void setup() {
   }
   apply_settings_constraints();
 
-  // Init M5Stack and M5Cardputer libs.
+  // Init platform-specific front-end (Cardputer or T-Deck).
+#ifdef TARGET_LILYGO_TDECK
+  M5Cardputer.begin(true);
+#else
   auto cfg = M5.config();
   cfg.internal_spk = true;
   cfg.internal_mic = true;
   cfg.fallback_board = m5::board_t::board_M5Cardputer;
   // Use keyboard.
   M5Cardputer.begin(cfg, true);
+#endif
+  g_display_ready = true;
 
 #if ENABLE_SOUND
   // Speaker initialisation handled in audioSetup().
