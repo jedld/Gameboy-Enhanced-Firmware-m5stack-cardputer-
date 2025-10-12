@@ -244,15 +244,32 @@ struct CacheRecoveryState {
 
 static CacheRecoveryState g_cache_recovery = {false, 0, 0};
 
-#define DEST_W 240
-#define DEST_H 135
+#ifdef TARGET_LILYGO_TDECK
+static constexpr size_t DISPLAY_NATIVE_W = 320;
+static constexpr size_t DISPLAY_NATIVE_H = 240;
+static constexpr size_t STRETCH_OUTPUT_W = (LCD_WIDTH * DISPLAY_NATIVE_H + (LCD_HEIGHT / 2)) / LCD_HEIGHT;
+static constexpr int32_t STRETCH_X_OFFSET = static_cast<int32_t>((DISPLAY_NATIVE_W - STRETCH_OUTPUT_W) / 2);
+#else
+static constexpr size_t DISPLAY_NATIVE_W = 240;
+static constexpr size_t DISPLAY_NATIVE_H = 135;
+static constexpr size_t STRETCH_OUTPUT_W = DISPLAY_NATIVE_W;
+static constexpr int32_t STRETCH_X_OFFSET = 0;
+#endif
+
+static constexpr size_t DEST_W = DISPLAY_NATIVE_W;
+static constexpr size_t DEST_H = DISPLAY_NATIVE_H;
+
+static_assert(STRETCH_OUTPUT_W <= DEST_W, "Stretch width must not exceed display width");
 
 static constexpr uint32_t RENDER_TASK_STACK_SIZE = 2048;
 static constexpr uint32_t AUDIO_TASK_STACK_SIZE = 2048;
 
 #define DEBUG_DELAY 0
 
-#define DISPLAY_CENTER(x) x + (DEST_W/2 - LCD_WIDTH/2)
+static constexpr int32_t display_center_offset = static_cast<int32_t>((DISPLAY_NATIVE_W / 2) - (LCD_WIDTH / 2));
+static constexpr int32_t DISPLAY_CENTER(int32_t x) {
+  return x + display_center_offset;
+}
 
 // ROM streaming helpers.
 static constexpr size_t ROM_STREAM_BLOCK_SIZE = 0x1000;
@@ -471,7 +488,7 @@ static constexpr size_t MBC7_EEPROM_RAW_SIZE = MBC7_EEPROM_WORD_COUNT * sizeof(u
 static FirmwareSettings g_settings = {
   true,
   true,
-  false,
+  true,
   ROM_CACHE_BANK_MAX,
   DEFAULT_MASTER_VOLUME,
   static_cast<uint8_t>(FRAME_SKIP_MODE_AUTO),
@@ -2821,6 +2838,10 @@ static void apply_settings_constraints() {
   if(g_settings.frame_skip_mode >= FRAME_SKIP_MODE_COUNT) {
     g_settings.frame_skip_mode = static_cast<uint8_t>(FRAME_SKIP_MODE_AUTO);
   }
+#ifdef TARGET_LILYGO_TDECK
+  // T-Deck requires stretch mode for proper aspect ratio
+  g_settings.stretch_display = true;
+#endif
 }
 
 static bool ensure_settings_dir() {
@@ -3000,6 +3021,16 @@ static bool load_settings_from_sd() {
   }
 
   apply_settings_constraints();
+  
+#ifdef TARGET_LILYGO_TDECK
+  // T-Deck requires stretch mode for proper aspect ratio
+  if(!g_settings.stretch_display) {
+    g_settings.stretch_display = true;
+    upgrade_needed = true;
+    Serial.println("Forcing stretch mode for T-Deck");
+  }
+#endif
+  
   g_settings_loaded = true;
   g_settings_dirty = upgrade_needed;
 
@@ -6215,10 +6246,10 @@ static void ensure_stretch_map() {
     return;
   }
 
-  constexpr float scale = static_cast<float>(LCD_WIDTH) / static_cast<float>(DEST_W);
+  constexpr float scale = static_cast<float>(LCD_WIDTH) / static_cast<float>(STRETCH_OUTPUT_W);
   const float max_src = static_cast<float>(LCD_WIDTH - 1);
 
-  for(unsigned int x = 0; x < DEST_W; ++x) {
+  for(unsigned int x = 0; x < STRETCH_OUTPUT_W; ++x) {
     float src_x = (static_cast<float>(x) + 0.5f) * scale - 0.5f;
     if(src_x < 0.0f) {
       src_x = 0.0f;
@@ -6333,10 +6364,11 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
     frame_row_map_initialised = true;
   }
 
-  const uint16_t output_width = stretch ? DEST_W : LCD_WIDTH;
-  const int32_t x_offset = stretch ? 0 : DISPLAY_CENTER(0);
+  const uint16_t output_width = stretch ? static_cast<uint16_t>(STRETCH_OUTPUT_W) : LCD_WIDTH;
+  const int32_t x_offset = stretch ? STRETCH_X_OFFSET : DISPLAY_CENTER(0);
   const size_t row_bytes = output_width * sizeof(uint16_t);
   const bool cache_was_valid = display_cache_valid;
+  const bool apply_letterbox = stretch && (STRETCH_X_OFFSET > 0);
 
   auto needs_update = [&](unsigned int src_y0, uint16_t weight) -> bool {
     if(row_dirty == nullptr || !cache_was_valid) {
@@ -6443,6 +6475,17 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
   uint16_t *const line_buffer = stretch_line_buffer;
 
   const bool use_full_cache = swap_fb_enabled && swap_fb_psram_backed && swap_fb != nullptr && row_hash != nullptr;
+
+  if(apply_letterbox && !cache_was_valid) {
+    if(STRETCH_X_OFFSET > 0) {
+      M5Cardputer.Display.fillRect(0, 0, STRETCH_X_OFFSET, DEST_H, FALLBACK_COLOUR_RGB565);
+    }
+    const int32_t right_x = STRETCH_X_OFFSET + output_width;
+    const int32_t right_width = static_cast<int32_t>(DEST_W) - right_x;
+    if(right_width > 0) {
+      M5Cardputer.Display.fillRect(right_x, 0, right_width, DEST_H, FALLBACK_COLOUR_RGB565);
+    }
+  }
 
   if(!use_full_cache) {
     unsigned int segment_rows = 0;
