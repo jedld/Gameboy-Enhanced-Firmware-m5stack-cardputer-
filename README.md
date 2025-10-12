@@ -505,9 +505,9 @@ Yellow bars on either side of the display momentarily indicate that the cartridg
 
 Controls(in game):
 left/right use 'a' and 'd'
-up/down use 'e' and 's'
+up/down use 'w' and 's'
 A/B use 'l' and 'k'
-start/select use '1' and '0'
+start/select use '1' and '2' (Enter and Space also work as Start/Select shortcuts)
 cycle palette in current mode use the ] square bracket
 cycle between classic gameboy,super gameboy & 12 color modes [
 force cart ram backup press '=' (if uncertain of gamesave use this)

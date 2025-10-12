@@ -28,6 +28,7 @@
 #define MAX_PATH_LEN 256
 
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <memory>
 #include <new>
@@ -37,6 +38,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cmath>
+#include <string>
 #include <limits.h>
 #include <time.h>
 #include <sys/types.h>
@@ -348,6 +350,17 @@ static const char * const JOYPAD_BUTTON_LABELS[JOYPAD_BUTTON_COUNT] = {
 };
 
 static constexpr uint8_t DEFAULT_JOYPAD_KEYMAP[JOYPAD_BUTTON_COUNT] = {
+  static_cast<uint8_t>('w'),
+  static_cast<uint8_t>('s'),
+  static_cast<uint8_t>('a'),
+  static_cast<uint8_t>('d'),
+  static_cast<uint8_t>('l'),
+  static_cast<uint8_t>('k'),
+  static_cast<uint8_t>('1'),
+  static_cast<uint8_t>('2')
+};
+
+static constexpr uint8_t LEGACY_JOYPAD_KEYMAP[JOYPAD_BUTTON_COUNT] = {
   static_cast<uint8_t>('e'),
   static_cast<uint8_t>('s'),
   static_cast<uint8_t>('a'),
@@ -437,7 +450,7 @@ struct FirmwareSettings {
 };
 
 static constexpr uint8_t DEFAULT_MASTER_VOLUME = 255;
-static constexpr uint8_t SETTINGS_VERSION = 4;
+static constexpr uint8_t SETTINGS_VERSION = 5;
 static constexpr uint8_t VOLUME_STEP = 16;
 static constexpr const char *SETTINGS_DIR = "/config";
 static constexpr const char *SETTINGS_FILE_PATH = "/config/cardputer_settings.ini";
@@ -463,7 +476,7 @@ static FirmwareSettings g_settings = {
   DEFAULT_MASTER_VOLUME,
   static_cast<uint8_t>(FRAME_SKIP_MODE_AUTO),
   {
-    static_cast<uint8_t>('e'),
+    static_cast<uint8_t>('w'),
     static_cast<uint8_t>('s'),
     static_cast<uint8_t>('a'),
     static_cast<uint8_t>('d'),
@@ -2730,6 +2743,63 @@ static void apply_default_button_mapping() {
          sizeof(DEFAULT_JOYPAD_KEYMAP));
 }
 
+static bool keys_word_contains(const std::string &word, char value) {
+  return word.find(value) != std::string::npos;
+}
+
+template <size_t N>
+static bool keys_word_contains(const std::array<char, N> &word, char value) {
+  return std::find(word.begin(), word.end(), value) != word.end();
+}
+
+static bool keys_word_contains(const std::vector<char> &word, char value) {
+  return std::find(word.begin(), word.end(), value) != word.end();
+}
+
+static void keys_word_append_unique(std::string &word, char value) {
+  if(word.find(value) == std::string::npos) {
+    word.push_back(value);
+  }
+}
+
+template <size_t N>
+static void keys_word_append_unique(std::array<char, N> &word, char value) {
+  for(char existing : word) {
+    if(existing == value) {
+      return;
+    }
+  }
+
+  for(char &slot : word) {
+    if(slot == 0) {
+      slot = value;
+      return;
+    }
+  }
+}
+
+static void keys_word_append_unique(std::vector<char> &word, char value) {
+  if(std::find(word.begin(), word.end(), value) == word.end()) {
+    word.push_back(value);
+  }
+}
+
+static void augment_keys_state(Keyboard_Class::KeysState &status) {
+  for(uint8_t hid : status.hid_keys) {
+    char ascii = hid_keycode_to_ascii(hid);
+    if(ascii == 0) {
+      continue;
+    }
+
+    const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(ascii)));
+    if(keys_word_contains(status.word, ascii) || keys_word_contains(status.word, upper)) {
+      continue;
+    }
+
+    keys_word_append_unique(status.word, ascii);
+  }
+}
+
 static void apply_settings_constraints() {
   const uint8_t min_banks = 1;
   if(g_settings.rom_cache_banks < min_banks) {
@@ -2821,6 +2891,7 @@ static bool load_settings_from_sd() {
   bool version_seen = false;
   bool volume_seen = false;
   bool upgrade_needed = false;
+  bool legacy_keymap_detected = false;
   uint8_t loaded_keys[JOYPAD_BUTTON_COUNT] = {0};
 
   while(file.available()) {
@@ -2900,7 +2971,17 @@ static bool load_settings_from_sd() {
         start = comma + 1;
       }
       if(index == JOYPAD_BUTTON_COUNT) {
+        bool matches_legacy = true;
+        for(size_t i = 0; i < JOYPAD_BUTTON_COUNT; ++i) {
+          if(loaded_keys[i] != LEGACY_JOYPAD_KEYMAP[i]) {
+            matches_legacy = false;
+            break;
+          }
+        }
         memcpy(g_settings.button_mapping, loaded_keys, sizeof(loaded_keys));
+        if(matches_legacy) {
+          legacy_keymap_detected = true;
+        }
       }
     }
   }
@@ -2912,6 +2993,10 @@ static bool load_settings_from_sd() {
     if(!volume_seen) {
       g_settings.master_volume = DEFAULT_MASTER_VOLUME;
     }
+  }
+
+  if(upgrade_needed && legacy_keymap_detected) {
+    apply_default_button_mapping();
   }
 
   apply_settings_constraints();
@@ -3448,6 +3533,7 @@ static void poll_keyboard() {
   gb.direct.joypad = 0xff;
   M5Cardputer.update();
   Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+  augment_keys_state(status);
   handle_volume_keys(status);
   handle_save_state_shortcuts(status);
   bool consume_screenshot_key = false;
@@ -5184,6 +5270,7 @@ static FlashPromptAction prompt_flash_rom(size_t rom_size, const char *rom_title
     M5Cardputer.update();
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    augment_keys_state(status);
 
     if(keys_state_contains_escape(status)) {
       wait_for_keyboard_release();
@@ -5680,7 +5767,8 @@ static bool palette_capture_boot_combo(size_t *out_index) {
 
   while(micros64() < timeout) {
     M5Cardputer.update();
-    const Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    augment_keys_state(status);
 
     bool up, right, down, left, button_a, button_b;
     palette_extract_keys(status, up, right, down, left, button_a, button_b);
@@ -6917,6 +7005,7 @@ static void show_keymap_menu() {
     }
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    augment_keys_state(status);
     bool handled = false;
 
     auto bump_selection = [&](int delta) {
@@ -6943,6 +7032,7 @@ static void show_keymap_menu() {
           M5Cardputer.update();
           if(M5Cardputer.Keyboard.isPressed()) {
             Keyboard_Class::KeysState capture = M5Cardputer.Keyboard.keysState();
+            augment_keys_state(capture);
             if(capture.enter) {
               wait_for_keyboard_release();
               status_message = "Mapping cancelled";
@@ -7133,6 +7223,7 @@ static void show_options_menu() {
     }
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    augment_keys_state(status);
 
     auto bump_selection = [&](int delta) {
       selection = static_cast<uint8_t>((selection + OPTION_COUNT + delta) % OPTION_COUNT);
@@ -7351,6 +7442,7 @@ static void show_bluetooth_menu() {
     }
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    augment_keys_state(status);
 
     bool handled = false;
 
@@ -7537,6 +7629,7 @@ static void show_home_menu() {
     }
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    augment_keys_state(status);
 
     auto bump_selection = [&](int delta) {
       selection = static_cast<uint8_t>((selection + OPTION_COUNT + delta) % OPTION_COUNT);
@@ -7931,6 +8024,7 @@ char* file_picker() {
       set_font_size(128);
       if(M5Cardputer.Keyboard.isPressed()) {
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+        augment_keys_state(status);
 
         if(keys_state_contains_escape(status)) {
           esc_pressed = true;

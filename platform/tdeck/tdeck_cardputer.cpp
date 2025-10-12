@@ -10,11 +10,44 @@
 #include <vector>
 
 #include <algorithm>
+#include <cctype>
 
 extern bool g_display_ready;
 
 namespace {
 constexpr uint8_t kBacklightSteps = 16;
+
+constexpr size_t kMatrixCols = 5;
+constexpr size_t kMatrixRows = 7;
+
+constexpr char kBaseKeymap[kMatrixCols][kMatrixRows] = {
+    {'q', 'w', 0,   'a', 0,  ' ', 0},
+    {'e', 's', 'd', 'p', 'x', 'z', 0},
+    {'r', 'g', 't', 0,   'v', 'c', 'f'},
+    {'u', 'h', 'y', '\n', 'b', 'n', 'j'},
+    {'o', 'l', 'i', '\b', '$', 'm', 'k'},
+};
+
+constexpr char kSymbolKeymap[kMatrixCols][kMatrixRows] = {
+    {'#', '1', 0,   '*', 0,  0,  '0'},
+    {'2', '4', '5', '@', '8', '7', 0},
+    {'3', '/', '(', 0,   '?', '9', '6'},
+    {'_', ':', ')', 0,   '!', ',', ';'},
+    {'+', '"', '-', 0,   0,   '.', '\''},
+};
+
+constexpr size_t kSymbolColumn = 0;
+constexpr size_t kSymbolRow = 2;
+constexpr size_t kAltColumn = 0;
+constexpr size_t kAltRow = 4;
+constexpr size_t kShiftLeftColumn = 1;
+constexpr size_t kShiftLeftRow = 6;
+constexpr size_t kShiftRightColumn = 2;
+constexpr size_t kShiftRightRow = 3;
+constexpr size_t kEnterColumn = 3;
+constexpr size_t kEnterRow = 3;
+constexpr size_t kBackspaceColumn = 4;
+constexpr size_t kBackspaceRow = 3;
 
 void writeKeyboardCommand(uint8_t command, uint8_t value) {
   Wire.beginTransmission(LILYGO_KB_ADDRESS);
@@ -384,6 +417,8 @@ bool Speaker_Class::playRaw(const int16_t *samples,
 
 void Keyboard_Class::begin() {
   writeKeyboardCommand(LILYGO_KB_DEFAULT_BRIGHTNESS_CMD, 127);
+  writeKeyboardCommand(LILYGO_KB_MODE_RAW_CMD, 1);
+  delay(1);
   update();
 }
 
@@ -395,8 +430,89 @@ void Keyboard_Class::update() {
   next.ctrl = false;
   next.enter = false;
 
-  size_t index = 0;
-  if(Wire.requestFrom(LILYGO_KB_ADDRESS, static_cast<uint8_t>(KeysState::kMaxKeys))) {
+  const int available = Wire.requestFrom(LILYGO_KB_ADDRESS, static_cast<uint8_t>(KeysState::kMaxKeys));
+  if(available >= static_cast<int>(kMatrixCols)) {
+    std::array<uint8_t, kMatrixCols> column_state{};
+    size_t col_index = 0;
+    while(Wire.available() && col_index < kMatrixCols) {
+      column_state[col_index++] = static_cast<uint8_t>(Wire.read());
+    }
+    while(Wire.available()) {
+      Wire.read();
+    }
+
+    bool pressed_matrix[kMatrixCols][kMatrixRows] = {};
+    bool any_pressed = false;
+    for(size_t col = 0; col < kMatrixCols; ++col) {
+      const uint8_t mask = column_state[col];
+      for(size_t row = 0; row < kMatrixRows; ++row) {
+        const bool pressed = ((mask >> row) & 0x01u) != 0;
+        pressed_matrix[col][row] = pressed;
+        if(pressed) {
+          any_pressed = true;
+        }
+      }
+    }
+
+    const bool symbol_layer = pressed_matrix[kSymbolColumn][kSymbolRow];
+    const bool alt_active = pressed_matrix[kAltColumn][kAltRow];
+    const bool shift_active = pressed_matrix[kShiftLeftColumn][kShiftLeftRow] ||
+                              pressed_matrix[kShiftRightColumn][kShiftRightRow];
+    const bool enter_active = pressed_matrix[kEnterColumn][kEnterRow];
+    const bool backspace_active = pressed_matrix[kBackspaceColumn][kBackspaceRow];
+
+    next.fn = alt_active;
+    next.ctrl = false;
+    next.enter = enter_active;
+
+    size_t write_index = 0;
+    auto append_char = [&](char value) {
+      if(value == 0 || write_index >= KeysState::kMaxKeys) {
+        return;
+      }
+      next.word[write_index] = value;
+      next.hid_keys[write_index] = static_cast<uint8_t>(value);
+      ++write_index;
+    };
+
+    if(enter_active) {
+      append_char('\n');
+    }
+    if(backspace_active) {
+      append_char('\b');
+    }
+
+    for(size_t col = 0; col < kMatrixCols; ++col) {
+      for(size_t row = 0; row < kMatrixRows; ++row) {
+        if(!pressed_matrix[col][row]) {
+          continue;
+        }
+
+        if((col == kSymbolColumn && row == kSymbolRow) ||
+           (col == kAltColumn && row == kAltRow) ||
+           (col == kShiftLeftColumn && row == kShiftLeftRow) ||
+           (col == kShiftRightColumn && row == kShiftRightRow) ||
+           (col == kEnterColumn && row == kEnterRow) ||
+           (col == kBackspaceColumn && row == kBackspaceRow)) {
+          continue;
+        }
+
+        char value = symbol_layer ? kSymbolKeymap[col][row] : kBaseKeymap[col][row];
+        if(value == 0) {
+          continue;
+        }
+
+        if(shift_active && value >= 'a' && value <= 'z') {
+          value = static_cast<char>(std::toupper(static_cast<unsigned char>(value)));
+        }
+
+        append_char(value);
+      }
+    }
+
+    pressed_ = any_pressed;
+  } else {
+    size_t index = 0;
     while(Wire.available() && index < KeysState::kMaxKeys) {
       int value = Wire.read();
       if(value <= 0) {
@@ -410,9 +526,9 @@ void Keyboard_Class::update() {
       }
       ++index;
     }
+    pressed_ = index > 0;
   }
 
-  pressed_ = index > 0;
   state_ = next;
 }
 

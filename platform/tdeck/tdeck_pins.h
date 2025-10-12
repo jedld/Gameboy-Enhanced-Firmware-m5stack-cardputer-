@@ -42,3 +42,5 @@ static constexpr uint8_t BOARD_GPS_TX = 17;
 static constexpr uint8_t LILYGO_KB_ADDRESS = 0x55;
 static constexpr uint8_t LILYGO_KB_BRIGHTNESS_CMD = 0x01;
 static constexpr uint8_t LILYGO_KB_DEFAULT_BRIGHTNESS_CMD = 0x02;
+static constexpr uint8_t LILYGO_KB_MODE_RAW_CMD = 0x03;
+static constexpr uint8_t LILYGO_KB_MODE_KEY_CMD = 0x04;
