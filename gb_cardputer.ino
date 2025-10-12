@@ -8664,7 +8664,6 @@ static void audioSetup() {
   auto cfg = base_cfg;
   cfg.sample_rate = requested_rate;
   cfg.stereo = true;
-  cfg.magnification = 8;
   audio_set_sample_rate(requested_rate);
   Serial.printf("audioSetup: requested sample rate %u Hz (psram=%s)\n",
                 (unsigned)requested_rate,
@@ -8684,37 +8683,69 @@ static void audioSetup() {
   if(g_psram_available) {
     cfg.dma_buf_count = 12;
   }
+
+#ifdef TARGET_LILYGO_TDECK
+  cfg.pin_data_out = BOARD_I2S_DOUT;
+  cfg.pin_bck = BOARD_I2S_BCK;
+  cfg.pin_ws = BOARD_I2S_WS;
+  cfg.i2s_port = I2S_NUM_0;
+#else
+  cfg.magnification = 8;
   cfg.task_priority = tskIDLE_PRIORITY + 4;
   cfg.task_pinned_core = 0;
   cfg.use_dac = false;
-  // Cardputer speaker (NS4168) uses dedicated I2S pins: G41=BCLK, G42=SDOUT, G43=LRCLK.
-  cfg.pin_data_out = 42;
-  cfg.pin_bck = 41;
-  cfg.pin_ws = 43;
+  cfg.pin_data_out = 42;   // SDOUT
+  cfg.pin_bck = 41;        // BCLK
+  cfg.pin_ws = 43;         // LRCLK
   cfg.pin_mck = -1;
+#endif
 
   M5Cardputer.Speaker.end();
   M5Cardputer.Speaker.config(cfg);
   audio_initialised = M5Cardputer.Speaker.begin();
-  Serial.printf("Speaker.begin (stereo) data_out=%d bck=%d ws=%d mck=%d -> %s\n",
+  Serial.printf(
+#ifdef TARGET_LILYGO_TDECK
+                "Speaker.begin (stereo) data_out=%d bck=%d ws=%d -> %s\n",
+#else
+                "Speaker.begin (stereo) data_out=%d bck=%d ws=%d mck=%d -> %s\n",
+#endif
                 cfg.pin_data_out,
                 cfg.pin_bck,
                 cfg.pin_ws,
+#ifdef TARGET_LILYGO_TDECK
+                audio_initialised ? "OK" : "FAIL"
+#else
                 cfg.pin_mck,
-                audio_initialised ? "OK" : "FAIL");
+                audio_initialised ? "OK" : "FAIL"
+#endif
+                );
 
   if(!audio_initialised) {
+#ifdef TARGET_LILYGO_TDECK
+    cfg.stereo = false;
+#else
     cfg.pin_data_out = 42;
     cfg.stereo = false;
+#endif
     M5Cardputer.Speaker.end();
     M5Cardputer.Speaker.config(cfg);
     audio_initialised = M5Cardputer.Speaker.begin();
-    Serial.printf("Speaker.begin retry mono data_out=%d bck=%d ws=%d mck=%d -> %s\n",
+    Serial.printf(
+#ifdef TARGET_LILYGO_TDECK
+                  "Speaker.begin retry mono data_out=%d bck=%d ws=%d -> %s\n",
+#else
+                  "Speaker.begin retry mono data_out=%d bck=%d ws=%d mck=%d -> %s\n",
+#endif
                   cfg.pin_data_out,
                   cfg.pin_bck,
                   cfg.pin_ws,
+#ifdef TARGET_LILYGO_TDECK
+                  audio_initialised ? "OK" : "FAIL"
+#else
                   cfg.pin_mck,
-                  audio_initialised ? "OK" : "FAIL");
+                  audio_initialised ? "OK" : "FAIL"
+#endif
+                  );
   }
 
   if(!audio_initialised) {
