@@ -28,6 +28,7 @@
 #define MAX_PATH_LEN 256
 
 #include <vector>
+#include <algorithm>
 #include <memory>
 #include <new>
 #include <cstring>
@@ -89,6 +90,56 @@ static inline uint64_t micros64() {
 SET_LOOP_TASK_STACK_SIZE(16384);
 
 static bool g_file_picker_cancelled = false;
+
+enum class FileSortMode : uint8_t {
+  NameAsc = 0,
+  NameDesc = 1,
+  Count
+};
+
+static FileSortMode g_file_picker_sort_mode = FileSortMode::NameAsc;
+
+static inline int compare_strings_case_insensitive(const char *lhs, const char *rhs) {
+  if(lhs == nullptr && rhs == nullptr) {
+    return 0;
+  }
+  if(lhs == nullptr) {
+    return -1;
+  }
+  if(rhs == nullptr) {
+    return 1;
+  }
+
+  while(*lhs != '\0' && *rhs != '\0') {
+    const int l = tolower(static_cast<unsigned char>(*lhs));
+    const int r = tolower(static_cast<unsigned char>(*rhs));
+    if(l != r) {
+      return l - r;
+    }
+    ++lhs;
+    ++rhs;
+  }
+
+  const int l = tolower(static_cast<unsigned char>(*lhs));
+  const int r = tolower(static_cast<unsigned char>(*rhs));
+  return l - r;
+}
+
+static inline FileSortMode next_sort_mode(FileSortMode mode) {
+  const uint8_t next = (static_cast<uint8_t>(mode) + 1u) % static_cast<uint8_t>(FileSortMode::Count);
+  return static_cast<FileSortMode>(next);
+}
+
+static inline const char *file_sort_mode_label(FileSortMode mode) {
+  switch(mode) {
+    case FileSortMode::NameAsc:
+      return "Sort: A-Z (T)";
+    case FileSortMode::NameDesc:
+      return "Sort: Z-A (T)";
+    default:
+      return "Sort";
+  }
+}
 
 static constexpr size_t ROM_FLASH_PROMPT_THRESHOLD = 65536;
 static constexpr size_t ROM_STORAGE_TITLE_MAX = 32;
@@ -7613,6 +7664,8 @@ char* file_picker() {
 
     std::vector<Entry> entries;
     entries.reserve(16);
+    std::vector<Entry> fs_entries;
+    fs_entries.reserve(64);
 
     bool has_parent = dir_opened && strcmp(current_path, "/") != 0;
     if(has_parent) {
@@ -7644,6 +7697,8 @@ char* file_picker() {
       entries.push_back({String(label), false, false, true, SIZE_MAX, nullptr});
     }
 
+    const size_t static_entry_count = entries.size();
+
     if(dir_opened) {
       while(true) {
         File entry = dir.openNextFile();
@@ -7651,10 +7706,10 @@ char* file_picker() {
           break;
         }
 
-  Entry e{String(entry.name()), entry.isDirectory(), false, false, SIZE_MAX, nullptr};
+        Entry e{String(entry.name()), entry.isDirectory(), false, false, SIZE_MAX, nullptr};
         if(e.isDirectory || has_rom_extension(e.name)) {
-          entries.push_back(e);
-          if(entries.size() >= MAX_FILES) {
+          fs_entries.push_back(e);
+          if((entries.size() + fs_entries.size()) >= MAX_FILES) {
             entry.close();
             break;
           }
@@ -7663,6 +7718,34 @@ char* file_picker() {
       }
       dir.close();
     }
+
+    auto sort_fs_entries = [&]() {
+      if(fs_entries.empty()) {
+        return;
+      }
+
+      std::sort(fs_entries.begin(), fs_entries.end(), [&](const Entry &a, const Entry &b) {
+        if(a.isDirectory != b.isDirectory) {
+          return a.isDirectory && !b.isDirectory;
+        }
+        const int cmp = compare_strings_case_insensitive(a.name.c_str(), b.name.c_str());
+        if(cmp == 0) {
+          return a.name.length() < b.name.length();
+        }
+        if(g_file_picker_sort_mode == FileSortMode::NameAsc) {
+          return cmp < 0;
+        }
+        return cmp > 0;
+      });
+    };
+
+    auto rebuild_entries = [&]() {
+      entries.resize(static_entry_count);
+      entries.insert(entries.end(), fs_entries.begin(), fs_entries.end());
+    };
+
+    sort_fs_entries();
+    rebuild_entries();
 
     if(entries.empty()) {
       if(!has_parent) {
@@ -7700,13 +7783,46 @@ char* file_picker() {
       continue;
     }
 
-    int select_index = 0;
-    bool redraw = true;
+  int select_index = 0;
+  bool redraw_full = true;
+  bool redraw_selected = false;
     bool selection_made = false;
     bool esc_pressed = false;
 
+    auto entries_equal = [](const Entry &lhs, const Entry &rhs) {
+      if(lhs.isDirectory != rhs.isDirectory) {
+        return false;
+      }
+      if(lhs.isEmbedded != rhs.isEmbedded) {
+        return false;
+      }
+      if(lhs.isFlashed != rhs.isFlashed) {
+        return false;
+      }
+      if(lhs.embeddedIndex != rhs.embeddedIndex) {
+        return false;
+      }
+      if(lhs.embeddedEntry != rhs.embeddedEntry) {
+        return false;
+      }
+      if(lhs.name != rhs.name) {
+        return false;
+      }
+      return true;
+    };
+
+    int last_scroll_index = -1;
+    int scroll_px_offset = 0;
+    int scroll_direction = 1;
+    uint32_t scroll_last_ms = millis();
+    const int scroll_step_px = 8;
+    const uint32_t scroll_interval_ms = 110;
+    const uint32_t scroll_pause_ms = 650;
+    const int textPadding = 10;
+
     while(!selection_made && !esc_pressed) {
       M5Cardputer.update();
+      set_font_size(128);
       if(M5Cardputer.Keyboard.isPressed()) {
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
 
@@ -7719,20 +7835,22 @@ char* file_picker() {
               case ';':
               case ',':
                 select_index--;
-                redraw = true;
+                redraw_full = true;
                 delay(180);
                 break;
               case '.':
                 select_index++;
-                redraw = true;
+                redraw_full = true;
                 delay(180);
                 break;
               case 'k':
               case 'K':
               case 'w':
               case 'W':
+              case 'e':
+              case 'E':
                 select_index--;
-                redraw = true;
+                redraw_full = true;
                 delay(160);
                 break;
               case 'j':
@@ -7740,13 +7858,48 @@ char* file_picker() {
               case 's':
               case 'S':
                 select_index++;
-                redraw = true;
+                redraw_full = true;
                 delay(160);
                 break;
               case 'l':
               case 'L':
                 selection_made = true;
                 delay(160);
+                break;
+              case 't':
+              case 'T':
+                g_file_picker_sort_mode = next_sort_mode(g_file_picker_sort_mode);
+                sort_fs_entries();
+                {
+                  Entry current_entry;
+                  if(!entries.empty() && select_index >= 0 && select_index < static_cast<int>(entries.size())) {
+                    current_entry = entries[select_index];
+                  }
+                  rebuild_entries();
+                  const int updated_count = static_cast<int>(entries.size());
+                  int new_index = select_index;
+                  if(!entries.empty()) {
+                    for(int idx = 0; idx < updated_count; ++idx) {
+                      if(entries_equal(entries[idx], current_entry)) {
+                        new_index = idx;
+                        break;
+                      }
+                    }
+                  }
+                  select_index = new_index;
+                  if(select_index >= updated_count) {
+                    select_index = updated_count > 0 ? (updated_count - 1) : 0;
+                  }
+                  if(select_index < 0) {
+                    select_index = 0;
+                  }
+                }
+                  redraw_full = true;
+                last_scroll_index = -1;
+                scroll_px_offset = 0;
+                scroll_direction = 1;
+                scroll_last_ms = millis();
+                delay(180);
                 break;
               default:
                 break;
@@ -7766,14 +7919,76 @@ char* file_picker() {
 
       if(select_index < 0) {
         select_index = entry_count - 1;
-        redraw = true;
+        redraw_full = true;
       } else if(select_index >= entry_count) {
         select_index = 0;
-        redraw = true;
+        redraw_full = true;
       }
 
-      if(redraw) {
-        redraw = false;
+      const uint32_t now_ms = millis();
+      if(select_index != last_scroll_index) {
+        last_scroll_index = select_index;
+        scroll_px_offset = 0;
+        scroll_direction = 1;
+        scroll_last_ms = now_ms;
+      }
+
+      if(entry_count > 0 && select_index >= 0 && select_index < entry_count) {
+        const Entry &selected_entry = entries[select_index];
+        String selected_label = selected_entry.name;
+        if(selected_entry.isDirectory && !selected_entry.isEmbedded && selected_label != "..") {
+          selected_label += "/";
+        }
+        String selected_indicator;
+        if(selected_entry.isEmbedded) {
+          const bool is_autoboot = selected_entry.embeddedEntry != nullptr && selected_entry.embeddedEntry->autoboot;
+          selected_indicator = is_autoboot ? "[FW★] " : "[FW] ";
+        } else if(selected_entry.isFlashed) {
+          selected_indicator = "[FLASH] ";
+        } else if(selected_entry.isDirectory) {
+          selected_indicator = (selected_label == ".." ? "[UP] " : "[DIR] ");
+        }
+
+        String selected_text = selected_indicator + selected_label;
+        const int dispW = M5Cardputer.Display.width();
+        const int arrowWidth = M5Cardputer.Display.textWidth("> ");
+        const int max_selected_width = dispW - (textPadding * 2) - arrowWidth;
+        const int selected_text_width = M5Cardputer.Display.textWidth(selected_text.c_str());
+
+        if(selected_text_width > max_selected_width) {
+          const int max_offset = selected_text_width - max_selected_width;
+          const uint32_t interval = (scroll_px_offset == 0 || scroll_px_offset == max_offset) ? scroll_pause_ms : scroll_interval_ms;
+          if(now_ms - scroll_last_ms >= interval) {
+            scroll_last_ms = now_ms;
+            scroll_px_offset += scroll_direction * scroll_step_px;
+            if(scroll_px_offset >= max_offset) {
+              scroll_px_offset = max_offset;
+              scroll_direction = -1;
+              scroll_last_ms = now_ms;
+            } else if(scroll_px_offset <= 0) {
+              scroll_px_offset = 0;
+              scroll_direction = 1;
+              scroll_last_ms = now_ms;
+            }
+            redraw_selected = true;
+          }
+          if(scroll_px_offset > max_offset) {
+            scroll_px_offset = max_offset;
+          } else if(scroll_px_offset < 0) {
+            scroll_px_offset = 0;
+          }
+        } else {
+          if(scroll_px_offset != 0) {
+            scroll_px_offset = 0;
+            redraw_selected = true;
+          }
+        }
+      }
+
+      if(redraw_full || redraw_selected) {
+        const bool full_refresh = redraw_full;
+        redraw_full = false;
+        redraw_selected = false;
 
         const int dispW = M5Cardputer.Display.width();
         const int dispH = M5Cardputer.Display.height();
@@ -7784,7 +7999,13 @@ char* file_picker() {
           lineHeight = fontH + 6;
         }
 
-        int visible_rows = dispH / lineHeight;
+        const int hintHeight = fontH + 10;
+        int available_height = dispH - hintHeight;
+        if(available_height < lineHeight) {
+          available_height = lineHeight;
+        }
+
+        int visible_rows = available_height / lineHeight;
         if(visible_rows < 3) {
           visible_rows = 3;
         }
@@ -7803,74 +8024,63 @@ char* file_picker() {
           }
         }
 
-        const int listHeight = lineHeight * visible_rows;
-        const int top = (dispH - listHeight) / 2;
-        const int textPadding = 10;
+    const int listHeight = lineHeight * visible_rows;
+    int top = (available_height - listHeight) / 2;
+    if(top < 4) {
+      top = 4;
+    }
 
-        const uint16_t bg_default = M5Cardputer.Display.color565(0, 0, 0);
-        const uint16_t highlight_color = M5Cardputer.Display.color565(160, 190, 255);
-        const uint16_t fg_default = M5Cardputer.Display.color565(210, 210, 210);
-        const uint16_t fg_selected = M5Cardputer.Display.color565(255, 255, 255);
+    const uint16_t bg_default = M5Cardputer.Display.color565(0, 0, 0);
+    const uint16_t highlight_color = M5Cardputer.Display.color565(160, 190, 255);
+    const uint16_t highlight_bg = M5Cardputer.Display.color565(40, 60, 120);
+    const uint16_t fg_default = M5Cardputer.Display.color565(210, 210, 210);
+    const uint16_t fg_selected = M5Cardputer.Display.color565(255, 255, 255);
+    const int arrowWidth = M5Cardputer.Display.textWidth("> ");
 
-        bool background_drawn = false;
-        if(select_index >= 0 && select_index < entry_count) {
-          const Entry &selected_entry = entries[select_index];
-          if(!selected_entry.isDirectory && !selected_entry.isEmbedded && has_rom_extension(selected_entry.name)) {
-            String full_path;
-            if(strcmp(current_path, "/") == 0) {
-              full_path = "/" + selected_entry.name;
-            } else {
-              full_path = String(current_path) + "/" + selected_entry.name;
-            }
-            background_drawn = try_display_box_art(full_path, 0, 0, dispW, dispH);
-          }
-        }
-
-        if(!background_drawn) {
-          M5Cardputer.Display.fillScreen(bg_default);
-        }
-
-        for(int row = 0; row < visible_rows; ++row) {
-          int entry_idx = start_index + row;
-          if(entry_idx >= entry_count) {
-            break;
+        auto compute_entry_label = [&](int entry_idx, String &indicator_out, String &label_out) {
+          label_out = entries[entry_idx].name;
+          if(entries[entry_idx].isDirectory && !entries[entry_idx].isEmbedded && label_out != "..") {
+            label_out += "/";
           }
 
-          bool is_selected = (entry_idx == select_index);
-          int y = top + row * lineHeight;
+          if(entries[entry_idx].isEmbedded) {
+            const bool is_autoboot = entries[entry_idx].embeddedEntry != nullptr && entries[entry_idx].embeddedEntry->autoboot;
+            indicator_out = is_autoboot ? "[FW★] " : "[FW] ";
+          } else if(entries[entry_idx].isFlashed) {
+            indicator_out = "[FLASH] ";
+          } else if(entries[entry_idx].isDirectory) {
+            indicator_out = (label_out == "..") ? "[UP] " : "[DIR] ";
+          } else {
+            indicator_out = "";
+          }
+        };
+
+        const int selected_display_row = select_index - start_index;
+
+        auto render_row = [&](int display_row, int entry_idx) {
+          const bool is_selected = (entry_idx == select_index);
+          const int y = top + display_row * lineHeight;
+          uint16_t row_bg = bg_default;
           uint16_t row_fg = is_selected ? fg_selected : fg_default;
 
           if(is_selected) {
+            M5Cardputer.Display.fillRoundRect(2, y, dispW - 4, lineHeight, 6, highlight_bg);
             M5Cardputer.Display.drawRoundRect(2, y, dispW - 4, lineHeight, 6, highlight_color);
+          } else {
+            M5Cardputer.Display.fillRect(2, y, dispW - 4, lineHeight, row_bg);
           }
 
           M5Cardputer.Display.setTextColor(row_fg);
 
-          String label = entries[entry_idx].name;
-          if(entries[entry_idx].isDirectory && !entries[entry_idx].isEmbedded && label != "..") {
-            label += "/";
-          }
-
+          String label;
           String indicator;
-          if(entries[entry_idx].isEmbedded) {
-            const bool is_autoboot = entries[entry_idx].embeddedEntry != nullptr && entries[entry_idx].embeddedEntry->autoboot;
-            indicator = is_autoboot ? "[FW★] " : "[FW] ";
-          } else if(entries[entry_idx].isFlashed) {
-            indicator = "[FLASH] ";
-          } else if(entries[entry_idx].isDirectory) {
-            indicator = (label == "..") ? "[UP] " : "[DIR] ";
-          }
+          compute_entry_label(entry_idx, indicator, label);
 
-          String render_text = indicator + label;
-          bool shortened = false;
-          const int max_text_width = dispW - (textPadding * 2) - (is_selected ? M5Cardputer.Display.textWidth("> ") : 0);
-          while(render_text.length() > 1 && M5Cardputer.Display.textWidth(render_text.c_str()) > max_text_width) {
-            render_text.remove(render_text.length() - 1);
-            shortened = true;
-          }
-          if(shortened && render_text.length() > 3) {
-            render_text.remove(render_text.length() - 3);
-            render_text += "...";
+          String full_text = indicator + label;
+          int max_text_width = dispW - (textPadding * 2);
+          int max_selected_width = max_text_width - arrowWidth;
+          if(max_selected_width < 0) {
+            max_selected_width = 0;
           }
 
           int textY = y + (lineHeight - fontH) / 2;
@@ -7879,17 +8089,100 @@ char* file_picker() {
           }
 
           int cursorX = textPadding;
+
           if(is_selected) {
+            const int text_width = M5Cardputer.Display.textWidth(full_text.c_str());
             M5Cardputer.Display.setCursor(cursorX, textY);
             M5Cardputer.Display.print("> ");
-            cursorX += M5Cardputer.Display.textWidth("> ");
+            cursorX += arrowWidth;
+            if(text_width > max_selected_width) {
+              int offset = scroll_px_offset;
+              const int max_offset = text_width - max_selected_width;
+              if(offset > max_offset) {
+                offset = max_offset;
+              }
+              if(offset < 0) {
+                offset = 0;
+              }
+              cursorX -= offset;
+            }
+            M5Cardputer.Display.setCursor(cursorX, textY);
+            M5Cardputer.Display.print(full_text);
+          } else {
+            String render_text = full_text;
+            bool shortened = false;
+            while(render_text.length() > 1 && M5Cardputer.Display.textWidth(render_text.c_str()) > max_text_width) {
+              render_text.remove(render_text.length() - 1);
+              shortened = true;
+            }
+            if(shortened && render_text.length() > 3) {
+              render_text.remove(render_text.length() - 3);
+              render_text += "...";
+            }
+            M5Cardputer.Display.setCursor(cursorX, textY);
+            M5Cardputer.Display.print(render_text);
+          }
+        };
+
+        if(full_refresh) {
+          bool background_drawn = false;
+          if(select_index >= 0 && select_index < entry_count) {
+            const Entry &selected_entry = entries[select_index];
+            if(!selected_entry.isDirectory && !selected_entry.isEmbedded && has_rom_extension(selected_entry.name)) {
+              String full_path;
+              if(strcmp(current_path, "/") == 0) {
+                full_path = "/" + selected_entry.name;
+              } else {
+                full_path = String(current_path) + "/" + selected_entry.name;
+              }
+              background_drawn = try_display_box_art(full_path, 0, 0, dispW, dispH);
+            }
           }
 
-          M5Cardputer.Display.setCursor(cursorX, textY);
-          M5Cardputer.Display.print(render_text);
-        }
+          if(!background_drawn) {
+            M5Cardputer.Display.fillRect(0, 0, dispW, dispH, bg_default);
+          }
 
-        M5Cardputer.Display.setTextColor(M5Cardputer.Display.color565(255, 255, 255));
+          M5Cardputer.Display.startWrite();
+          M5Cardputer.Display.setTextWrap(false);
+          for(int row = 0; row < visible_rows; ++row) {
+            int entry_idx = start_index + row;
+            if(entry_idx >= entry_count) {
+              break;
+            }
+            render_row(row, entry_idx);
+          }
+
+          const int hint_y = dispH - hintHeight;
+          if(hint_y >= 0) {
+            M5Cardputer.Display.fillRect(0, hint_y, dispW, hintHeight, bg_default);
+            M5Cardputer.Display.setTextColor(fg_default);
+            String sort_label = file_sort_mode_label(g_file_picker_sort_mode);
+            int label_width = M5Cardputer.Display.textWidth(sort_label.c_str());
+            int label_y = hint_y + (hintHeight - fontH) / 2;
+            if(label_y < hint_y) {
+              label_y = hint_y;
+            }
+            int label_x = dispW - label_width - 6;
+            if(label_x < 4) {
+              label_x = 4;
+            }
+            M5Cardputer.Display.setCursor(label_x, label_y);
+            M5Cardputer.Display.print(sort_label);
+          }
+          M5Cardputer.Display.setTextColor(M5Cardputer.Display.color565(255, 255, 255));
+          M5Cardputer.Display.setTextWrap(true);
+          M5Cardputer.Display.endWrite();
+        } else {
+          const int display_row = selected_display_row;
+          if(display_row >= 0 && display_row < visible_rows) {
+            M5Cardputer.Display.startWrite();
+            M5Cardputer.Display.setTextWrap(false);
+            render_row(display_row, select_index);
+            M5Cardputer.Display.setTextWrap(true);
+            M5Cardputer.Display.endWrite();
+          }
+        }
       }
     }
 
