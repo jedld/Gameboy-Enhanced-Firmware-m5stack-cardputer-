@@ -11,6 +11,7 @@
 
 #include <driver/i2s.h>
 
+#include "platform/tdeck/keyboard_layout.h"
 #include "platform/tdeck/tdeck_pins.h"
 
 class TDeckDisplay final {
@@ -93,10 +94,20 @@ class Keyboard_Class {
   KeysState keysState() const;
   bool isPressed() const;
   bool isKeyPressed(char key) const;
+  void setLayout(const tdeck::keyboard::KeyboardLayout &layout);
+  void setDebugConfig(const tdeck::keyboard::KeyboardDebugConfig &debug);
 
  private:
+  void requestRawMode(bool force = false);
+
+  const tdeck::keyboard::KeyboardLayout *layout_ = &tdeck::keyboard::kDefaultLayout;
+  tdeck::keyboard::KeyboardDebugConfig debug_config_ = tdeck::keyboard::kDefaultDebugConfig;
   KeysState state_{};
   bool pressed_ = false;
+  std::array<uint8_t, tdeck::keyboard::kDefaultColumns> last_matrix_{};
+  bool have_last_matrix_ = false;
+  bool raw_mode_confirmed_ = false;
+  unsigned long last_raw_mode_request_ms_ = 0;
 };
 
 class Speaker_Class {
@@ -116,6 +127,7 @@ class Speaker_Class {
   void config(const config_t &cfg);
   void setVolume(uint8_t volume) { volume_ = volume; }
   void setAllChannelVolume(uint8_t volume) { volume_ = volume; }
+  uint8_t volume() const { return volume_; }
   size_t isPlaying(uint8_t) const { return queued_frames_.load() > 0 ? 1 : 0; }
   void end();
   bool begin();

@@ -1175,6 +1175,11 @@ static inline uint16_t rgb888_to_rgb565(uint32_t colour) {
   uint16_t r = (colour >> 16) & 0xFF;
   uint16_t g = (colour >> 8) & 0xFF;
   uint16_t b = colour & 0xFF;
+#ifdef TARGET_LILYGO_TDECK
+  const uint16_t tmp = r;
+  r = b;
+  b = tmp;
+#endif
   return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 
@@ -7631,7 +7636,7 @@ static void render_home_menu(uint8_t selection) {
   menu += "J/S=Down  K/W=Up\n";
   menu += "L/ENTER=Select  H=Prev\n";
 
-  const uint16_t menu_bg = M5Cardputer.Display.color565(255, 0, 0);
+  const uint16_t menu_bg = rgb888_to_rgb565(0x101010);
   Serial.printf("render_home_menu: colours fg=0x%04X bg=0x%04X\n", 0xFFFF, menu_bg);
   Serial.println("render_home_menu content:\n" + menu);
   M5Cardputer.Display.startWrite();
@@ -8645,6 +8650,18 @@ static void audio_queue_push(size_t idx) {
   audio_queue_count++;
 }
 
+#ifdef TARGET_LILYGO_TDECK
+static inline void apply_volume_to_buffer(int16_t *samples, size_t count, uint8_t volume) {
+  if(samples == nullptr || count == 0 || volume >= 255) {
+    return;
+  }
+  for(size_t i = 0; i < count; ++i) {
+    const int32_t scaled = (static_cast<int32_t>(samples[i]) * static_cast<int32_t>(volume)) / 255;
+    samples[i] = static_cast<int16_t>(scaled);
+  }
+}
+#endif
+
 static void apply_speaker_volume() {
   if(!audio_initialised) {
     return;
@@ -8835,6 +8852,18 @@ static void audioPump() {
                    reinterpret_cast<uint8_t *>(samples),
                    interleaved_samples * sizeof(int16_t));
 
+#ifdef TARGET_LILYGO_TDECK
+    const uint8_t speaker_volume = M5Cardputer.Speaker.volume();
+    bool volume_applied = false;
+    auto scale_if_needed = [&]() {
+      if(!volume_applied) {
+        apply_volume_to_buffer(samples, interleaved_samples, speaker_volume);
+        volume_applied = true;
+      }
+    };
+    scale_if_needed();
+#endif
+
     bool queued = M5Cardputer.Speaker.playRaw(samples,
                                               interleaved_samples,
                                               sample_rate,
@@ -8844,6 +8873,9 @@ static void audioPump() {
                                               false);
     if(!queued) {
       audio_release_finished();
+#ifdef TARGET_LILYGO_TDECK
+      scale_if_needed();
+#endif
       queued = M5Cardputer.Speaker.playRaw(samples,
                                            interleaved_samples,
                                            sample_rate,
@@ -8917,6 +8949,10 @@ void setup() {
   // Init platform-specific front-end (Cardputer or T-Deck).
 #ifdef TARGET_LILYGO_TDECK
   M5Cardputer.begin(true);
+  tdeck::keyboard::KeyboardDebugConfig debug{};
+  debug.log_raw_matrix = true;      // dumps I²C column bytes
+  debug.log_decoded_keys = true;    // logs translated characters
+  M5Cardputer.Keyboard.setDebugConfig(debug);
 #else
   auto cfg = M5.config();
   cfg.internal_spk = true;

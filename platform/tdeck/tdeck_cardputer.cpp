@@ -6,6 +6,7 @@
 #include <esp_idf_version.h>
 #include <esp_intr_alloc.h>
 
+#include <array>
 #include <cstdarg>
 #include <vector>
 
@@ -17,37 +18,15 @@ extern bool g_display_ready;
 namespace {
 constexpr uint8_t kBacklightSteps = 16;
 
-constexpr size_t kMatrixCols = 5;
-constexpr size_t kMatrixRows = 7;
+constexpr auto &kKeyboardLayout = tdeck::keyboard::kDefaultLayout;
+constexpr std::size_t kMatrixCols = kKeyboardLayout.columns;
+constexpr std::size_t kMatrixRows = kKeyboardLayout.rows;
 
-constexpr char kBaseKeymap[kMatrixCols][kMatrixRows] = {
-    {'q', 'w', 0,   'a', 0,  ' ', 0},
-    {'e', 's', 'd', 'p', 'x', 'z', 0},
-    {'r', 'g', 't', 0,   'v', 'c', 'f'},
-    {'u', 'h', 'y', '\n', 'b', 'n', 'j'},
-    {'o', 'l', 'i', '\b', '$', 'm', 'k'},
-};
-
-constexpr char kSymbolKeymap[kMatrixCols][kMatrixRows] = {
-    {'#', '1', 0,   '*', 0,  0,  '0'},
-    {'2', '4', '5', '@', '8', '7', 0},
-    {'3', '/', '(', 0,   '?', '9', '6'},
-    {'_', ':', ')', 0,   '!', ',', ';'},
-    {'+', '"', '-', 0,   0,   '.', '\''},
-};
-
-constexpr size_t kSymbolColumn = 0;
-constexpr size_t kSymbolRow = 2;
-constexpr size_t kAltColumn = 0;
-constexpr size_t kAltRow = 4;
-constexpr size_t kShiftLeftColumn = 1;
-constexpr size_t kShiftLeftRow = 6;
-constexpr size_t kShiftRightColumn = 2;
-constexpr size_t kShiftRightRow = 3;
-constexpr size_t kEnterColumn = 3;
-constexpr size_t kEnterRow = 3;
-constexpr size_t kBackspaceColumn = 4;
-constexpr size_t kBackspaceRow = 3;
+void writeKeyboardCommand(uint8_t command) {
+  Wire.beginTransmission(LILYGO_KB_ADDRESS);
+  Wire.write(command);
+  Wire.endTransmission(true);
+}
 
 void writeKeyboardCommand(uint8_t command, uint8_t value) {
   Wire.beginTransmission(LILYGO_KB_ADDRESS);
@@ -417,12 +396,23 @@ bool Speaker_Class::playRaw(const int16_t *samples,
 
 void Keyboard_Class::begin() {
   writeKeyboardCommand(LILYGO_KB_DEFAULT_BRIGHTNESS_CMD, 127);
-  writeKeyboardCommand(LILYGO_KB_MODE_RAW_CMD, 1);
+  last_matrix_.fill(0);
+  have_last_matrix_ = false;
+  raw_mode_confirmed_ = false;
+  requestRawMode(true);
   delay(1);
   update();
 }
 
 void Keyboard_Class::update() {
+  if(layout_ == nullptr) {
+    layout_ = &kKeyboardLayout;
+  }
+
+  if(!raw_mode_confirmed_) {
+    requestRawMode(false);
+  }
+
   KeysState next;
   next.word.fill(0);
   next.hid_keys.fill(0);
@@ -441,6 +431,77 @@ void Keyboard_Class::update() {
       Wire.read();
     }
 
+    const bool matrix_changed = !have_last_matrix_ || column_state != last_matrix_;
+    if(debug_config_.log_raw_matrix && matrix_changed) {
+      Serial.print("[T-Deck][Keyboard] matrix:");
+      for(size_t col = 0; col < col_index; ++col) {
+        Serial.printf(" c%u=0x%02X", static_cast<unsigned>(col), column_state[col]);
+      }
+      Serial.println();
+    }
+
+    last_matrix_ = column_state;
+    have_last_matrix_ = true;
+
+    const bool uniform_payload = (col_index > 0) && std::all_of(column_state.begin() + 1,
+                                                                column_state.begin() + col_index,
+                                                                [&](uint8_t value) {
+                                                                  return value == column_state[0];
+                                                                });
+
+    size_t write_index = 0;
+    auto append_char = [&](char value) {
+      if(value == 0 || write_index >= KeysState::kMaxKeys) {
+        return;
+      }
+      next.word[write_index] = value;
+      next.hid_keys[write_index] = static_cast<uint8_t>(value);
+      ++write_index;
+    };
+
+    if(uniform_payload) {
+      const uint8_t ascii_value = column_state[0];
+      if(ascii_value != 0) {
+        char ch = static_cast<char>(ascii_value);
+        if(ch == '\r') {
+          ch = '\n';
+        }
+        append_char(ch);
+        if(ch == '\n' || ch == '\r') {
+          next.enter = true;
+        }
+        pressed_ = true;
+        if(debug_config_.log_decoded_keys) {
+          const bool printable = (ch >= 32 && ch <= 126);
+          Serial.printf("[T-Deck][Keyboard] key: ascii 0x%02X", ascii_value);
+          if(printable) {
+            Serial.printf(" ('%c')", ch);
+          }
+          Serial.println();
+        }
+        have_last_matrix_ = false;
+        requestRawMode(true);
+        raw_mode_confirmed_ = false;
+      } else {
+        pressed_ = false;
+        if(!raw_mode_confirmed_) {
+          requestRawMode(false);
+        }
+      }
+      state_ = next;
+      return;
+    }
+
+    if(layout_->columns != kMatrixCols || layout_->rows != kMatrixRows) {
+      // Layout mismatch – avoid using stale buffers.
+      have_last_matrix_ = false;
+      state_ = next;
+      pressed_ = false;
+      return;
+    }
+
+    raw_mode_confirmed_ = true;
+
     bool pressed_matrix[kMatrixCols][kMatrixRows] = {};
     bool any_pressed = false;
     for(size_t col = 0; col < kMatrixCols; ++col) {
@@ -454,33 +515,41 @@ void Keyboard_Class::update() {
       }
     }
 
-    const bool symbol_layer = pressed_matrix[kSymbolColumn][kSymbolRow];
-    const bool alt_active = pressed_matrix[kAltColumn][kAltRow];
-    const bool shift_active = pressed_matrix[kShiftLeftColumn][kShiftLeftRow] ||
-                              pressed_matrix[kShiftRightColumn][kShiftRightRow];
-    const bool enter_active = pressed_matrix[kEnterColumn][kEnterRow];
-    const bool backspace_active = pressed_matrix[kBackspaceColumn][kBackspaceRow];
+    const auto is_active = [&](const tdeck::keyboard::KeyPosition &pos) {
+      return pos.column < kMatrixCols && pos.row < kMatrixRows && pressed_matrix[pos.column][pos.row];
+    };
+
+    const bool symbol_layer = is_active(layout_->symbol_toggle);
+    const bool alt_active = is_active(layout_->alt_modifier);
+    const bool shift_active = is_active(layout_->shift_left) || is_active(layout_->shift_right);
+    const bool enter_active = is_active(layout_->enter_key);
+    const bool backspace_active = is_active(layout_->backspace_key);
 
     next.fn = alt_active;
     next.ctrl = false;
     next.enter = enter_active;
 
-    size_t write_index = 0;
-    auto append_char = [&](char value) {
-      if(value == 0 || write_index >= KeysState::kMaxKeys) {
-        return;
-      }
-      next.word[write_index] = value;
-      next.hid_keys[write_index] = static_cast<uint8_t>(value);
-      ++write_index;
-    };
-
     if(enter_active) {
       append_char('\n');
+      if(debug_config_.log_decoded_keys) {
+        Serial.println("[T-Deck][Keyboard] key: Enter (0x0A)");
+      }
     }
     if(backspace_active) {
       append_char('\b');
+      if(debug_config_.log_decoded_keys) {
+        Serial.println("[T-Deck][Keyboard] key: Backspace (0x08)");
+      }
     }
+
+    const auto is_modifier_position = [&](size_t col, size_t row) {
+      return (layout_->symbol_toggle.column == col && layout_->symbol_toggle.row == row) ||
+             (layout_->alt_modifier.column == col && layout_->alt_modifier.row == row) ||
+             (layout_->shift_left.column == col && layout_->shift_left.row == row) ||
+             (layout_->shift_right.column == col && layout_->shift_right.row == row) ||
+             (layout_->enter_key.column == col && layout_->enter_key.row == row) ||
+             (layout_->backspace_key.column == col && layout_->backspace_key.row == row);
+    };
 
     for(size_t col = 0; col < kMatrixCols; ++col) {
       for(size_t row = 0; row < kMatrixRows; ++row) {
@@ -488,16 +557,11 @@ void Keyboard_Class::update() {
           continue;
         }
 
-        if((col == kSymbolColumn && row == kSymbolRow) ||
-           (col == kAltColumn && row == kAltRow) ||
-           (col == kShiftLeftColumn && row == kShiftLeftRow) ||
-           (col == kShiftRightColumn && row == kShiftRightRow) ||
-           (col == kEnterColumn && row == kEnterRow) ||
-           (col == kBackspaceColumn && row == kBackspaceRow)) {
+        if(is_modifier_position(col, row)) {
           continue;
         }
 
-        char value = symbol_layer ? kSymbolKeymap[col][row] : kBaseKeymap[col][row];
+        char value = symbol_layer ? layout_->symbolAt(col, row) : layout_->baseAt(col, row);
         if(value == 0) {
           continue;
         }
@@ -506,12 +570,25 @@ void Keyboard_Class::update() {
           value = static_cast<char>(std::toupper(static_cast<unsigned char>(value)));
         }
 
+        if(debug_config_.log_decoded_keys) {
+          const bool printable = (value >= 32 && value <= 126);
+          Serial.printf("[T-Deck][Keyboard] key: col=%u row=%u -> 0x%02X",
+                        static_cast<unsigned>(col),
+                        static_cast<unsigned>(row),
+                        static_cast<uint8_t>(value));
+          if(printable) {
+            Serial.printf(" ('%c')", value);
+          }
+          Serial.printf(" [sym=%d shift=%d alt=%d]\n", symbol_layer, shift_active, alt_active);
+        }
+
         append_char(value);
       }
     }
 
     pressed_ = any_pressed;
   } else {
+    have_last_matrix_ = false;
     size_t index = 0;
     while(Wire.available() && index < KeysState::kMaxKeys) {
       int value = Wire.read();
@@ -524,9 +601,21 @@ void Keyboard_Class::update() {
       if(ch == '\n' || ch == '\r') {
         next.enter = true;
       }
+      if(debug_config_.log_decoded_keys) {
+        const bool printable = (ch >= 32 && ch <= 126);
+        Serial.printf("[T-Deck][Keyboard] key: passthrough 0x%02X", static_cast<uint8_t>(ch));
+        if(printable) {
+          Serial.printf(" ('%c')", ch);
+        }
+        Serial.println();
+      }
       ++index;
     }
     pressed_ = index > 0;
+    if(pressed_) {
+      requestRawMode(true);
+      raw_mode_confirmed_ = false;
+    }
   }
 
   state_ = next;
@@ -536,12 +625,35 @@ Keyboard_Class::KeysState Keyboard_Class::keysState() const {
   return state_;
 }
 
+void Keyboard_Class::requestRawMode(bool force) {
+  const unsigned long now = millis();
+  constexpr unsigned long kRetryIntervalMs = 200;
+  if(force || (now - last_raw_mode_request_ms_ >= kRetryIntervalMs)) {
+    writeKeyboardCommand(LILYGO_KB_MODE_RAW_CMD);
+    last_raw_mode_request_ms_ = now;
+  }
+}
+
 bool Keyboard_Class::isPressed() const {
   return pressed_;
 }
 
 bool Keyboard_Class::isKeyPressed(char key) const {
   return std::find(state_.word.begin(), state_.word.end(), key) != state_.word.end();
+}
+
+void Keyboard_Class::setLayout(const tdeck::keyboard::KeyboardLayout &layout) {
+  if(layout.columns != kMatrixCols || layout.rows != kMatrixRows) {
+    Serial.println("[T-Deck][Keyboard] Ignoring layout change (dimension mismatch)");
+    return;
+  }
+  layout_ = &layout;
+  have_last_matrix_ = false;
+  last_matrix_.fill(0);
+}
+
+void Keyboard_Class::setDebugConfig(const tdeck::keyboard::KeyboardDebugConfig &debug) {
+  debug_config_ = debug;
 }
 
 TDeckCardputer_Class M5Cardputer;
