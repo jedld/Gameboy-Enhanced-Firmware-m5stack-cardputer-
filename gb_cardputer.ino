@@ -2600,41 +2600,35 @@ static bool capture_screenshot() {
     return false;
   }
 
-  const size_t pixel_count = LCD_WIDTH * LCD_HEIGHT;
-  const size_t copy_bytes = pixel_count * sizeof(uint16_t);
-  auto allocate_frame_copy = [&](void) -> uint16_t * {
-    uint16_t *buffer = (uint16_t *)heap_caps_malloc(copy_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if(buffer == nullptr) {
-      buffer = (uint16_t *)heap_caps_malloc(copy_bytes, MALLOC_CAP_8BIT);
-    }
-    return buffer;
-  };
+  const uint16_t *frame_data = source;
 
-  bool display_cache_disabled = false;
-  uint16_t *frame_copy = allocate_frame_copy();
-  if(frame_copy == nullptr && swap_fb_enabled) {
-    disable_display_cache();
-    display_cache_disabled = true;
-    frame_copy = allocate_frame_copy();
-  }
-  if(frame_copy == nullptr) {
-    if(display_cache_disabled) {
-      request_cache_recovery(true, priv.rom_cache.bank_count);
+  SemaphoreHandle_t capture_lock = nullptr;
+  bool capture_lock_taken = false;
+  if(!priv.single_buffer_mode && frame_data != nullptr) {
+    for(uint8_t i = 0; i < 2; ++i) {
+      if(priv.framebuffers[i] == frame_data && priv.frame_buffer_free[i] != nullptr) {
+        if(xSemaphoreTake(priv.frame_buffer_free[i], 0) == pdTRUE) {
+          capture_lock = priv.frame_buffer_free[i];
+          capture_lock_taken = true;
+        }
+        break;
+      }
     }
-    show_status_message("Screenshot failed: out of memory", StatusMessageKind::Error);
-    return false;
   }
-  memcpy(frame_copy, source, copy_bytes);
+
+  auto release_capture_lock = [&]() {
+    if(capture_lock_taken && capture_lock != nullptr) {
+      xSemaphoreGive(capture_lock);
+      capture_lock_taken = false;
+    }
+  };
 
   constexpr size_t row_stride = ((LCD_WIDTH * 3u) + 3u) & ~3u;
   uint8_t row_buffer[row_stride];
 
   char path[MAX_PATH_LEN];
   if(!build_screenshot_path(path, sizeof(path))) {
-    heap_caps_free(frame_copy);
-    if(display_cache_disabled) {
-      request_cache_recovery(true, priv.rom_cache.bank_count);
-    }
+    release_capture_lock();
     show_status_message("Screenshot failed: name", StatusMessageKind::Error);
     return false;
   }
@@ -2682,10 +2676,7 @@ static bool capture_screenshot() {
 
   File file = SD.open(path, FILE_WRITE);
   if(!file) {
-    heap_caps_free(frame_copy);
-    if(display_cache_disabled) {
-      request_cache_recovery(true, priv.rom_cache.bank_count);
-    }
+    release_capture_lock();
     show_status_message("Screenshot failed: SD write", StatusMessageKind::Error);
     Serial.printf("Screenshot: failed to open %s for write\n", path);
     return false;
@@ -2701,7 +2692,7 @@ static bool capture_screenshot() {
   if(ok) {
     for(size_t y = 0; y < LCD_HEIGHT && ok; ++y) {
       const size_t src_y = LCD_HEIGHT - 1 - y;
-      const uint16_t *src_row = frame_copy + (src_y * LCD_WIDTH);
+      const uint16_t *src_row = frame_data + (src_y * LCD_WIDTH);
       for(size_t x = 0; x < LCD_WIDTH; ++x) {
         const uint16_t pixel = src_row[x];
         const uint8_t r5 = static_cast<uint8_t>((pixel >> 11) & 0x1F);
@@ -2718,10 +2709,7 @@ static bool capture_screenshot() {
     }
   }
   file.close();
-  heap_caps_free(frame_copy);
-  if(display_cache_disabled) {
-    request_cache_recovery(true, priv.rom_cache.bank_count);
-  }
+  release_capture_lock();
 
   if(!ok) {
     SD.remove(path);
