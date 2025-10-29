@@ -639,17 +639,41 @@ static constexpr uint8_t FRAME_SKIP_HOLD_FRAMES_FALLBACK = 4;
 static constexpr uint8_t INTERLACE_ENABLE_STREAK = 4;
 static constexpr uint8_t INTERLACE_DISABLE_STREAK = 24;
 static constexpr uint8_t INTERLACE_HOLD_FRAMES = 16;
+static constexpr uint8_t INTERLACE_COOLDOWN_FRAMES = 12;
+static constexpr uint16_t INTERLACE_DIRTY_NUMERATOR = 3;
+static constexpr uint16_t INTERLACE_DIRTY_DENOMINATOR = 4;
+static constexpr uint8_t INTERLACE_PALETTE_CHANGE_THRESHOLD = 12;
 
 struct AdaptiveInterlaceState {
   uint8_t over_budget_streak;
   uint8_t under_budget_streak;
   uint8_t hold_frames;
+  uint8_t cooldown_frames;
   bool active;
 };
 
 static AdaptiveInterlaceState g_interlace_state = {};
 
-static inline void updateAdaptiveFrameSkip(struct gb_s *gb, bool over_budget) {
+struct priv_t;
+
+static inline void request_interlace_cooldown(struct gb_s *gb) {
+  AdaptiveInterlaceState &interlace = g_interlace_state;
+  interlace.cooldown_frames = INTERLACE_COOLDOWN_FRAMES;
+  if(interlace.active) {
+    interlace.active = false;
+  }
+  interlace.over_budget_streak = 0;
+  interlace.under_budget_streak = 0;
+  interlace.hold_frames = 0;
+  gb->direct.interlace = 0;
+  gb->display.interlace_count = 0;
+}
+
+static bool detect_palette_change(struct gb_s *gb, bool frame_completed);
+
+static inline void updateAdaptiveFrameSkip(struct gb_s *gb,
+                                           bool over_budget,
+                                           bool frame_completed) {
   auto &state = gb->display.frame_skip_state;
   struct priv_t *priv = (struct priv_t *)gb->direct.priv;
 
@@ -690,6 +714,11 @@ static inline void updateAdaptiveFrameSkip(struct gb_s *gb, bool over_budget) {
     state.frames_since_toggle++;
   }
 
+  AdaptiveInterlaceState &interlace = g_interlace_state;
+  if(frame_completed && interlace.cooldown_frames > 0) {
+    interlace.cooldown_frames--;
+  }
+
   if(over_budget) {
     if(state.over_budget_streak < 0xFF) {
       state.over_budget_streak++;
@@ -707,8 +736,10 @@ static inline void updateAdaptiveFrameSkip(struct gb_s *gb, bool over_budget) {
   const bool can_toggle = (state.debounce_frames_remaining == 0) &&
                           (state.frames_since_toggle >= state.minimum_active_frames);
 
-  AdaptiveInterlaceState &interlace = g_interlace_state;
-  const bool allow_interlace = (gb->cgb.enabled != 0) && swap_fb_enabled && swap_fb_psram_backed;
+  const bool allow_interlace = (gb->cgb.enabled != 0) &&
+                               swap_fb_enabled &&
+                               swap_fb_psram_backed &&
+                               (interlace.cooldown_frames == 0);
 
   if(allow_interlace) {
     if(over_budget) {
@@ -735,6 +766,7 @@ static inline void updateAdaptiveFrameSkip(struct gb_s *gb, bool over_budget) {
         interlace.hold_frames = INTERLACE_HOLD_FRAMES;
         interlace.under_budget_streak = 0;
         gb->display.interlace_count = 0;
+        interlace.cooldown_frames = 0;
       }
     } else {
       const bool ready_to_disable =
@@ -744,6 +776,7 @@ static inline void updateAdaptiveFrameSkip(struct gb_s *gb, bool over_budget) {
         interlace.over_budget_streak = 0;
         interlace.under_budget_streak = 0;
         interlace.hold_frames = 0;
+        interlace.cooldown_frames = 0;
       }
     }
 
@@ -759,7 +792,10 @@ static inline void updateAdaptiveFrameSkip(struct gb_s *gb, bool over_budget) {
     }
   } else {
     if(interlace.active) {
-      interlace = {};
+      interlace.active = false;
+      interlace.over_budget_streak = 0;
+      interlace.under_budget_streak = 0;
+      interlace.hold_frames = 0;
     }
     gb->direct.interlace = 0;
     gb->display.interlace_count = 0;
@@ -792,42 +828,6 @@ static inline void updateAdaptiveFrameSkip(struct gb_s *gb, bool over_budget) {
       state.over_budget_streak = 0;
       state.under_budget_streak = 0;
     }
-  }
-}
-
-static inline void apply_frame_skip_policy(struct gb_s *gb, bool over_budget) {
-  FrameSkipMode mode = static_cast<FrameSkipMode>(g_settings.frame_skip_mode);
-
-  // Always run adaptive logic to maintain interlace and internal state.
-  updateAdaptiveFrameSkip(gb, over_budget);
-
-  auto &state = gb->display.frame_skip_state;
-
-  switch(mode) {
-    case FRAME_SKIP_MODE_AUTO:
-      return;
-    case FRAME_SKIP_MODE_FORCED:
-      gb->direct.frame_skip = 1;
-      state.current_frame_skip = 1;
-      state.over_budget_streak = 0;
-      state.under_budget_streak = 0;
-      state.debounce_frames_remaining = 0;
-      state.frames_since_toggle = 0;
-      return;
-    case FRAME_SKIP_MODE_DISABLED:
-      gb->direct.frame_skip = 0;
-      gb->display.frame_skip_count = 0;
-      state.current_frame_skip = 0;
-      state.over_budget_streak = 0;
-      state.under_budget_streak = 0;
-      state.debounce_frames_remaining = 0;
-      if(state.frames_since_toggle < state.minimum_active_frames) {
-        state.frames_since_toggle = state.minimum_active_frames;
-      }
-      return;
-    default:
-      g_settings.frame_skip_mode = static_cast<uint8_t>(FRAME_SKIP_MODE_AUTO);
-      return;
   }
 }
 
@@ -1120,6 +1120,8 @@ struct priv_t
   uint16_t *framebuffers[2];
   uint32_t framebuffer_row_hash[2][LCD_HEIGHT];
   uint8_t framebuffer_row_dirty[2][LCD_HEIGHT];
+  uint16_t current_frame_dirty_rows;
+  uint16_t last_frame_dirty_rows;
   uint8_t write_fb_index;
   bool single_buffer_mode;
   QueueHandle_t frame_queue;
@@ -1140,6 +1142,12 @@ struct priv_t
   SaveStateSlot save_slots[SAVE_STATE_SLOT_COUNT];
   char sd_rom_path[MAX_PATH_LEN];
   bool sd_rom_path_valid;
+  bool palette_snapshot_valid;
+  bool palette_snapshot_cgb;
+  uint8_t last_bg_palette[4];
+  uint8_t last_sp_palette[8];
+  uint32_t last_cgb_bg_palette[32];
+  uint32_t last_cgb_obj_palette[32];
 };
 
 static struct gb_s gb;
@@ -1148,6 +1156,119 @@ static TaskHandle_t render_task_handle = nullptr;
 #if ENABLE_SOUND
 static TaskHandle_t audio_task_handle = nullptr;
 #endif
+
+static bool detect_palette_change(struct gb_s *gb, bool frame_completed) {
+  if(!frame_completed || gb == nullptr) {
+    return false;
+  }
+
+  struct priv_t *priv = (struct priv_t *)gb->direct.priv;
+  if(priv == nullptr) {
+    return false;
+  }
+
+  const bool cgb_enabled = (gb->cgb.enabled != 0);
+
+  if(!priv->palette_snapshot_valid || priv->palette_snapshot_cgb != cgb_enabled) {
+    priv->palette_snapshot_valid = true;
+    priv->palette_snapshot_cgb = cgb_enabled;
+    if(cgb_enabled) {
+      memcpy(priv->last_cgb_bg_palette,
+             gb->display.cgb_bg_palette,
+             sizeof(priv->last_cgb_bg_palette));
+      memcpy(priv->last_cgb_obj_palette,
+             gb->display.cgb_obj_palette,
+             sizeof(priv->last_cgb_obj_palette));
+    } else {
+      memcpy(priv->last_bg_palette, gb->display.bg_palette, sizeof(priv->last_bg_palette));
+      memcpy(priv->last_sp_palette, gb->display.sp_palette, sizeof(priv->last_sp_palette));
+    }
+    return false;
+  }
+
+  if(!cgb_enabled) {
+    memcpy(priv->last_bg_palette, gb->display.bg_palette, sizeof(priv->last_bg_palette));
+    memcpy(priv->last_sp_palette, gb->display.sp_palette, sizeof(priv->last_sp_palette));
+    return false;
+  }
+
+  uint16_t change_count = 0;
+  for(size_t i = 0; i < 32; ++i) {
+    if(priv->last_cgb_bg_palette[i] != gb->display.cgb_bg_palette[i]) {
+      change_count++;
+    }
+    if(priv->last_cgb_obj_palette[i] != gb->display.cgb_obj_palette[i]) {
+      change_count++;
+    }
+  }
+
+  memcpy(priv->last_cgb_bg_palette,
+         gb->display.cgb_bg_palette,
+         sizeof(priv->last_cgb_bg_palette));
+  memcpy(priv->last_cgb_obj_palette,
+         gb->display.cgb_obj_palette,
+         sizeof(priv->last_cgb_obj_palette));
+
+  return change_count >= INTERLACE_PALETTE_CHANGE_THRESHOLD;
+}
+
+static inline void apply_frame_skip_policy(struct gb_s *gb,
+                                           bool over_budget,
+                                           bool frame_completed,
+                                           bool interlace_was_active) {
+  FrameSkipMode mode = static_cast<FrameSkipMode>(g_settings.frame_skip_mode);
+
+  bool palette_changed = detect_palette_change(gb, frame_completed);
+
+  bool mass_dirty = false;
+  if(frame_completed) {
+    struct priv_t *priv = (struct priv_t *)gb->direct.priv;
+    if(priv != nullptr) {
+      const uint16_t max_rows = interlace_was_active ? (LCD_HEIGHT / 2) : LCD_HEIGHT;
+      const uint16_t threshold = static_cast<uint16_t>((max_rows * INTERLACE_DIRTY_NUMERATOR) /
+                                                       INTERLACE_DIRTY_DENOMINATOR);
+      if(max_rows > 0 && priv->last_frame_dirty_rows >= threshold) {
+        mass_dirty = true;
+      }
+    }
+  }
+
+  if(palette_changed || mass_dirty) {
+    request_interlace_cooldown(gb);
+  }
+
+  // Always run adaptive logic to maintain interlace and internal state.
+  updateAdaptiveFrameSkip(gb, over_budget, frame_completed);
+
+  auto &state = gb->display.frame_skip_state;
+
+  switch(mode) {
+    case FRAME_SKIP_MODE_AUTO:
+      return;
+    case FRAME_SKIP_MODE_FORCED:
+      gb->direct.frame_skip = 1;
+      state.current_frame_skip = 1;
+      state.over_budget_streak = 0;
+      state.under_budget_streak = 0;
+      state.debounce_frames_remaining = 0;
+      state.frames_since_toggle = 0;
+      return;
+    case FRAME_SKIP_MODE_DISABLED:
+      gb->direct.frame_skip = 0;
+      gb->display.frame_skip_count = 0;
+      state.current_frame_skip = 0;
+      state.over_budget_streak = 0;
+      state.under_budget_streak = 0;
+      state.debounce_frames_remaining = 0;
+      if(state.frames_since_toggle < state.minimum_active_frames) {
+        state.frames_since_toggle = state.minimum_active_frames;
+      }
+      return;
+    default:
+      g_settings.frame_skip_mode = static_cast<uint8_t>(FRAME_SKIP_MODE_AUTO);
+      return;
+  }
+}
 
 
 static constexpr uint32_t CACHE_RECOVERY_RETRY_INTERVAL_MS = 750;
@@ -5958,6 +6079,9 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160],
     if(row_dirty != nullptr) {
       row_dirty[line] = (hash != previous_hash) ? 1 : 0;
     }
+    if(row_dirty != nullptr && row_dirty[line] != 0 && priv->current_frame_dirty_rows < LCD_HEIGHT) {
+      priv->current_frame_dirty_rows++;
+    }
     return;
   }
 
@@ -6014,6 +6138,9 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160],
   }
   if(row_dirty != nullptr) {
     row_dirty[line] = (hash != previous_hash) ? 1 : 0;
+  }
+  if(row_dirty != nullptr && row_dirty[line] != 0 && priv->current_frame_dirty_rows < LCD_HEIGHT) {
+    priv->current_frame_dirty_rows++;
   }
 }
 
@@ -9219,6 +9346,10 @@ void setup() {
   priv.frame_buffer_free[1] = nullptr;
   priv.framebuffers[0] = nullptr;
   priv.framebuffers[1] = nullptr;
+  priv.current_frame_dirty_rows = 0;
+  priv.last_frame_dirty_rows = 0;
+  priv.palette_snapshot_valid = false;
+  priv.palette_snapshot_cgb = false;
   memset(priv.framebuffer_row_hash, 0, sizeof(priv.framebuffer_row_hash));
   memset(priv.framebuffer_row_dirty, 0, sizeof(priv.framebuffer_row_dirty));
   const size_t fb_bytes = LCD_HEIGHT * LCD_WIDTH * sizeof(uint16_t);
@@ -9768,9 +9899,16 @@ void setup() {
     }
 #endif
 
+    if(frame_completed) {
+      priv.last_frame_dirty_rows = priv.current_frame_dirty_rows;
+      priv.current_frame_dirty_rows = 0;
+    }
+
+    const bool interlace_was_active = (gb.direct.interlace != 0);
+
     process_cache_recovery();
 
-  apply_frame_skip_policy(&gb, over_budget);
+    apply_frame_skip_policy(&gb, over_budget, frame_completed, interlace_was_active);
 
 #if ENABLE_PROFILING
     profiler_record_frame(frame_us,
