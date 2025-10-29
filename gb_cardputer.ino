@@ -524,6 +524,9 @@ static bool g_spi2_initialised = false;
 static bool g_settings_loaded = false;
 static bool g_settings_dirty = false;
 
+static m5::board_t g_board_type = m5::board_t::board_unknown;
+static bool g_is_cardputer_adv = false;
+
 static bool ensure_display_cache_allocated() {
 #if !ENABLE_LCD
   return false;
@@ -582,6 +585,7 @@ static void reset_save_state(struct priv_t *priv);
 static void set_sd_rom_path(struct priv_t *priv, const char *path);
 static void clear_sd_rom_path(struct priv_t *priv);
 static bool ensure_saves_dir();
+static void ensure_default_sd_layout();
 static void sanitise_identifier(const char *input, char *output, size_t output_len);
 static bool build_save_path_for_rom(const char *rom_path, const char *extension, char *out, size_t out_len);
 static bool derive_save_paths(struct priv_t *priv, bool uses_mbc7);
@@ -2915,6 +2919,24 @@ static bool ensure_saves_dir() {
   }
   Serial.println("Failed to create saves directory on SD");
   return false;
+}
+
+static void ensure_default_sd_layout() {
+  if(!g_sd_mounted) {
+    return;
+  }
+
+  if(!ensure_settings_dir()) {
+    Serial.println("Warning: settings directory unavailable");
+  }
+
+  if(!ensure_saves_dir()) {
+    Serial.println("Warning: saves directory unavailable");
+  }
+
+  if(!ensure_screenshot_dir()) {
+    Serial.println("Warning: screenshot directory unavailable");
+  }
 }
 
 static void sanitise_identifier(const char *input, char *output, size_t output_len) {
@@ -8421,7 +8443,7 @@ static void audioSetup() {
   auto cfg = base_cfg;
   cfg.sample_rate = requested_rate;
   cfg.stereo = true;
-  cfg.magnification = 8;
+  cfg.magnification = g_is_cardputer_adv ? 16 : 8;
   audio_set_sample_rate(requested_rate);
   Serial.printf("audioSetup: requested sample rate %u Hz (psram=%s)\n",
                 (unsigned)requested_rate,
@@ -8444,11 +8466,29 @@ static void audioSetup() {
   cfg.task_priority = tskIDLE_PRIORITY + 4;
   cfg.task_pinned_core = 0;
   cfg.use_dac = false;
-  // Cardputer speaker (NS4168) uses dedicated I2S pins: G41=BCLK, G42=SDOUT, G43=LRCLK.
-  cfg.pin_data_out = 42;
-  cfg.pin_bck = 41;
-  cfg.pin_ws = 43;
-  cfg.pin_mck = -1;
+  cfg.pin_data_out = base_cfg.pin_data_out;
+  cfg.pin_bck = base_cfg.pin_bck;
+  cfg.pin_ws = base_cfg.pin_ws;
+  cfg.pin_mck = base_cfg.pin_mck;
+  if(cfg.pin_data_out < 0) {
+    cfg.pin_data_out = 42;
+  }
+  if(cfg.pin_bck < 0) {
+    cfg.pin_bck = 41;
+  }
+  if(cfg.pin_ws < 0) {
+    cfg.pin_ws = 43;
+  }
+  if(cfg.pin_mck < 0) {
+    cfg.pin_mck = -1;
+  }
+
+  Serial.printf("audioSetup: using I2S data_out=%d bck=%d ws=%d mck=%d (adv=%s)\n",
+                cfg.pin_data_out,
+                cfg.pin_bck,
+                cfg.pin_ws,
+                cfg.pin_mck,
+                g_is_cardputer_adv ? "yes" : "no");
 
   M5Cardputer.Speaker.end();
   M5Cardputer.Speaker.config(cfg);
@@ -8461,7 +8501,7 @@ static void audioSetup() {
                 audio_initialised ? "OK" : "FAIL");
 
   if(!audio_initialised) {
-    cfg.pin_data_out = 42;
+  cfg.pin_data_out = base_cfg.pin_data_out >= 0 ? base_cfg.pin_data_out : 42;
     cfg.stereo = false;
     M5Cardputer.Speaker.end();
     M5Cardputer.Speaker.config(cfg);
@@ -8644,9 +8684,19 @@ void setup() {
   auto cfg = M5.config();
   cfg.internal_spk = true;
   cfg.internal_mic = true;
-  cfg.fallback_board = m5::board_t::board_M5Cardputer;
+  cfg.fallback_board = m5::board_t::board_M5CardputerADV;
   // Use keyboard.
   M5Cardputer.begin(cfg, true);
+
+  g_board_type = M5.getBoard();
+  if(g_board_type == m5::board_t::board_unknown) {
+    Serial.println("Board autodetect failed; forcing Cardputer ADV profile");
+    g_board_type = m5::board_t::board_M5CardputerADV;
+  }
+  g_is_cardputer_adv = (g_board_type == m5::board_t::board_M5CardputerADV);
+  Serial.printf("Detected Cardputer variant: %s (board=%d)\n",
+                g_is_cardputer_adv ? "ADV" : "v1.1/legacy",
+                static_cast<int>(g_board_type));
 
 #if ENABLE_SOUND
   // Speaker initialisation handled in audioSetup().
@@ -8677,6 +8727,7 @@ void setup() {
   }
 
   if(sd_available) {
+    ensure_default_sd_layout();
     if(!load_settings_from_sd()) {
       apply_settings_constraints();
       save_settings_to_sd();
