@@ -239,6 +239,12 @@ List of SGB and Analogue Pocket enhanced titles:
 * Yakyuman
 * Yoshi
 
+10.30.2025: 0.2
+* Restored the on-screen FPS/profiler overlay so frame pacing diagnostics are visible again.
+* Fixed CGB double-speed timer scaling in Peanut-GB, returning music playback to the correct tempo.
+* Tidied timing checks around the audio pump to keep buffer depth steady under heavy scenes.
+
+
 10.10.2025:0.1
 
 * Forked jedld version

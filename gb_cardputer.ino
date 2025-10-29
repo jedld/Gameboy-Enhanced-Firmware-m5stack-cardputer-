@@ -79,7 +79,7 @@ struct PaletteState;
 
 static constexpr const char *FIRMWARE_NAME = "m5gbcemu";
 #ifndef M5GBCEMU_VERSION
-#define M5GBCEMU_VERSION "0.1.1"
+#define M5GBCEMU_VERSION "0.2.0"
 #endif
 static constexpr const char *FIRMWARE_VERSION = M5GBCEMU_VERSION;
 
