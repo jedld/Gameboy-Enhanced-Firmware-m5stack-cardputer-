@@ -10,6 +10,7 @@
 #include <Arduino.h>
 #ifdef ESP32
 #include <esp_wifi.h>
+#include <ESPmDNS.h>
 #endif
 
 static WebServer *g_web_server = nullptr;
@@ -447,6 +448,18 @@ bool WiFiManager::startAccessPoint(const char *ssid, const char *password) {
       g_web_server->begin();
       Serial.println("Web server started on port 80");
       delay(200);  // Give server time to initialize
+      
+      // Start mDNS for Bonjour/ZeroConf discovery (makes it discoverable in Finder)
+      #ifdef ESP32
+      if(MDNS.begin("cardputer")) {
+        MDNS.addService("http", "tcp", WEB_SERVER_PORT);
+        MDNS.addServiceTxt("http", "tcp", "name", "Cardputer Airdrop");
+        MDNS.addServiceTxt("http", "tcp", "type", "file-transfer");
+        Serial.println("mDNS started: cardputer.local");
+      } else {
+        Serial.println("mDNS failed to start");
+      }
+      #endif
     } else {
       Serial.println("Failed to create WebServer object");
       return false;
@@ -466,6 +479,10 @@ void WiFiManager::stopAccessPoint() {
     delete g_web_server;
     g_web_server = nullptr;
   }
+
+  #ifdef ESP32
+  MDNS.end();
+  #endif
 
   WiFi.softAPdisconnect(true);
   ap_active_ = false;
@@ -496,6 +513,11 @@ void WiFiManager::loop() {
     
     // Handle web server clients - this must be called frequently
     g_web_server->handleClient();
+    
+    #ifdef ESP32
+    // Update mDNS
+    MDNS.update();
+    #endif
     
     // Small yield to prevent watchdog issues
     yield();
