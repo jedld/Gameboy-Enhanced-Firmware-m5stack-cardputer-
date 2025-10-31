@@ -5396,7 +5396,7 @@ static bool flash_rom_to_storage(struct priv_t *priv, size_t rom_size) {
   set_font_size(112);
   M5Cardputer.Display.setTextColor(M5Cardputer.Display.color565(255, 255, 255));
   M5Cardputer.Display.setCursor(10, 18);
-  M5Cardputer.Display.print("Flashing ROM");
+  M5Cardputer.Display.print("Flashing ROM Please wait");
 
   set_font_size(80);
   M5Cardputer.Display.setCursor(10, 78);
@@ -5408,7 +5408,7 @@ static bool flash_rom_to_storage(struct priv_t *priv, size_t rom_size) {
   const uint16_t text_colour = M5Cardputer.Display.color565(255, 255, 255);
 
   const int bar_x = 12;
-  const int bar_y = 150;
+  const int bar_y = 60;
   const int bar_w = 216;
   const int bar_h = 24;
   M5Cardputer.Display.drawRoundRect(bar_x, bar_y, bar_w, bar_h, 6, outline_colour);
