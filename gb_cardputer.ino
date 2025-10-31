@@ -68,6 +68,7 @@
 #include "peanutgb/peanut_gb.h"
 #include "bluetooth/bluetooth_manager.h"
 #include "input/external_input.h"
+#include "wifi/wifi_manager.h"
 #include <SD.h>
 #include <pgmspace.h>
 #include "gbc.h"
@@ -7139,10 +7140,20 @@ static void show_options_menu() {
 #if ENABLE_BLUETOOTH_CONTROLLERS
     OPTION_BLUETOOTH = 6,
     OPTION_KEYMAP = 7,
+#if ENABLE_WIFI_AIRDROP
+    OPTION_AIRDROP = 8,
+    OPTION_DONE = 9,
+#else
     OPTION_DONE = 8,
+#endif
 #else
     OPTION_KEYMAP = 6,
+#if ENABLE_WIFI_AIRDROP
+    OPTION_AIRDROP = 7,
+    OPTION_DONE = 8,
+#else
     OPTION_DONE = 7,
+#endif
 #endif
     OPTION_COUNT
   };
@@ -7152,7 +7163,10 @@ static void show_options_menu() {
   bool done = false;
   bool settings_changed = false;
 
-  while(!done) {
+    while(!done) {
+#if ENABLE_WIFI_AIRDROP
+    WiFiManager::instance().loop();
+#endif
     if(redraw) {
       redraw = false;
       M5Cardputer.Display.clearDisplay();
@@ -7188,6 +7202,11 @@ static void show_options_menu() {
       BluetoothManager::instance().isReady() ? "" : "(off)" );
 #endif
       draw_option(OPTION_KEYMAP, "Configure buttons", "");
+#if ENABLE_WIFI_AIRDROP
+      draw_option(OPTION_AIRDROP,
+          "Airdrop",
+          WiFiManager::instance().isAccessPointActive() ? WiFiManager::instance().getAccessPointIP() : "Off");
+#endif
       draw_option(OPTION_DONE, "Back", "");
 
   set_font_size(200);
@@ -7263,6 +7282,27 @@ static void show_options_menu() {
           show_keymap_menu();
           redraw = true;
           break;
+#if ENABLE_WIFI_AIRDROP
+        case OPTION_AIRDROP:
+          if(WiFiManager::instance().isAccessPointActive()) {
+            WiFiManager::instance().stopAccessPoint();
+            show_status_message("Airdrop stopped", StatusMessageKind::Info);
+          } else {
+            if(!g_sd_mounted) {
+              show_status_message("SD card required", StatusMessageKind::Error);
+            } else {
+              if(WiFiManager::instance().startAccessPoint()) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Airdrop: %s", WiFiManager::instance().getAccessPointIP());
+                show_status_message(msg, StatusMessageKind::Success);
+              } else {
+                show_status_message("Airdrop failed", StatusMessageKind::Error);
+              }
+            }
+          }
+          redraw = true;
+          break;
+#endif
         case OPTION_DONE:
           wait_for_keyboard_release();
           done = true;
@@ -7542,6 +7582,9 @@ static void show_home_menu() {
   bool launch_selected = false;
 
   while(!launch_selected) {
+#if ENABLE_WIFI_AIRDROP
+    WiFiManager::instance().loop();
+#endif
     if(redraw) {
       redraw = false;
       M5Cardputer.Display.clearDisplay();
@@ -8827,6 +8870,10 @@ void setup() {
   });
 #endif
 
+#if ENABLE_WIFI_AIRDROP
+  WiFiManager::instance().initialize();
+#endif
+
   // Set display rotation to horizontal.
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.initDMA();
@@ -8917,6 +8964,9 @@ void setup() {
 
     bool rom_browser_cancelled = false;
     while(!rom_ready) {
+#if ENABLE_WIFI_AIRDROP
+      WiFiManager::instance().loop();
+#endif
       if(try_embedded_first) {
         try_embedded_first = false;
         if(boot_entry != nullptr && load_embedded_rom(&priv, boot_entry)) {
@@ -9136,7 +9186,7 @@ void setup() {
         save_state_refresh_metadata(&priv);
 
         bool exit_requested = false;
-        if(priv.rom_is_cgb && rom_size > ROM_FLASH_PROMPT_THRESHOLD && priv.sd_rom_path_valid && rom_storage_get_partition() != nullptr) {
+        if(rom_size > ROM_FLASH_PROMPT_THRESHOLD && priv.sd_rom_path_valid && rom_storage_get_partition() != nullptr) {
           char title_buffer[ROM_STORAGE_TITLE_MAX];
           extract_rom_title_from_cache(&priv.rom_cache, title_buffer, sizeof(title_buffer));
           FlashPromptAction action = prompt_flash_rom(rom_size, title_buffer);
@@ -9653,6 +9703,9 @@ void setup() {
     const uint64_t frame_start = micros64();
 
     poll_keyboard();
+#if ENABLE_WIFI_AIRDROP
+    WiFiManager::instance().loop();
+#endif
     const uint64_t after_poll = micros64();
 
     uint32_t cpu_steps = 0;
