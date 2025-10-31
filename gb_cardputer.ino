@@ -8697,6 +8697,10 @@ static void audioSetup() {
   Serial.printf("Audio memory (before alloc): internal DMA=%u bytes, psram DMA=%u bytes\n",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+  Serial.printf("Audio buffer size: %u bytes per buffer (total for %u buffers: %u bytes)\n",
+                (unsigned)buffer_bytes,
+                (unsigned)AUDIO_BUFFER_COUNT,
+                (unsigned)(buffer_bytes * AUDIO_BUFFER_COUNT));
   for(size_t i = 0; i < AUDIO_BUFFER_COUNT; ++i) {
     audio_buffers[i] = audio_alloc_dma_buffer(buffer_bytes);
     if(audio_buffers[i] == nullptr) {
@@ -8705,6 +8709,112 @@ static void audioSetup() {
     }
     memset(audio_buffers[i], 0, buffer_bytes);
     audio_buffer_state[i] = 0;
+  }
+
+  // If allocation failed and PSRAM is not available, try recovery strategies
+  if(!buffer_ok && !g_psram_available) {
+#if ENABLE_LCD
+    if(priv.framebuffers[1] != nullptr && !priv.single_buffer_mode) {
+      Serial.println("Audio buffer allocation failed; freeing secondary framebuffer to retry");
+      heap_caps_free(priv.framebuffers[1]);
+      priv.framebuffers[1] = nullptr;
+      memset(priv.framebuffer_row_hash[1], 0, sizeof(priv.framebuffer_row_hash[1]));
+      priv.single_buffer_mode = true;
+      priv.write_fb_index = 0;
+      
+      // Retry audio buffer allocation
+      buffer_ok = true;
+      for(size_t i = 0; i < AUDIO_BUFFER_COUNT; ++i) {
+        audio_buffers[i] = audio_alloc_dma_buffer(buffer_bytes);
+        if(audio_buffers[i] == nullptr) {
+          buffer_ok = false;
+          break;
+        }
+        memset(audio_buffers[i], 0, buffer_bytes);
+        audio_buffer_state[i] = 0;
+      }
+      if(buffer_ok) {
+        Serial.println("Audio buffer allocation succeeded after freeing secondary framebuffer");
+      }
+    }
+#endif
+    
+    // If still failed, try progressively fewer buffers, and potentially reallocate framebuffer
+    if(!buffer_ok) {
+      // Free any partially allocated buffers first
+      for(size_t i = 0; i < AUDIO_BUFFER_COUNT; ++i) {
+        if(audio_buffers[i] != nullptr) {
+          heap_caps_free(audio_buffers[i]);
+          audio_buffers[i] = nullptr;
+        }
+      }
+      
+      // Try progressive reduction: 3, 2, 1 buffers
+      size_t target_counts[] = {3, 2, 1};
+      for(size_t attempt = 0; attempt < sizeof(target_counts) / sizeof(target_counts[0]) && !buffer_ok; ++attempt) {
+        const size_t target_count = target_counts[attempt];
+        Serial.printf("Retrying with reduced audio buffer count: trying %u buffers (need %u bytes)\n",
+                      (unsigned)target_count,
+                      (unsigned)(buffer_bytes * target_count));
+        
+        // Try reallocating first framebuffer to non-DMA memory to free DMA memory for audio
+#if ENABLE_LCD
+        if(attempt == 0 && priv.framebuffers[0] != nullptr) {
+          // Try reallocating first framebuffer as non-DMA (before trying reduced buffers)
+          Serial.println("Attempting to reallocate first framebuffer to free DMA memory");
+          const size_t fb_bytes = LCD_HEIGHT * LCD_WIDTH * sizeof(uint16_t);
+          uint16_t *fb0_backup = priv.framebuffers[0];
+          
+          // Try allocating as non-DMA first (this will free DMA memory if current FB is DMA)
+          uint16_t *fb0_new = (uint16_t *)heap_caps_malloc(fb_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+          if(fb0_new != nullptr) {
+            // Copy existing data
+            memcpy(fb0_new, fb0_backup, fb_bytes);
+            heap_caps_free(fb0_backup);
+            priv.framebuffers[0] = fb0_new;
+            Serial.printf("First framebuffer reallocated to non-DMA memory (freed ~%u bytes DMA)\n",
+                          (unsigned)fb_bytes);
+            // Check available DMA memory after reallocation
+            Serial.printf("Audio memory (after FB realloc): internal DMA=%u bytes\n",
+                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+          } else {
+            Serial.println("Failed to reallocate first framebuffer (non-DMA allocation failed)");
+          }
+        }
+#endif
+        
+        buffer_ok = true;
+        for(size_t i = 0; i < target_count; ++i) {
+          audio_buffers[i] = audio_alloc_dma_buffer(buffer_bytes);
+          if(audio_buffers[i] == nullptr) {
+            buffer_ok = false;
+            break;
+          }
+          memset(audio_buffers[i], 0, buffer_bytes);
+          audio_buffer_state[i] = 0;
+        }
+        
+        if(buffer_ok) {
+          // Clear remaining buffer slots
+          for(size_t i = target_count; i < AUDIO_BUFFER_COUNT; ++i) {
+            audio_buffers[i] = nullptr;
+            audio_buffer_state[i] = 0;
+          }
+          Serial.printf("Audio buffer allocation succeeded with %u buffers (reduced from %u)\n",
+                        (unsigned)target_count,
+                        (unsigned)AUDIO_BUFFER_COUNT);
+          break;
+        } else {
+          // Free any partially allocated buffers from this attempt
+          for(size_t i = 0; i < target_count; ++i) {
+            if(audio_buffers[i] != nullptr) {
+              heap_caps_free(audio_buffers[i]);
+              audio_buffers[i] = nullptr;
+            }
+          }
+        }
+      }
+    }
   }
 
   if(!buffer_ok) {
@@ -8871,12 +8981,24 @@ void setup() {
 #endif
 
 #if ENABLE_WIFI_AIRDROP
+  // Log DMA memory before WiFi init (WiFi.mode() might allocate memory)
+  Serial.printf("DMA memory before WiFi.init(): internal DMA=%u bytes\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
   WiFiManager::instance().initialize();
+  Serial.printf("DMA memory after WiFi.init(): internal DMA=%u bytes\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
 #endif
 
   // Set display rotation to horizontal.
   M5Cardputer.Display.setRotation(1);
+  
+  // Log DMA memory before Display.initDMA() - it may allocate DMA buffers
+  Serial.printf("DMA memory before Display.initDMA(): internal DMA=%u bytes\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
   M5Cardputer.Display.initDMA();
+  Serial.printf("DMA memory after Display.initDMA(): internal DMA=%u bytes\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+  
   set_font_size(80);
   show_boot_splash();
   set_font_size(80);
@@ -8908,10 +9030,14 @@ void setup() {
   Serial.printf("setup stack avail (after home menu): %u bytes\n",
                 (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
 
+  Serial.printf("DMA memory before GB buffers: internal DMA=%u bytes\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
   gb.wram = alloc_gb_buffer(WRAM_TOTAL_SIZE, "WRAM", true);
   gb.vram = alloc_gb_buffer(VRAM_TOTAL_SIZE, "VRAM", true);
   gb.oam = alloc_gb_buffer(OAM_SIZE, "OAM", true);
   gb.hram_io = alloc_gb_buffer(HRAM_IO_SIZE, "HRAM/IO", true);
+  Serial.printf("DMA memory after GB buffers: internal DMA=%u bytes\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
   if(!gb.wram || !gb.vram || !gb.oam || !gb.hram_io) {
     debugPrint("Out of memory");
     while(true) {
@@ -9395,9 +9521,15 @@ void setup() {
   memset(priv.framebuffer_row_hash, 0, sizeof(priv.framebuffer_row_hash));
   memset(priv.framebuffer_row_dirty, 0, sizeof(priv.framebuffer_row_dirty));
   const size_t fb_bytes = LCD_HEIGHT * LCD_WIDTH * sizeof(uint16_t);
-  static constexpr uint32_t FB_CAPS_FAST[] = {
+  // When PSRAM is not available, prioritize non-DMA internal memory for framebuffers
+  // to preserve DMA-capable memory for audio buffers
+  static constexpr uint32_t FB_CAPS_FAST_WITH_PSRAM[] = {
     MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+  };
+  static constexpr uint32_t FB_CAPS_FAST_NO_PSRAM[] = {
+    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,  // Non-DMA first to preserve DMA for audio
+    MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT
   };
   static constexpr uint32_t FB_CAPS_FALLBACK[] = {
     MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
@@ -9405,12 +9537,24 @@ void setup() {
     MALLOC_CAP_8BIT
   };
   auto alloc_framebuffer = [&](void) -> uint16_t* {
-    for(uint32_t cap : FB_CAPS_FAST) {
-      uint16_t *buf = (uint16_t *)heap_caps_malloc(fb_bytes, cap);
-      if(buf != nullptr) {
-        return buf;
+    // Try fast caps (PSRAM-aware)
+    if(g_psram_available) {
+      for(uint32_t cap : FB_CAPS_FAST_WITH_PSRAM) {
+        uint16_t *buf = (uint16_t *)heap_caps_malloc(fb_bytes, cap);
+        if(buf != nullptr) {
+          return buf;
+        }
+      }
+    } else {
+      // Without PSRAM, prefer non-DMA to save DMA memory for audio
+      for(uint32_t cap : FB_CAPS_FAST_NO_PSRAM) {
+        uint16_t *buf = (uint16_t *)heap_caps_malloc(fb_bytes, cap);
+        if(buf != nullptr) {
+          return buf;
+        }
       }
     }
+    // Fallback to PSRAM or generic if available
     for(uint32_t cap : FB_CAPS_FALLBACK) {
       uint16_t *buf = (uint16_t *)heap_caps_malloc(fb_bytes, cap);
       if(buf != nullptr) {

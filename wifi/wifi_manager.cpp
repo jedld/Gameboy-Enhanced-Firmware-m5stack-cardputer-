@@ -362,12 +362,9 @@ bool WiFiManager::initialize() {
     return true;
   }
 
-  WiFi.mode(WIFI_AP);
-  
-  // Disable power saving mode to ensure responsive network
-  #ifdef ESP32
-  esp_wifi_set_ps(WIFI_PS_NONE);
-  #endif
+  // Defer WiFi.mode() until AP is actually started to avoid unnecessary memory allocation
+  // WiFi.mode(WIFI_AP) allocates buffers even if AP isn't active
+  // This is now called in startAccessPoint() instead
   
   initialized_ = true;
   return true;
@@ -388,6 +385,14 @@ bool WiFiManager::startAccessPoint(const char *ssid, const char *password) {
   if(ap_active_) {
     return true;  // Already active
   }
+
+  // Initialize WiFi mode only when actually starting the AP (deferred allocation)
+  WiFi.mode(WIFI_AP);
+  
+  // Disable power saving mode to ensure responsive network
+  #ifdef ESP32
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  #endif
 
   if(ssid != nullptr && strlen(ssid) > 0) {
     strncpy(ap_ssid_, ssid, sizeof(ap_ssid_) - 1);
@@ -514,10 +519,7 @@ void WiFiManager::loop() {
     // Handle web server clients - this must be called frequently
     g_web_server->handleClient();
     
-    #ifdef ESP32
-    // Update mDNS
-    MDNS.update();
-    #endif
+    // Note: mDNS works automatically once started, no update() call needed
     
     // Small yield to prevent watchdog issues
     yield();

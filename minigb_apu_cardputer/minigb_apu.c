@@ -63,11 +63,16 @@ typedef struct {
 
 static APU_FAST_DATA biquad_filter_t g_bass_filter_left = {0};
 static APU_FAST_DATA biquad_filter_t g_bass_filter_right = {0};
+static APU_FAST_DATA biquad_filter_t g_dc_block_left = {0};
+static APU_FAST_DATA biquad_filter_t g_dc_block_right = {0};
 static bool g_eq_enabled = true;
 static bool g_eq_configured = false;
-static const float g_eq_post_gain = 0.92f;
+static bool g_dc_block_configured = false;
+static const float g_eq_post_gain = 0.88f; // Reduced slightly to prevent clipping with enhanced bass
 
 static void APU_FAST_FN biquad_reset(biquad_filter_t *f);
+static void APU_FAST_FN biquad_configure_high_pass(biquad_filter_t *f, double sample_rate, double cutoff_hz);
+static void APU_FAST_FN audio_configure_dc_blocking(void);
 static void APU_FAST_FN audio_configure_equaliser(void);
 static void APU_FAST_FN audio_ensure_params(void);
 static void APU_FAST_FN audio_reset_filters(void);
@@ -85,7 +90,26 @@ static void APU_FAST_FN audio_reset_filters(void)
 {
 	biquad_reset(&g_bass_filter_left);
 	biquad_reset(&g_bass_filter_right);
+	biquad_reset(&g_dc_block_left);
+	biquad_reset(&g_dc_block_right);
 	g_eq_configured = false;
+	g_dc_block_configured = false;
+}
+
+static void APU_FAST_FN audio_configure_dc_blocking(void)
+{
+	audio_ensure_params();
+	const double sample_rate = (double)g_audio_sample_rate;
+	if(sample_rate <= 0.0) {
+		return;
+	}
+
+	// Configure DC blocking high-pass filter to remove clicks/pops
+	// Very low cutoff (10Hz) to remove DC offset without affecting audible frequencies
+	const double dc_cutoff_hz = 10.0;
+	biquad_configure_high_pass(&g_dc_block_left, sample_rate, dc_cutoff_hz);
+	biquad_configure_high_pass(&g_dc_block_right, sample_rate, dc_cutoff_hz);
+	g_dc_block_configured = true;
 }
 
 static void APU_FAST_FN biquad_configure_low_shelf(biquad_filter_t *f,
@@ -137,6 +161,44 @@ static void APU_FAST_FN biquad_configure_low_shelf(biquad_filter_t *f,
 	biquad_reset(f);
 }
 
+static void APU_FAST_FN biquad_configure_high_pass(biquad_filter_t *f,
+										double sample_rate,
+										double cutoff_hz)
+{
+	if(f == NULL || sample_rate <= 0.0) {
+		return;
+	}
+
+	if(cutoff_hz < 1.0) {
+		cutoff_hz = 1.0;
+	}
+	if(cutoff_hz > sample_rate * 0.45) {
+		cutoff_hz = sample_rate * 0.45;
+	}
+
+	const double w0 = 2.0 * M_PI * cutoff_hz / sample_rate;
+	const double cos_w0 = cos(w0);
+	const double sin_w0 = sin(w0);
+	const double Q = 0.707; // Butterworth response
+	const double alpha = sin_w0 / (2.0 * Q);
+
+	const double a0 = 1.0 + alpha;
+	const double a1 = -2.0 * cos_w0;
+	const double a2 = 1.0 - alpha;
+	const double b0 = (1.0 + cos_w0) / 2.0;
+	const double b1 = -(1.0 + cos_w0);
+	const double b2 = (1.0 + cos_w0) / 2.0;
+
+	const double inv_a0 = 1.0 / a0;
+	f->b0 = (float)(b0 * inv_a0);
+	f->b1 = (float)(b1 * inv_a0);
+	f->b2 = (float)(b2 * inv_a0);
+	f->a1 = (float)(a1 * inv_a0);
+	f->a2 = (float)(a2 * inv_a0);
+
+	biquad_reset(f);
+}
+
 static inline float APU_FAST_FN biquad_process(biquad_filter_t *f, float x)
 {
 	const float y = f->b0 * x + f->b1 * f->x1 + f->b2 * f->x2
@@ -148,9 +210,24 @@ static inline float APU_FAST_FN biquad_process(biquad_filter_t *f, float x)
 	return y;
 }
 
-static inline int16_t APU_FAST_FN clamp_to_i16(float value)
-
+// Soft saturation using tanh for smooth clipping
+static inline float APU_FAST_FN soft_saturate(float value, float threshold)
 {
+	if(value > threshold) {
+		return threshold + (float)tanh((value - threshold) / threshold) * threshold;
+	}
+	if(value < -threshold) {
+		return -threshold + (float)tanh((value + threshold) / threshold) * threshold;
+	}
+	return value;
+}
+
+static inline int16_t APU_FAST_FN clamp_to_i16(float value)
+{
+	// Use soft saturation before hard clipping to reduce harsh artifacts
+	const float threshold = (float)INT16_MAX * 0.95f;
+	value = soft_saturate(value, threshold);
+	
 	if(value > (float)INT16_MAX) {
 		return INT16_MAX;
 	}
@@ -174,9 +251,11 @@ static void APU_FAST_FN audio_configure_equaliser(void)
 		return;
 	}
 
-	const double bass_cutoff_hz = 135.0; // tuned for Cardputer speaker
-	const double bass_gain_db = 7.0;     // gentle low shelf boost
-	const double slope = 0.75;          // smooth transition
+	// Enhanced bass settings for better low-end response
+	// Lower cutoff for deeper bass, higher gain for more punch
+	const double bass_cutoff_hz = 100.0;  // Lower cutoff for deeper bass response
+	const double bass_gain_db = 10.0;     // Increased from 7dB for stronger bass boost
+	const double slope = 0.65;            // Smoother transition for natural sound
 
 	biquad_configure_low_shelf(&g_bass_filter_left,
 				   sample_rate,
@@ -188,6 +267,9 @@ static void APU_FAST_FN audio_configure_equaliser(void)
 				   bass_cutoff_hz,
 				   bass_gain_db,
 				   slope);
+
+	// Always configure DC blocking
+	audio_configure_dc_blocking();
 
 	g_eq_configured = true;
 }
@@ -212,8 +294,13 @@ static void APU_FAST_FN audio_recompute_timing(void)
 	g_audio_nsamples = g_audio_samples * 2u;
 	g_audio_params_ready = true;
 	g_eq_configured = false;
-	if(g_eq_enabled)
+	g_dc_block_configured = false;
+	if(g_eq_enabled) {
 		audio_configure_equaliser();
+	} else {
+		// Configure DC blocking even when EQ is disabled
+		audio_configure_dc_blocking();
+	}
 }
 
 static void APU_FAST_FN audio_ensure_params(void)
@@ -610,28 +697,48 @@ void APU_FAST_FN audio_callback(void *userdata, uint8_t *stream, int len)
 	update_wave(samples);
 	update_noise(samples);
 
+	// Always ensure DC blocking is configured
+	if(!g_dc_block_configured) {
+		audio_configure_dc_blocking();
+	}
+
 	if(g_eq_enabled) {
 		if(!g_eq_configured)
 			audio_configure_equaliser();
 	} else if(g_eq_configured) {
 		audio_reset_filters();
+		// Reconfigure DC blocking after reset
+		audio_configure_dc_blocking();
 	}
 
 	if(g_eq_configured) {
     const float gain = g_eq_post_gain;
     #pragma GCC ivdep
     for(uint_fast16_t i = 0; (i + 1) < total_samples; i += 2) {
+      // Apply bass boost EQ
       float left = biquad_process(&g_bass_filter_left, (float)samples[i + 0]);
       float right = biquad_process(&g_bass_filter_right, (float)samples[i + 1]);
+      
+      // Apply DC blocking to remove clicks/pops
+      left = biquad_process(&g_dc_block_left, left);
+      right = biquad_process(&g_dc_block_right, right);
+      
+      // Apply gain with soft saturation
+      left *= gain;
+      right *= gain;
 
-      samples[i + 0] = clamp_to_i16(left * gain);
-      samples[i + 1] = clamp_to_i16(right * gain);
+      samples[i + 0] = clamp_to_i16(left);
+      samples[i + 1] = clamp_to_i16(right);
     }
 	} else {
+    // Even without EQ, apply DC blocking to prevent clicks
     #pragma GCC ivdep
     for(uint_fast16_t i = 0; (i + 1) < total_samples; i += 2) {
-      samples[i + 0] = clamp_to_i16((float)samples[i + 0]);
-      samples[i + 1] = clamp_to_i16((float)samples[i + 1]);
+      float left = biquad_process(&g_dc_block_left, (float)samples[i + 0]);
+      float right = biquad_process(&g_dc_block_right, (float)samples[i + 1]);
+      
+      samples[i + 0] = clamp_to_i16(left);
+      samples[i + 1] = clamp_to_i16(right);
     }
 	}
 }
