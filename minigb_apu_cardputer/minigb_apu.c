@@ -33,6 +33,15 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+#if defined(ESP_PLATFORM)
+#include <esp_attr.h>
+#define APU_FAST_FN IRAM_ATTR
+#define APU_FAST_DATA DRAM_ATTR
+#else
+#define APU_FAST_FN
+#define APU_FAST_DATA
+#endif
+
 static uint32_t g_audio_sample_rate = AUDIO_DEFAULT_SAMPLE_RATE;
 static uint32_t g_freq_inc_ref = AUDIO_DEFAULT_SAMPLE_RATE * 16u;
 static uint32_t g_freq_inc_scale = 16u;
@@ -52,18 +61,18 @@ typedef struct {
 	float y2;
 } biquad_filter_t;
 
-static biquad_filter_t g_bass_filter_left = {0};
-static biquad_filter_t g_bass_filter_right = {0};
+static APU_FAST_DATA biquad_filter_t g_bass_filter_left = {0};
+static APU_FAST_DATA biquad_filter_t g_bass_filter_right = {0};
 static bool g_eq_enabled = true;
 static bool g_eq_configured = false;
 static const float g_eq_post_gain = 0.92f;
 
-static void biquad_reset(biquad_filter_t *f);
-static void audio_configure_equaliser(void);
-static void audio_ensure_params(void);
-static void audio_reset_filters(void);
+static void APU_FAST_FN biquad_reset(biquad_filter_t *f);
+static void APU_FAST_FN audio_configure_equaliser(void);
+static void APU_FAST_FN audio_ensure_params(void);
+static void APU_FAST_FN audio_reset_filters(void);
 
-static void biquad_reset(biquad_filter_t *f)
+static void APU_FAST_FN biquad_reset(biquad_filter_t *f)
 {
 	if(f == NULL) {
 		return;
@@ -72,14 +81,14 @@ static void biquad_reset(biquad_filter_t *f)
 	f->y1 = f->y2 = 0.0f;
 }
 
-static void audio_reset_filters(void)
+static void APU_FAST_FN audio_reset_filters(void)
 {
 	biquad_reset(&g_bass_filter_left);
 	biquad_reset(&g_bass_filter_right);
 	g_eq_configured = false;
 }
 
-static void biquad_configure_low_shelf(biquad_filter_t *f,
+static void APU_FAST_FN biquad_configure_low_shelf(biquad_filter_t *f,
 									   double sample_rate,
 									   double cutoff_hz,
 									   double gain_db,
@@ -128,7 +137,7 @@ static void biquad_configure_low_shelf(biquad_filter_t *f,
 	biquad_reset(f);
 }
 
-static inline float biquad_process(biquad_filter_t *f, float x)
+static inline float APU_FAST_FN biquad_process(biquad_filter_t *f, float x)
 {
 	const float y = f->b0 * x + f->b1 * f->x1 + f->b2 * f->x2
 					- f->a1 * f->y1 - f->a2 * f->y2;
@@ -139,7 +148,7 @@ static inline float biquad_process(biquad_filter_t *f, float x)
 	return y;
 }
 
-static inline int16_t clamp_to_i16(float value)
+static inline int16_t APU_FAST_FN clamp_to_i16(float value)
 
 {
 	if(value > (float)INT16_MAX) {
@@ -151,7 +160,7 @@ static inline int16_t clamp_to_i16(float value)
 	return (int16_t)lrintf(value);
 }
 
-static void audio_configure_equaliser(void)
+static void APU_FAST_FN audio_configure_equaliser(void)
 {
 	if(!g_eq_enabled) {
 		audio_reset_filters();
@@ -183,7 +192,7 @@ static void audio_configure_equaliser(void)
 	g_eq_configured = true;
 }
 
-static void audio_recompute_timing(void)
+static void APU_FAST_FN audio_recompute_timing(void)
 {
 	if(g_audio_sample_rate == 0)
 		g_audio_sample_rate = AUDIO_DEFAULT_SAMPLE_RATE;
@@ -207,7 +216,7 @@ static void audio_recompute_timing(void)
 		audio_configure_equaliser();
 }
 
-static void audio_ensure_params(void)
+static void APU_FAST_FN audio_ensure_params(void)
 {
 	if(!g_audio_params_ready)
 	{
@@ -242,7 +251,7 @@ uint32_t audio_samples_per_buffer(void)
 /**
  * Memory holding audio registers between 0xFF10 and 0xFF3F inclusive.
  */
-static uint8_t audio_mem[AUDIO_MEM_SIZE];
+static APU_FAST_DATA uint8_t audio_mem[AUDIO_MEM_SIZE] __attribute__((aligned(16)));
 
 struct chan_len_ctr {
 	uint8_t load;
@@ -267,7 +276,7 @@ struct chan_freq_sweep {
 	uint32_t inc;
 };
 
-static struct chan {
+struct chan {
 	unsigned enabled : 1;
 	unsigned powered : 1;
 	unsigned on_left : 1;
@@ -301,18 +310,20 @@ static struct chan {
 			uint8_t sample;
 		} wave;
 	};
-} chans[4];
+};
 
-static int32_t vol_l, vol_r;
+static APU_FAST_DATA struct chan chans[4];
 
-static void set_note_freq(struct chan *c, const uint32_t freq)
+static APU_FAST_DATA int32_t vol_l, vol_r;
+
+static void APU_FAST_FN set_note_freq(struct chan *c, const uint32_t freq)
 {
 	/* Lowest expected value of freq is 64. */
 	audio_ensure_params();
 	c->freq_inc = freq * g_freq_inc_scale;
 }
 
-static void chan_enable(const uint_fast8_t i, const bool enable)
+static void APU_FAST_FN chan_enable(const uint_fast8_t i, const bool enable)
 {
 	uint8_t val;
 
@@ -325,7 +336,7 @@ static void chan_enable(const uint_fast8_t i, const bool enable)
 	//audio_mem[0xFF26 - AUDIO_ADDR_COMPENSATION] |= 0x80 | ((uint8_t)enable) << i;
 }
 
-static void update_env(struct chan *c)
+static void APU_FAST_FN update_env(struct chan *c)
 {
 	c->env.counter += c->env.inc;
 
@@ -341,7 +352,7 @@ static void update_env(struct chan *c)
 	}
 }
 
-static void update_len(struct chan *c)
+static void APU_FAST_FN update_len(struct chan *c)
 {
 	if (!c->len.enabled)
 		return;
@@ -353,7 +364,7 @@ static void update_len(struct chan *c)
 	}
 }
 
-static bool update_freq(struct chan *c, uint32_t *pos)
+static bool APU_FAST_FN update_freq(struct chan *c, uint32_t *pos)
 {
 	uint32_t inc = c->freq_inc - *pos;
 	c->freq_counter += inc;
@@ -368,7 +379,7 @@ static bool update_freq(struct chan *c, uint32_t *pos)
 	}
 }
 
-static void update_sweep(struct chan *c)
+static void APU_FAST_FN update_sweep(struct chan *c)
 {
 	c->sweep.counter += c->sweep.inc;
 
@@ -393,7 +404,7 @@ static void update_sweep(struct chan *c)
 	}
 }
 
-static void update_square(int16_t* samples, const bool ch2)
+static void APU_FAST_FN update_square(int16_t *restrict samples, const bool ch2)
 {
 	uint32_t freq;
 	struct chan* c = chans + ch2;
@@ -407,7 +418,8 @@ static void update_square(int16_t* samples, const bool ch2)
 	set_note_freq(c, freq);
 	c->freq_inc *= 8;
 
-	for (uint_fast16_t i = 0; i < limit; i += 2) {
+  #pragma GCC ivdep
+  for (uint_fast16_t i = 0; i < limit; i += 2) {
 		update_len(c);
 
 		if (!c->enabled)
@@ -455,7 +467,7 @@ static uint8_t wave_sample(const unsigned int pos, const unsigned int volume)
 	return volume ? (sample >> (volume - 1)) : 0;
 }
 
-static void update_wave(int16_t *samples)
+static void APU_FAST_FN update_wave(int16_t *restrict samples)
 {
 	uint32_t freq;
 	struct chan *c = chans + 2;
@@ -470,7 +482,8 @@ static void update_wave(int16_t *samples)
 
 	c->freq_inc *= 32;
 
-	for (uint_fast16_t i = 0; i < limit; i += 2) {
+  #pragma GCC ivdep
+  for (uint_fast16_t i = 0; i < limit; i += 2) {
 		update_len(c);
 
 		if (!c->enabled)
@@ -511,7 +524,7 @@ static void update_wave(int16_t *samples)
 	}
 }
 
-static void update_noise(int16_t *samples)
+static void APU_FAST_FN update_noise(int16_t *restrict samples)
 {
 	struct chan *c = chans + 3;
 	audio_ensure_params();
@@ -533,7 +546,8 @@ static void update_noise(int16_t *samples)
 	if (c->freq >= 14)
 		c->enabled = 0;
 
-	for (uint_fast16_t i = 0; i < limit; i += 2) {
+  #pragma GCC ivdep
+  for (uint_fast16_t i = 0; i < limit; i += 2) {
 		update_len(c);
 
 		if (!c->enabled)
@@ -580,9 +594,9 @@ static void update_noise(int16_t *samples)
 /**
  * SDL2 style audio callback function.
  */
-void audio_callback(void *userdata, uint8_t *stream, int len)
+void APU_FAST_FN audio_callback(void *userdata, uint8_t *stream, int len)
 {
-	int16_t *samples = (int16_t *)stream;
+  int16_t *restrict samples = (int16_t *)stream;
 	const uint_fast16_t total_samples = (uint_fast16_t)(len / (int)sizeof(int16_t));
 
 	/* Appease unused variable warning. */
@@ -604,27 +618,25 @@ void audio_callback(void *userdata, uint8_t *stream, int len)
 	}
 
 	if(g_eq_configured) {
-		for(uint_fast16_t i = 0; (i + 1) < total_samples; i += 2) {
-			float left = (float)samples[i + 0];
-			float right = (float)samples[i + 1];
+    const float gain = g_eq_post_gain;
+    #pragma GCC ivdep
+    for(uint_fast16_t i = 0; (i + 1) < total_samples; i += 2) {
+      float left = biquad_process(&g_bass_filter_left, (float)samples[i + 0]);
+      float right = biquad_process(&g_bass_filter_right, (float)samples[i + 1]);
 
-			left = biquad_process(&g_bass_filter_left, left) * g_eq_post_gain;
-			right = biquad_process(&g_bass_filter_right, right) * g_eq_post_gain;
-
-			samples[i + 0] = clamp_to_i16(left);
-			samples[i + 1] = clamp_to_i16(right);
-		}
+      samples[i + 0] = clamp_to_i16(left * gain);
+      samples[i + 1] = clamp_to_i16(right * gain);
+    }
 	} else {
-		for(uint_fast16_t i = 0; (i + 1) < total_samples; i += 2) {
-			const float left = (float)samples[i + 0];
-			const float right = (float)samples[i + 1];
-			samples[i + 0] = clamp_to_i16(left);
-			samples[i + 1] = clamp_to_i16(right);
-		}
+    #pragma GCC ivdep
+    for(uint_fast16_t i = 0; (i + 1) < total_samples; i += 2) {
+      samples[i + 0] = clamp_to_i16((float)samples[i + 0]);
+      samples[i + 1] = clamp_to_i16((float)samples[i + 1]);
+    }
 	}
 }
 
-static void chan_trigger(uint_fast8_t i)
+static void APU_FAST_FN chan_trigger(uint_fast8_t i)
 {
 	struct chan *c = chans + i;
 	audio_ensure_params();
@@ -681,7 +693,7 @@ static void chan_trigger(uint_fast8_t i)
  *				This is not checked in this function.
  * \return	Byte at address.
  */
-uint8_t audio_read(const uint16_t addr)
+uint8_t APU_FAST_FN audio_read(const uint16_t addr)
 {
 	static const uint8_t ortab[] = {
 		0x80, 0x3f, 0x00, 0xff, 0xbf,
@@ -704,7 +716,7 @@ uint8_t audio_read(const uint16_t addr)
  *				This is not checked in this function.
  * \param val	Byte to write at address.
  */
-void audio_write(const uint16_t addr, const uint8_t val)
+void APU_FAST_FN audio_write(const uint16_t addr, const uint8_t val)
 {
 	audio_ensure_params();
 	/* Find sound channel corresponding to register address. */

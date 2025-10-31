@@ -5398,9 +5398,6 @@ static bool flash_rom_to_storage(struct priv_t *priv, size_t rom_size) {
   M5Cardputer.Display.setCursor(10, 18);
   M5Cardputer.Display.print("Flashing ROM Please wait");
 
-  set_font_size(80);
-  M5Cardputer.Display.setCursor(10, 78);
-  M5Cardputer.Display.print(title);
 
   const uint16_t bg_colour = M5Cardputer.Display.color565(0, 0, 0);
   const uint16_t outline_colour = M5Cardputer.Display.color565(80, 80, 80);
@@ -6254,7 +6251,7 @@ static void mark_last_display_frame(const uint16_t *fb) {
 // Draw a frame to the display while scaling it to fit.
 // This is needed as the Cardputer's display has a height of 135px,
 // while the GameBoy's has a height of 144px.
-void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty) {
+void IRAM_ATTR fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty) {
   if(fb == nullptr) {
     return;
   }
@@ -6370,8 +6367,12 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
         const uint16_t *row1 = fb + ((src_y0 + 1) * LCD_WIDTH);
         const uint16_t w1 = weight;
         const uint16_t w0 = 256 - weight;
+        uint16_t *__restrict__ blended = blended_row;
+        const uint16_t *__restrict__ base0 = row0;
+        const uint16_t *__restrict__ base1 = row1;
+        #pragma GCC ivdep
         for(unsigned int x = 0; x < LCD_WIDTH; ++x) {
-          blended_row[x] = blend_pixel(row0[x], row1[x], w0, w1);
+          blended[x] = blend_pixel(base0[x], base1[x], w0, w1);
         }
         src_row = blended_row;
         use_blend = true;
@@ -6397,6 +6398,9 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
     }
 
     uint32_t hash = compute_hash ? 2166136261u : 0;
+    uint16_t *__restrict__ dst_vec = dst;
+    const uint16_t *__restrict__ src_vec = src_row;
+    #pragma GCC ivdep
     for(unsigned int x = 0; x < output_width; ++x) {
       unsigned int base = stretch_col_map[x];
       if(base >= LCD_WIDTH) {
@@ -6405,11 +6409,11 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
       uint16_t w = stretch_col_weight[x];
       uint16_t colour;
       if(w == 0 || base >= LCD_WIDTH - 1) {
-        colour = src_row[base];
+        colour = src_vec[base];
       } else {
-        colour = blend_pixel(src_row[base], src_row[base + 1], 256 - w, w);
+        colour = blend_pixel(src_vec[base], src_vec[base + 1], 256 - w, w);
       }
-      dst[x] = colour;
+      dst_vec[x] = colour;
       if(compute_hash) {
         hash = framebuffer_hash_step(hash, colour);
       }
