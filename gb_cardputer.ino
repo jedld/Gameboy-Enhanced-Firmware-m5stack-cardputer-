@@ -580,7 +580,10 @@ static bool ensure_display_cache_allocated() {
   }
 
   const size_t swap_bytes = DEST_H * DEST_W * sizeof(uint16_t);
+  // Prefer internal RAM to avoid PSRAM cache coherency issues with DMA
   static constexpr uint32_t kSwapCapsRestore[] = {
+    MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
     MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
   };
@@ -9131,11 +9134,13 @@ void setup() {
   if(!swap_fb_enabled) {
     const size_t swap_bytes = DEST_H * DEST_W * sizeof(uint16_t);
     
+    // Prefer internal RAM for swap_fb to avoid PSRAM cache coherency issues with DMA
+    // Internal RAM has better cache behavior for frequently written/read DMA buffers
     static constexpr uint32_t swap_caps_priority[] = {
-      MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
-      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
       MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
       MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
       MALLOC_CAP_8BIT
     };
@@ -9761,16 +9766,17 @@ void setup() {
   if(!swap_fb_enabled) {
     const size_t swap_bytes = DEST_H * DEST_W * sizeof(uint16_t);
     
-    // Try to allocate swap framebuffer - prefer PSRAM, but fallback to internal RAM if needed
+    // Try to allocate swap framebuffer - prefer internal RAM to avoid PSRAM cache coherency issues
+    // Internal RAM has better cache behavior for frequently written/read DMA buffers
     // This significantly improves performance even without PSRAM
     // Note: We relax DMA requirement for fallback as non-DMA memory still provides the caching benefit
     static constexpr uint32_t swap_caps_priority[] = {
-      // First try PSRAM with DMA (best performance)
-      MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
-      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-      // Then try internal RAM - prefer DMA but fallback is OK
+      // First try internal RAM with DMA (best for cache coherency with DMA)
       MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
+      // Then try PSRAM if internal RAM is not available
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
       // Try any DMA-capable memory
       MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
       // Last resort: any memory (non-DMA but still provides caching benefits)
