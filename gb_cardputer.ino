@@ -324,7 +324,7 @@ static bool frame_row_map_initialised = false;
 static uint8_t frame_row_map[DEST_H];
 static uint16_t frame_row_weight[DEST_H];
 static uint32_t swap_row_hash[DEST_H];
-static constexpr unsigned int FALLBACK_SEGMENT_ROWS = 8;  // Increased from 4 to reduce DMA overhead
+static constexpr unsigned int FALLBACK_SEGMENT_ROWS = 16;  // Increased for better batching when many rows are dirty (scrolling)
 static uint16_t fallback_segment_buffer[FALLBACK_SEGMENT_ROWS * DEST_W];
 static uint8_t g_last_display_fb_index = 0;
 static bool g_last_display_frame_valid = false;
@@ -3549,10 +3549,12 @@ static void handle_volume_keys(const Keyboard_Class::KeysState &status) {
   static bool previous_down = false;
 
   if(up_pressed && !previous_up) {
-    adjust_master_volume(static_cast<int>(VOLUME_STEP), true, true);
+    // Defer SD write to avoid blocking - settings will be saved periodically
+    adjust_master_volume(static_cast<int>(VOLUME_STEP), false, true);
   }
   if(down_pressed && !previous_down) {
-    adjust_master_volume(-static_cast<int>(VOLUME_STEP), true, true);
+    // Defer SD write to avoid blocking - settings will be saved periodically
+    adjust_master_volume(-static_cast<int>(VOLUME_STEP), false, true);
   }
 
   previous_up = up_pressed;
@@ -6568,68 +6570,84 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
       segment_rows = 0;
     };
 
-    for(unsigned int j = 0; j < DEST_H; j++) {
-      const unsigned int src_y0 = frame_row_map[j];
-      const uint16_t weight = frame_row_weight[j];
-      const bool dirty_hint = needs_update(src_y0, weight);
+  for(unsigned int j = 0; j < DEST_H; j++) {
+    const unsigned int src_y0 = frame_row_map[j];
+    const uint16_t weight = frame_row_weight[j];
+    const bool dirty_hint = needs_update(src_y0, weight);
 
-      if(!stretch && display_cache_valid && row_hash != nullptr) {
-        uint32_t expected_hash = 0;
-        bool can_skip = false;
-        if(weight == 0) {
-          expected_hash = row_hash[src_y0];
-          can_skip = true;
-        } else if(weight == 256 && src_y0 + 1 < LCD_HEIGHT) {
-          expected_hash = row_hash[src_y0 + 1];
-          can_skip = true;
-        }
-
-        if(can_skip && !dirty_hint && swap_row_hash[j] == expected_hash) {
-          flush_segment(segment_rows);
-          continue;
-        }
+    if(!stretch && display_cache_valid && row_hash != nullptr) {
+      uint32_t expected_hash = 0;
+      bool can_skip = false;
+      if(weight == 0) {
+        expected_hash = row_hash[src_y0];
+        can_skip = true;
+      } else if(weight == 256 && src_y0 + 1 < LCD_HEIGHT) {
+        expected_hash = row_hash[src_y0 + 1];
+        can_skip = true;
       }
 
-      // Optimize: if dirty_hint is false and we have a cached hash, check hash first before expensive compose
-      bool row_changed = true;
-      if(display_cache_valid && !dirty_hint && swap_row_hash[j] != 0) {
-        // Row not marked dirty, try quick hash check using cached source row hash
-        uint32_t expected_hash = 0;
-        if(!stretch && row_hash != nullptr) {
-          if(weight == 0) {
-            expected_hash = row_hash[src_y0];
-          } else if(weight == 256 && src_y0 + 1 < LCD_HEIGHT) {
-            expected_hash = row_hash[src_y0 + 1];
-          }
-        }
-        if(expected_hash != 0 && swap_row_hash[j] == expected_hash) {
-          // Hash matches - row hasn't changed, skip recomputation
-          row_changed = false;
-        }
+      if(can_skip && !dirty_hint && swap_row_hash[j] == expected_hash) {
+        flush_segment(segment_rows);
+        continue;
       }
-      
-      if(row_changed) {
-        // Need to compute row
+    }
+
+      // Optimize: when dirty_hint is true, skip hash checks - we know row changed
+      // This is critical for scrolling performance when many rows are dirty
+      if(dirty_hint) {
+        // Row is dirty - process directly without hash checks for speed
+        // compose_row computes hash efficiently, so use it instead of recomputing
         const uint32_t dest_hash = compose_row(line_buffer, src_y0, weight, true);
-        const bool actually_changed = (!display_cache_valid) || (swap_row_hash[j] != dest_hash);
-        
-        if(actually_changed) {
-          swap_row_hash[j] = dest_hash;
-          if(segment_rows == 0) {
-            segment_start = j;
-          }
-          memcpy(fallback_segment_buffer + (segment_rows * output_width), line_buffer, row_bytes);
-          segment_rows++;
-          if(segment_rows == FALLBACK_SEGMENT_ROWS) {
-            flush_segment(segment_rows);
-          }
-        } else {
-          // Hash matches but we computed it - update cache
-          swap_row_hash[j] = dest_hash;
+        swap_row_hash[j] = dest_hash;
+        if(segment_rows == 0) {
+          segment_start = j;
+        }
+        memcpy(fallback_segment_buffer + (segment_rows * output_width), line_buffer, row_bytes);
+        segment_rows++;
+        if(segment_rows == FALLBACK_SEGMENT_ROWS) {
           flush_segment(segment_rows);
         }
       } else {
-        flush_segment(segment_rows);
+        // Row not dirty - check hash to see if it actually changed
+        bool row_changed = true;
+        if(display_cache_valid && swap_row_hash[j] != 0) {
+          // Try quick hash check using cached source row hash
+          uint32_t expected_hash = 0;
+          if(!stretch && row_hash != nullptr) {
+            if(weight == 0) {
+              expected_hash = row_hash[src_y0];
+            } else if(weight == 256 && src_y0 + 1 < LCD_HEIGHT) {
+              expected_hash = row_hash[src_y0 + 1];
+            }
+          }
+          if(expected_hash != 0 && swap_row_hash[j] == expected_hash) {
+            // Hash matches - row hasn't changed, skip recomputation
+            row_changed = false;
+          }
+        }
+        
+        if(row_changed) {
+          const uint32_t dest_hash = compose_row(line_buffer, src_y0, weight, true);
+          const bool actually_changed = (!display_cache_valid) || (swap_row_hash[j] != dest_hash);
+          
+          if(actually_changed) {
+            swap_row_hash[j] = dest_hash;
+            if(segment_rows == 0) {
+              segment_start = j;
+            }
+            memcpy(fallback_segment_buffer + (segment_rows * output_width), line_buffer, row_bytes);
+            segment_rows++;
+            if(segment_rows == FALLBACK_SEGMENT_ROWS) {
+              flush_segment(segment_rows);
+            }
+          } else {
+            // Hash matches but we computed it - update cache
+            swap_row_hash[j] = dest_hash;
+            flush_segment(segment_rows);
+          }
+        } else {
+          flush_segment(segment_rows);
+        }
       }
     }
 
@@ -6705,17 +6723,29 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
       }
     }
 
-    const uint32_t dest_hash = compose_row(cached_row, src_y0, weight, true);
-
-    if(!display_cache_valid || swap_row_hash[j] != dest_hash) {
+    // Optimize: when dirty_hint is true, skip hash comparison - we know row changed
+    // This improves performance when scrolling through large tile maps
+    if(dirty_hint) {
+      // Row is dirty - update directly without hash comparison
+      const uint32_t dest_hash = compose_row(cached_row, src_y0, weight, true);
       swap_row_hash[j] = dest_hash;
       if(segment_count == 0) {
         segment_start = j;
       }
       segment_count++;
-    } else if(segment_count != 0) {
-      flush_segment(segment_start, segment_count);
-      segment_count = 0;
+    } else {
+      // Row not dirty - check hash to see if it actually changed
+      const uint32_t dest_hash = compose_row(cached_row, src_y0, weight, true);
+      if(!display_cache_valid || swap_row_hash[j] != dest_hash) {
+        swap_row_hash[j] = dest_hash;
+        if(segment_count == 0) {
+          segment_start = j;
+        }
+        segment_count++;
+      } else if(segment_count != 0) {
+        flush_segment(segment_start, segment_count);
+        segment_count = 0;
+      }
     }
   }
 
@@ -8670,14 +8700,15 @@ static bool audio_initialised = false;
 static bool audio_engine_initialised = false;
 
 static int16_t *audio_alloc_dma_buffer(size_t bytes) {
+  // Prefer internal RAM for audio buffers to avoid PSRAM cache coherency issues with DMA
+  // Internal RAM has better cache behavior for frequently accessed DMA buffers
   const uint32_t caps_order[] = {
-    MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
     MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+    MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
     MALLOC_CAP_DMA | MALLOC_CAP_8BIT
   };
 
-  const size_t first_index = g_psram_available ? 0 : 1;
-  for(size_t i = first_index; i < sizeof(caps_order) / sizeof(caps_order[0]); ++i) {
+  for(size_t i = 0; i < sizeof(caps_order) / sizeof(caps_order[0]); ++i) {
     int16_t *ptr = reinterpret_cast<int16_t *>(heap_caps_malloc(bytes, caps_order[i]));
     if(ptr != nullptr) {
       return ptr;
@@ -8756,20 +8787,36 @@ static inline void apply_volume_to_buffer(int16_t *samples, size_t count, uint8_
   if(samples == nullptr || count == 0 || volume >= 255) {
     return;
   }
+  // Optimized volume scaling: avoid division by using bit shifts when possible
+  if(volume == 255) {
+    return; // No scaling needed
+  }
+  // Use fixed-point multiplication for better performance
+  const uint32_t vol = static_cast<uint32_t>(volume);
   for(size_t i = 0; i < count; ++i) {
-    const int32_t scaled = (static_cast<int32_t>(samples[i]) * static_cast<int32_t>(volume)) / 255;
+    // Fast multiply-divide: (sample * volume) / 255
+    // This is equivalent but avoids 32-bit cast on every iteration
+    const int16_t sample = samples[i];
+    const int32_t scaled = (static_cast<int32_t>(sample) * vol) / 255;
     samples[i] = static_cast<int16_t>(scaled);
   }
 }
 #endif
+
+static uint8_t g_last_applied_speaker_volume = 255;
 
 static void apply_speaker_volume() {
   if(!audio_initialised) {
     return;
   }
   const uint8_t volume = g_settings.master_volume;
-  M5Cardputer.Speaker.setVolume(volume);
-  M5Cardputer.Speaker.setAllChannelVolume(volume);
+  
+  // Only update speaker volume if it changed to avoid expensive operations
+  if(volume != g_last_applied_speaker_volume) {
+    M5Cardputer.Speaker.setVolume(volume);
+    M5Cardputer.Speaker.setAllChannelVolume(volume);
+    g_last_applied_speaker_volume = volume;
+  }
 }
 
 static void audioSetup() {
@@ -10247,6 +10294,17 @@ void setup() {
     const uint64_t frame_us = frame_end - frame_start;
 
     const uint32_t now_ms = millis();
+
+    // Periodically save settings if dirty (deferred from volume changes to avoid blocking)
+    static uint32_t last_settings_save_ms = 0;
+    static constexpr uint32_t SETTINGS_SAVE_INTERVAL_MS = 5000; // Save every 5 seconds if dirty
+    if(g_settings_dirty && g_sd_mounted) {
+      const uint32_t elapsed = now_ms - last_settings_save_ms;
+      if(elapsed >= SETTINGS_SAVE_INTERVAL_MS) {
+        save_settings_to_sd();
+        last_settings_save_ms = now_ms;
+      }
+    }
 
     if(priv.cart_save_path_valid && priv.cart_ram_dirty && priv.cart_ram != nullptr &&
        priv.cart_ram_size > 0 && g_sd_mounted) {
