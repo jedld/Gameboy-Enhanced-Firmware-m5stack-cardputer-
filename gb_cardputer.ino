@@ -324,7 +324,7 @@ static bool frame_row_map_initialised = false;
 static uint8_t frame_row_map[DEST_H];
 static uint16_t frame_row_weight[DEST_H];
 static uint32_t swap_row_hash[DEST_H];
-static constexpr unsigned int FALLBACK_SEGMENT_ROWS = 4;
+static constexpr unsigned int FALLBACK_SEGMENT_ROWS = 8;  // Increased from 4 to reduce DMA overhead
 static uint16_t fallback_segment_buffer[FALLBACK_SEGMENT_ROWS * DEST_W];
 static uint8_t g_last_display_fb_index = 0;
 static bool g_last_display_frame_valid = false;
@@ -6548,6 +6548,7 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
         M5Cardputer.Display.startWrite();
         any_change = true;
       }
+      // Only wait for DMA if it's actually busy (reduces latency)
       if(M5Cardputer.Display.dmaBusy()) {
         M5Cardputer.Display.waitDMA();
       }
@@ -6555,7 +6556,8 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
       M5Cardputer.Display.writePixelsDMA(fallback_segment_buffer,
                                          output_width * count,
                                          true);
-      M5Cardputer.Display.waitDMA();
+      // Don't wait for DMA completion here - let it run in background for better throughput
+      // We'll wait at the end if needed
 #if ENABLE_PROFILING
       rows_written += count;
       segments_flushed++;
@@ -6585,17 +6587,42 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
         }
       }
 
-      const uint32_t dest_hash = compose_row(line_buffer, src_y0, weight, true);
-      const bool row_changed = (!display_cache_valid) || (swap_row_hash[j] != dest_hash);
-
-      if(row_changed) {
-        swap_row_hash[j] = dest_hash;
-        if(segment_rows == 0) {
-          segment_start = j;
+      // Optimize: if dirty_hint is false and we have a cached hash, check hash first before expensive compose
+      bool row_changed = true;
+      if(display_cache_valid && !dirty_hint && swap_row_hash[j] != 0) {
+        // Row not marked dirty, try quick hash check using cached source row hash
+        uint32_t expected_hash = 0;
+        if(!stretch && row_hash != nullptr) {
+          if(weight == 0) {
+            expected_hash = row_hash[src_y0];
+          } else if(weight == 256 && src_y0 + 1 < LCD_HEIGHT) {
+            expected_hash = row_hash[src_y0 + 1];
+          }
         }
-        memcpy(fallback_segment_buffer + (segment_rows * output_width), line_buffer, row_bytes);
-        segment_rows++;
-        if(segment_rows == FALLBACK_SEGMENT_ROWS) {
+        if(expected_hash != 0 && swap_row_hash[j] == expected_hash) {
+          // Hash matches - row hasn't changed, skip recomputation
+          row_changed = false;
+        }
+      }
+      
+      if(row_changed) {
+        // Need to compute row
+        const uint32_t dest_hash = compose_row(line_buffer, src_y0, weight, true);
+        const bool actually_changed = (!display_cache_valid) || (swap_row_hash[j] != dest_hash);
+        
+        if(actually_changed) {
+          swap_row_hash[j] = dest_hash;
+          if(segment_rows == 0) {
+            segment_start = j;
+          }
+          memcpy(fallback_segment_buffer + (segment_rows * output_width), line_buffer, row_bytes);
+          segment_rows++;
+          if(segment_rows == FALLBACK_SEGMENT_ROWS) {
+            flush_segment(segment_rows);
+          }
+        } else {
+          // Hash matches but we computed it - update cache
+          swap_row_hash[j] = dest_hash;
           flush_segment(segment_rows);
         }
       } else {
@@ -8999,14 +9026,95 @@ void setup() {
   configure_performance_profile();
   reset_save_state(&priv);
 
-  bool psram_ok = psramInit();
+  // PSRAM initialization and detection
+  // On ESP32-S3, PSRAM is automatically initialized by the framework if configured in platformio.ini
+  // On ESP32, we need to call psramInit() explicitly
+  size_t psram_size = 0;
+  size_t psram_free = 0;
+  size_t spiram_total = 0;
+  size_t spiram_free = 0;
+  bool psram_ok = false;
+  
+#ifdef TARGET_LILYGO_TDECK
+  // ESP32-S3: PSRAM is auto-initialized by the framework during boot
+  // Give it a moment to ensure initialization is complete
+  delay(50);
+  
+  // Check heap caps to see what's available
+  spiram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+  spiram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  size_t internal_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+  size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  
+  Serial.printf("Memory diagnostics:\n");
+  Serial.printf("  SPIRAM total: %u bytes, free: %u bytes\n", (unsigned)spiram_total, (unsigned)spiram_free);
+  Serial.printf("  Internal total: %u bytes, free: %u bytes\n", (unsigned)internal_total, (unsigned)internal_free);
+  
+  psram_size = ESP.getPsramSize();
+  psram_free = ESP.getFreePsram();
+  Serial.printf("  ESP.getPsramSize(): %u bytes\n", (unsigned)psram_size);
+  Serial.printf("  ESP.getFreePsram(): %u bytes\n", (unsigned)psram_free);
+  
+  // Check if PSRAM is actually available (SPIRAM heap cap is more reliable on ESP32-S3)
+  psram_ok = (spiram_total > 0) || (psram_size > 0);
+  
+  // Additional check: try to allocate a small amount of PSRAM to verify it works
+  if(psram_ok && spiram_total > 0) {
+    void *test_ptr = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if(test_ptr == nullptr) {
+      Serial.println("PSRAM allocation test failed - heap_caps_malloc returned NULL");
+      psram_ok = false;
+    } else {
+      heap_caps_free(test_ptr);
+      Serial.println("PSRAM allocation test: OK");
+    }
+  }
+  
+  // If ESP.getPsramSize() says 0 but SPIRAM heap exists, use that
+  if(!psram_ok && spiram_total > 0) {
+    Serial.println("PSRAM detected via heap_caps but not via ESP.getPsramSize()");
+    psram_ok = true;
+    // Use heap_caps values as fallback
+    if(psram_size == 0) {
+      psram_size = spiram_total;
+    }
+    if(psram_free == 0) {
+      psram_free = spiram_free;
+    }
+  }
+#else
+  // ESP32: Need to initialize PSRAM explicitly
+  psram_ok = psramInit();
+  psram_size = ESP.getPsramSize();
+  psram_free = ESP.getFreePsram();
+#endif
+  
   Serial.printf("PSRAM init: %s, size=%u bytes, free=%u bytes\n",
                 psram_ok ? "OK" : "FAIL",
-                (unsigned)ESP.getPsramSize(),
-                (unsigned)ESP.getFreePsram());
-  g_psram_available = psram_ok && ESP.getFreePsram() > 0;
-  if(!psram_ok) {
+                (unsigned)psram_size,
+                (unsigned)psram_free);
+  
+  // Determine PSRAM availability - use heap_caps values if ESP.getPsramSize() is unreliable
+#ifdef TARGET_LILYGO_TDECK
+  // For ESP32-S3, prefer heap_caps which is more reliable
+  g_psram_available = psram_ok && (spiram_total > 0 || psram_size > 0) && (spiram_free > 0 || psram_free > 0);
+#else
+  g_psram_available = psram_ok && (psram_size > 0) && (psram_free > 0);
+#endif
+  
+  if(!psram_ok || !g_psram_available) {
     debugPrint("PSRAM init failed; using internal RAM only");
+    Serial.printf("PSRAM diagnostic: psram_ok=%d, size=%u, free=%u, available=%d\n",
+                  psram_ok ? 1 : 0,
+                  (unsigned)psram_size,
+                  (unsigned)psram_free,
+                  g_psram_available ? 1 : 0);
+#ifdef TARGET_LILYGO_TDECK
+    Serial.println("For T-Deck, ensure platformio.ini has:");
+    Serial.println("  board_build.psram_type = opi");
+    Serial.println("  board_build.esp32_psram_size = 8MB");
+    Serial.println("  board_build.psram = enabled");
+#endif
     delay(1500);
   }
 
@@ -9016,6 +9124,48 @@ void setup() {
     g_settings.rom_cache_banks = ROM_CACHE_BANK_LIMIT_NO_PSRAM;
   }
   apply_settings_constraints();
+
+  // CRITICAL: Allocate swap_fb BEFORE framebuffers to avoid heap fragmentation
+  // swap_fb needs 150KB contiguous block, which is harder to get after framebuffers fragment the heap
+#if ENABLE_LCD
+  if(!swap_fb_enabled) {
+    const size_t swap_bytes = DEST_H * DEST_W * sizeof(uint16_t);
+    
+    static constexpr uint32_t swap_caps_priority[] = {
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
+      MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+      MALLOC_CAP_8BIT
+    };
+
+    for(uint32_t cap : swap_caps_priority) {
+      size_t available_before = heap_caps_get_free_size(cap);
+      size_t largest_before = heap_caps_get_largest_free_block(cap);
+      
+      swap_fb = (uint16_t *)heap_caps_malloc(swap_bytes, cap);
+      if(swap_fb != nullptr) {
+        swap_fb_enabled = true;
+        swap_fb_dma_capable = (cap & MALLOC_CAP_DMA) != 0;
+        swap_fb_psram_backed = (cap & MALLOC_CAP_SPIRAM) != 0;
+        memset(swap_fb, 0xFF, swap_bytes);
+        display_cache_valid = false;
+        memset(swap_row_hash, 0, sizeof(swap_row_hash));
+        const char *mem_type = swap_fb_psram_backed ? "PSRAM" : "internal RAM";
+        Serial.printf("Display cache allocated EARLY (%u bytes, caps=0x%X) (%s)\n",
+                      (unsigned)swap_bytes,
+                      (unsigned)cap,
+                      mem_type);
+        break;
+      }
+    }
+    
+    if(!swap_fb_enabled) {
+      Serial.printf("Early swap_fb allocation failed - will retry after framebuffers\n");
+    }
+  }
+#endif
 
   // Init platform-specific front-end (Cardputer or T-Deck).
 #ifdef TARGET_LILYGO_TDECK
@@ -9607,34 +9757,61 @@ void setup() {
 #endif
 
 #if ENABLE_LCD
-  if(g_psram_available) {
-    if(!swap_fb_enabled) {
-  const size_t swap_bytes = DEST_H * DEST_W * sizeof(uint16_t);
-      static constexpr uint32_t swap_caps_psram[] = {
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-      };
+  // Try swap_fb allocation again if early allocation failed (after framebuffers allocated)
+  if(!swap_fb_enabled) {
+    const size_t swap_bytes = DEST_H * DEST_W * sizeof(uint16_t);
+    
+    // Try to allocate swap framebuffer - prefer PSRAM, but fallback to internal RAM if needed
+    // This significantly improves performance even without PSRAM
+    // Note: We relax DMA requirement for fallback as non-DMA memory still provides the caching benefit
+    static constexpr uint32_t swap_caps_priority[] = {
+      // First try PSRAM with DMA (best performance)
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+      // Then try internal RAM - prefer DMA but fallback is OK
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
+      // Try any DMA-capable memory
+      MALLOC_CAP_DMA | MALLOC_CAP_8BIT,
+      // Last resort: any memory (non-DMA but still provides caching benefits)
+      MALLOC_CAP_8BIT
+    };
 
-      swap_fb_psram_backed = false;
+    swap_fb_psram_backed = false;
 
-      auto try_allocate_swap = [&](void) -> bool {
-        for(uint32_t cap : swap_caps_psram) {
-          swap_fb = (uint16_t *)heap_caps_malloc(swap_bytes, cap);
-          if(swap_fb != nullptr) {
-            swap_fb_enabled = true;
-            swap_fb_dma_capable = (cap & MALLOC_CAP_DMA) != 0;
-            swap_fb_psram_backed = true;
-            memset(swap_fb, 0xFF, swap_bytes);
-            display_cache_valid = false;
-            memset(swap_row_hash, 0, sizeof(swap_row_hash));
-            Serial.printf("Display cache allocated (%u bytes, caps=0x%X) (PSRAM)\n",
-                          (unsigned)swap_bytes,
-                          (unsigned)cap);
-            return true;
-          }
+    auto try_allocate_swap = [&](void) -> bool {
+      for(uint32_t cap : swap_caps_priority) {
+        size_t available_before = heap_caps_get_free_size(cap);
+        size_t largest_before = heap_caps_get_largest_free_block(cap);
+        
+        swap_fb = (uint16_t *)heap_caps_malloc(swap_bytes, cap);
+        if(swap_fb != nullptr) {
+          swap_fb_enabled = true;
+          swap_fb_dma_capable = (cap & MALLOC_CAP_DMA) != 0;
+          swap_fb_psram_backed = (cap & MALLOC_CAP_SPIRAM) != 0;
+          memset(swap_fb, 0xFF, swap_bytes);
+          display_cache_valid = false;
+          memset(swap_row_hash, 0, sizeof(swap_row_hash));
+          const char *mem_type = swap_fb_psram_backed ? "PSRAM" : "internal RAM";
+          Serial.printf("Display cache allocated (%u bytes, caps=0x%X) (%s)\n",
+                        (unsigned)swap_bytes,
+                        (unsigned)cap,
+                        mem_type);
+          return true;
+        } else {
+          // Debug: log why allocation failed for this capability
+          Serial.printf("Allocation failed for cap 0x%X: need %u, free=%u, largest=%u\n",
+                        (unsigned)cap,
+                        (unsigned)swap_bytes,
+                        (unsigned)available_before,
+                        (unsigned)largest_before);
         }
-        return false;
-      };
+      }
+      return false;
+    };
+    
+    // Only attempt PSRAM trimming if PSRAM is available
+    if(g_psram_available) {
 
       if(!try_allocate_swap()) {
         bool trimmed = false;
@@ -9676,19 +9853,30 @@ void setup() {
                         (unsigned)priv.rom_cache.bank_count);
         }
       }
+    } else {
+      // PSRAM not available - try internal RAM
+      Serial.printf("Attempting swap_fb allocation (no PSRAM):\n");
+      Serial.printf("  Required: %u bytes (%.1f KB)\n", (unsigned)swap_bytes, swap_bytes / 1024.0f);
+      
+      // Check available memory for each capability type
+      for(size_t i = 0; i < sizeof(swap_caps_priority)/sizeof(swap_caps_priority[0]); ++i) {
+        uint32_t cap = swap_caps_priority[i];
+        size_t free_size = heap_caps_get_free_size(cap);
+        size_t largest_free = heap_caps_get_largest_free_block(cap);
+        Serial.printf("  Cap 0x%X: free=%u (%.1f KB), largest=%u (%.1f KB)\n",
+                      (unsigned)cap,
+                      (unsigned)free_size, free_size / 1024.0f,
+                      (unsigned)largest_free, largest_free / 1024.0f);
+      }
+      
+      if(!try_allocate_swap()) {
+        Serial.println("Display cache allocation failed (tried both PSRAM and internal RAM)");
+        Serial.printf("  Largest available block in internal RAM: %u bytes\n",
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        swap_fb_dma_capable = false;
+        swap_fb_psram_backed = false;
+      }
     }
-  } else {
-    if(swap_fb_enabled && swap_fb != nullptr) {
-      Serial.println("Releasing display cache (PSRAM unavailable)");
-      heap_caps_free(swap_fb);
-      swap_fb = nullptr;
-    }
-    swap_fb_enabled = false;
-    swap_fb_dma_capable = false;
-    swap_fb_psram_backed = false;
-    display_cache_valid = false;
-    memset(swap_row_hash, 0, sizeof(swap_row_hash));
-    Serial.println("Display cache disabled (PSRAM not present)");
   }
 #endif
 

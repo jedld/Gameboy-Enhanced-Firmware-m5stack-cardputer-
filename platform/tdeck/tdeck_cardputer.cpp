@@ -473,7 +473,7 @@ void Keyboard_Class::update() {
         pressed_ = true;
         if(debug_config_.log_decoded_keys) {
           const bool printable = (ch >= 32 && ch <= 126);
-          Serial.printf("[T-Deck][Keyboard] key: ascii 0x%02X", ascii_value);
+          // Serial.printf("[T-Deck][Keyboard] key: ascii 0x%02X", ascii_value);
           if(printable) {
             Serial.printf(" ('%c')", ch);
           }
@@ -538,7 +538,7 @@ void Keyboard_Class::update() {
     if(backspace_active) {
       append_char('\b');
       if(debug_config_.log_decoded_keys) {
-        Serial.println("[T-Deck][Keyboard] key: Backspace (0x08)");
+        // Serial.println("[T-Deck][Keyboard] key: Backspace (0x08)");
       }
     }
 
@@ -572,14 +572,14 @@ void Keyboard_Class::update() {
 
         if(debug_config_.log_decoded_keys) {
           const bool printable = (value >= 32 && value <= 126);
-          Serial.printf("[T-Deck][Keyboard] key: col=%u row=%u -> 0x%02X",
-                        static_cast<unsigned>(col),
-                        static_cast<unsigned>(row),
-                        static_cast<uint8_t>(value));
+          // Serial.printf("[T-Deck][Keyboard] key: col=%u row=%u -> 0x%02X",
+          //               static_cast<unsigned>(col),
+          //               static_cast<unsigned>(row),
+          //               static_cast<uint8_t>(value));
           if(printable) {
-            Serial.printf(" ('%c')", value);
+            // Serial.printf(" ('%c')", value);
           }
-          Serial.printf(" [sym=%d shift=%d alt=%d]\n", symbol_layer, shift_active, alt_active);
+          // Serial.printf(" [sym=%d shift=%d alt=%d]\n", symbol_layer, shift_active, alt_active);
         }
 
         append_char(value);
