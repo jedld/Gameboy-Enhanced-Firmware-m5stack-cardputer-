@@ -422,6 +422,7 @@ struct RomCache {
   char posix_path[MAX_PATH_LEN];
   size_t size;
   const uint8_t *memory_rom;
+  uint8_t *owned_memory;
   size_t memory_size;
   bool use_memory;
   uint8_t *bank0;
@@ -495,6 +496,9 @@ static constexpr uint32_t SAVE_AUTO_FLUSH_INTERVAL_MS = 4000;
 static constexpr uint32_t SAVE_FLUSH_RETRY_DELAY_MS = 1000;
 static constexpr size_t MBC7_EEPROM_WORD_COUNT = 128;
 static constexpr size_t MBC7_EEPROM_RAW_SIZE = MBC7_EEPROM_WORD_COUNT * sizeof(uint16_t);
+#ifdef TARGET_LILYGO_TDECK
+static constexpr size_t PSRAM_ROM_SAFETY_MARGIN = 512 * 1024; // reserve headroom for frame buffers & audio
+#endif
 
 static FirmwareSettings g_settings = {
   true,
@@ -931,7 +935,12 @@ struct PaletteState {
 struct priv_t;
 static void rom_cache_reset(RomCache *cache);
 static bool rom_cache_open(RomCache *cache, const char *path);
-static bool rom_cache_open_memory(RomCache *cache, const uint8_t *data, size_t size);
+static bool rom_cache_open_memory(RomCache *cache,
+                                  const uint8_t *data,
+                                  size_t size,
+                                  bool direct_access = false,
+                                  bool take_ownership = false,
+                                  const char *source_label = "Embedded ROM");
 static inline uint8_t IRAM_ATTR rom_cache_read(RomCache *cache, uint32_t addr);
 static void rom_cache_close(RomCache *cache);
 static uint8_t rom_cache_cgb_flag(const RomCache *cache);
@@ -4238,6 +4247,11 @@ static void extract_rom_title_from_cache(const RomCache *cache, char *out, size_
 }
 
 static void rom_cache_reset(RomCache *cache) {
+  if(cache->owned_memory != nullptr) {
+    heap_caps_free(cache->owned_memory);
+    cache->owned_memory = nullptr;
+  }
+
   size_t bank_count = cache->bank_count;
   if(bank_count == 0 || bank_count > ROM_CACHE_BANK_MAX) {
     bank_count = ROM_CACHE_BANK_MAX;
@@ -4273,6 +4287,7 @@ static void rom_cache_reset(RomCache *cache) {
   cache->posix_path[0] = '\0';
   cache->size = 0;
   cache->memory_rom = nullptr;
+  cache->owned_memory = nullptr;
   cache->memory_size = 0;
   cache->use_memory = false;
   cache->bank_count = bank_count;
@@ -4730,7 +4745,12 @@ static bool rom_cache_open(RomCache *cache, const char *path) {
   return true;
 }
 
-static bool rom_cache_open_memory(RomCache *cache, const uint8_t *data, size_t size) {
+static bool rom_cache_open_memory(RomCache *cache,
+                                  const uint8_t *data,
+                                  size_t size,
+                                  bool direct_access,
+                                  bool take_ownership,
+                                  const char *source_label) {
   if(cache == nullptr || data == nullptr || size == 0) {
     return false;
   }
@@ -4746,10 +4766,11 @@ static bool rom_cache_open_memory(RomCache *cache, const uint8_t *data, size_t s
   cache->probation_count = 0;
   cache->protected_count = 0;
   cache->protected_capacity = 0;
-  cache->use_memory = false; // direct access, bypass rom_cache_read()
+  cache->use_memory = direct_access;
   cache->memory_rom = data;
   cache->memory_size = size;
   cache->size = size;
+  cache->owned_memory = take_ownership ? const_cast<uint8_t *>(data) : nullptr;
   cache->cache_hits = 0;
   cache->cache_misses = 0;
   cache->cache_swaps = 0;
@@ -4757,8 +4778,13 @@ static bool rom_cache_open_memory(RomCache *cache, const uint8_t *data, size_t s
   cache->hot_bank_ptr = nullptr;
   cache->hot_bank_base = 0;
 
-  Serial.printf("Embedded ROM mapped directly (%u bytes)\n", (unsigned)size);
-  Serial.println("ROM cache disabled for embedded source");
+  const char *label = (source_label != nullptr && source_label[0] != '\0') ? source_label : "ROM";
+  Serial.printf("%s mapped directly (%u bytes)\n", label, (unsigned)size);
+  if(direct_access) {
+    Serial.println("ROM cache bypassed (direct memory access)");
+  } else {
+    Serial.println("ROM cache disabled for memory-backed source");
+  }
   Serial.printf("Free PSRAM: %u bytes, Free internal heap: %u bytes\n",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
@@ -5122,7 +5148,7 @@ static bool load_flashed_rom(struct priv_t *priv) {
 
   const uint8_t *rom_ptr = static_cast<const uint8_t *>(mapped_base) + ROM_STORAGE_DATA_OFFSET;
 
-  if(!rom_cache_open_memory(&priv->rom_cache, rom_ptr, header.rom_size)) {
+  if(!rom_cache_open_memory(&priv->rom_cache, rom_ptr, header.rom_size, false, false, "Flashed ROM")) {
     spi_flash_munmap(handle);
     return false;
   }
@@ -5440,6 +5466,90 @@ static FlashPromptAction prompt_flash_rom(size_t rom_size, const char *rom_title
     delay(40);
   }
 }
+
+#ifdef TARGET_LILYGO_TDECK
+static bool pin_rom_to_psram(struct priv_t *priv) {
+  if(priv == nullptr || !priv->sd_rom_path_valid) {
+    return false;
+  }
+
+  if(!g_psram_available) {
+    return false;
+  }
+
+  RomCache *cache = &priv->rom_cache;
+  const size_t rom_size = cache->size;
+  if(rom_size == 0) {
+    return false;
+  }
+
+  const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  const size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if(largest_block < rom_size) {
+    Serial.printf("PSRAM pin skipped: largest block %u < ROM size %u\n",
+                  (unsigned)largest_block,
+                  (unsigned)rom_size);
+    return false;
+  }
+
+  if(free_psram <= rom_size + PSRAM_ROM_SAFETY_MARGIN) {
+    Serial.printf("PSRAM pin skipped: free %u, need %u (+%u margin)\n",
+                  (unsigned)free_psram,
+                  (unsigned)rom_size,
+                  (unsigned)PSRAM_ROM_SAFETY_MARGIN);
+    return false;
+  }
+
+  uint8_t *buffer = static_cast<uint8_t *>(heap_caps_malloc(rom_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if(buffer == nullptr) {
+    Serial.printf("PSRAM pin failed: allocation of %u bytes returned NULL\n",
+                  (unsigned)rom_size);
+    return false;
+  }
+
+  File rom_file = SD.open(priv->sd_rom_path, FILE_READ);
+  if(!rom_file) {
+    heap_caps_free(buffer);
+    Serial.println("PSRAM pin failed: SD open error");
+    return false;
+  }
+
+  size_t copied = 0;
+  const size_t chunk_size = 64 * 1024;
+  while(copied < rom_size) {
+    const size_t remaining = rom_size - copied;
+    const size_t to_read = remaining < chunk_size ? remaining : chunk_size;
+    int read_bytes = rom_file.read(buffer + copied, to_read);
+    if(read_bytes <= 0) {
+      rom_file.close();
+      heap_caps_free(buffer);
+      Serial.println("PSRAM pin failed: SD read error");
+      return false;
+    }
+    copied += static_cast<size_t>(read_bytes);
+  }
+  rom_file.close();
+
+  if(copied != rom_size) {
+    heap_caps_free(buffer);
+    Serial.println("PSRAM pin failed: size mismatch");
+    return false;
+  }
+
+  if(!rom_cache_open_memory(cache, buffer, rom_size, true, true, "PSRAM ROM")) {
+    heap_caps_free(buffer);
+    Serial.println("PSRAM pin failed: cache mapping error");
+    return false;
+  }
+
+  debugPrint("ROM pinned to PSRAM");
+  return true;
+}
+#else
+static bool pin_rom_to_psram(struct priv_t *) {
+  return false;
+}
+#endif
 
 static bool flash_rom_to_storage(struct priv_t *priv, size_t rom_size) {
   if(priv == nullptr || !priv->sd_rom_path_valid) {
@@ -9713,7 +9823,14 @@ void setup() {
         save_state_refresh_metadata(&priv);
 
         bool exit_requested = false;
-        if(priv.rom_is_cgb && rom_size > ROM_FLASH_PROMPT_THRESHOLD && priv.sd_rom_path_valid && rom_storage_get_partition() != nullptr) {
+        bool rom_pinned_to_psram = false;
+#ifdef TARGET_LILYGO_TDECK
+        if(priv.rom_is_cgb && rom_size > ROM_FLASH_PROMPT_THRESHOLD) {
+          rom_pinned_to_psram = pin_rom_to_psram(&priv);
+        }
+#endif
+
+        if(!rom_pinned_to_psram && priv.rom_is_cgb && rom_size > ROM_FLASH_PROMPT_THRESHOLD && priv.sd_rom_path_valid && rom_storage_get_partition() != nullptr) {
           char title_buffer[ROM_STORAGE_TITLE_MAX];
           extract_rom_title_from_cache(&priv.rom_cache, title_buffer, sizeof(title_buffer));
           FlashPromptAction action = prompt_flash_rom(rom_size, title_buffer);
