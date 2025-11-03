@@ -2829,6 +2829,29 @@ static void augment_keys_state(Keyboard_Class::KeysState &status) {
   }
 }
 
+#ifdef TARGET_LILYGO_TDECK
+static void handle_trackball_click(Keyboard_Class::KeysState &status) {
+  // Trackball click is on BOARD_BOOT_PIN (GPIO 0)
+  // When clicked, it goes LOW (since it's configured with INPUT_PULLUP)
+  const bool trackball_clicked = (digitalRead(BOARD_BOOT_PIN) == LOW);
+  
+  // Inject ESC key (0x1B) into keyboard state while trackball is clicked
+  if(trackball_clicked) {
+    const char esc_char = 0x1B;
+    if(!keys_word_contains(status.word, esc_char)) {
+      keys_word_append_unique(status.word, esc_char);
+      // Also add to HID keys array for completeness
+      for(size_t i = 0; i < status.hid_keys.size(); ++i) {
+        if(status.hid_keys[i] == 0) {
+          status.hid_keys[i] = 0x29;  // HID usage ID for Escape
+          break;
+        }
+      }
+    }
+  }
+}
+#endif
+
 static void apply_settings_constraints() {
   const uint8_t min_banks = 1;
   if(g_settings.rom_cache_banks < min_banks) {
@@ -3504,10 +3527,14 @@ static void handle_volume_keys(const Keyboard_Class::KeysState &status) {
     switch(key) {
       case '=':
       case '+':
+      case 'O':
+      case 'o':
         up_pressed = true;
         break;
       case '-':
       case '_':
+      case 'I':
+      case 'i':
         down_pressed = true;
         break;
       default:
@@ -3577,6 +3604,9 @@ static void poll_keyboard() {
   M5Cardputer.update();
   Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
   augment_keys_state(status);
+#ifdef TARGET_LILYGO_TDECK
+  handle_trackball_click(status);
+#endif
   handle_volume_keys(status);
   handle_save_state_shortcuts(status);
   bool consume_screenshot_key = false;
@@ -5314,6 +5344,9 @@ static FlashPromptAction prompt_flash_rom(size_t rom_size, const char *rom_title
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
     augment_keys_state(status);
+#ifdef TARGET_LILYGO_TDECK
+    handle_trackball_click(status);
+#endif
 
     if(keys_state_contains_escape(status)) {
       wait_for_keyboard_release();
@@ -5812,6 +5845,9 @@ static bool palette_capture_boot_combo(size_t *out_index) {
     M5Cardputer.update();
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
     augment_keys_state(status);
+#ifdef TARGET_LILYGO_TDECK
+    handle_trackball_click(status);
+#endif
 
     bool up, right, down, left, button_a, button_b;
     palette_extract_keys(status, up, right, down, left, button_a, button_b);
@@ -7071,6 +7107,9 @@ static void show_keymap_menu() {
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
     augment_keys_state(status);
+#ifdef TARGET_LILYGO_TDECK
+    handle_trackball_click(status);
+#endif
     bool handled = false;
 
     auto bump_selection = [&](int delta) {
@@ -7098,6 +7137,9 @@ static void show_keymap_menu() {
           if(M5Cardputer.Keyboard.isPressed()) {
             Keyboard_Class::KeysState capture = M5Cardputer.Keyboard.keysState();
             augment_keys_state(capture);
+#ifdef TARGET_LILYGO_TDECK
+            handle_trackball_click(capture);
+#endif
             if(capture.enter) {
               wait_for_keyboard_release();
               status_message = "Mapping cancelled";
@@ -7289,6 +7331,9 @@ static void show_options_menu() {
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
     augment_keys_state(status);
+#ifdef TARGET_LILYGO_TDECK
+    handle_trackball_click(status);
+#endif
 
     auto bump_selection = [&](int delta) {
       selection = static_cast<uint8_t>((selection + OPTION_COUNT + delta) % OPTION_COUNT);
@@ -7508,6 +7553,9 @@ static void show_bluetooth_menu() {
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
     augment_keys_state(status);
+#ifdef TARGET_LILYGO_TDECK
+    handle_trackball_click(status);
+#endif
 
     bool handled = false;
 
@@ -7695,6 +7743,9 @@ static void show_home_menu() {
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
     augment_keys_state(status);
+#ifdef TARGET_LILYGO_TDECK
+    handle_trackball_click(status);
+#endif
 
     auto bump_selection = [&](int delta) {
       selection = static_cast<uint8_t>((selection + OPTION_COUNT + delta) % OPTION_COUNT);
@@ -8090,6 +8141,9 @@ char* file_picker() {
       if(M5Cardputer.Keyboard.isPressed()) {
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
         augment_keys_state(status);
+#ifdef TARGET_LILYGO_TDECK
+        handle_trackball_click(status);
+#endif
 
         if(keys_state_contains_escape(status)) {
           esc_pressed = true;
