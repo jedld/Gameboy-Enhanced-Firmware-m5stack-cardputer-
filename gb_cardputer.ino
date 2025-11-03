@@ -321,6 +321,7 @@ static bool swap_fb_dma_capable = false;
 static bool swap_fb_psram_backed = false;
 static bool display_cache_valid = false;
 static bool frame_row_map_initialised = false;
+static bool last_native_1to1_mode = false;
 static uint8_t frame_row_map[DEST_H];
 static uint16_t frame_row_weight[DEST_H];
 static uint32_t swap_row_hash[DEST_H];
@@ -469,6 +470,7 @@ struct FirmwareSettings {
   bool audio_enabled;
   bool cgb_bootstrap_palettes;
   bool stretch_display;
+  bool native_1to1_render;
   uint8_t rom_cache_banks;
   uint8_t master_volume;
   uint8_t frame_skip_mode;
@@ -476,7 +478,7 @@ struct FirmwareSettings {
 };
 
 static constexpr uint8_t DEFAULT_MASTER_VOLUME = 255;
-static constexpr uint8_t SETTINGS_VERSION = 5;
+static constexpr uint8_t SETTINGS_VERSION = 6;
 static constexpr uint8_t VOLUME_STEP = 16;
 static constexpr const char *SETTINGS_DIR = "/config";
 static constexpr const char *SETTINGS_FILE_PATH = "/config/cardputer_settings.ini";
@@ -498,6 +500,7 @@ static FirmwareSettings g_settings = {
   true,
   true,
   true,
+  false,  // native_1to1_render: default to off
   ROM_CACHE_BANK_MAX,
   DEFAULT_MASTER_VOLUME,
   static_cast<uint8_t>(FRAME_SKIP_MODE_AUTO),
@@ -2877,8 +2880,10 @@ static void apply_settings_constraints() {
     g_settings.frame_skip_mode = static_cast<uint8_t>(FRAME_SKIP_MODE_AUTO);
   }
 #ifdef TARGET_LILYGO_TDECK
-  // T-Deck requires stretch mode for proper aspect ratio
-  g_settings.stretch_display = true;
+  // T-Deck: prefer stretch mode for proper aspect ratio, but allow native 1:1
+  if(!g_settings.native_1to1_render) {
+    g_settings.stretch_display = true;
+  }
 #endif
 }
 
@@ -2917,6 +2922,7 @@ static bool save_settings_to_sd() {
   file.printf("audio=%u\n", g_settings.audio_enabled ? 1u : 0u);
   file.printf("bootstrap=%u\n", g_settings.cgb_bootstrap_palettes ? 1u : 0u);
   file.printf("stretch=%u\n", g_settings.stretch_display ? 1u : 0u);
+  file.printf("native=%u\n", g_settings.native_1to1_render ? 1u : 0u);
   file.printf("cache=%u\n", static_cast<unsigned>(g_settings.rom_cache_banks));
   file.printf("volume=%u\n", static_cast<unsigned>(g_settings.master_volume));
   file.printf("frame_skip=%u\n", static_cast<unsigned>(g_settings.frame_skip_mode));
@@ -2983,6 +2989,8 @@ static bool load_settings_from_sd() {
       g_settings.cgb_bootstrap_palettes = (value.toInt() != 0);
     } else if(key == "stretch") {
       g_settings.stretch_display = (value.toInt() != 0);
+    } else if(key == "native") {
+      g_settings.native_1to1_render = (value.toInt() != 0);
     } else if(key == "cache") {
       long banks = value.toInt();
       if(banks >= 1 && banks <= ROM_CACHE_BANK_MAX) {
@@ -3061,8 +3069,8 @@ static bool load_settings_from_sd() {
   apply_settings_constraints();
   
 #ifdef TARGET_LILYGO_TDECK
-  // T-Deck requires stretch mode for proper aspect ratio
-  if(!g_settings.stretch_display) {
+  // T-Deck: prefer stretch mode for proper aspect ratio, but allow native 1:1
+  if(!g_settings.stretch_display && !g_settings.native_1to1_render) {
     g_settings.stretch_display = true;
     upgrade_needed = true;
     Serial.println("Forcing stretch mode for T-Deck");
@@ -6366,7 +6374,17 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
     return;
   }
 
-  const bool stretch = g_settings.stretch_display;
+  // 1:1 native rendering takes precedence over stretch
+  const bool native_1to1 = g_settings.native_1to1_render;
+  const bool stretch = !native_1to1 && g_settings.stretch_display;
+
+  // Re-initialize frame mapping if native mode changed
+  if(native_1to1 != last_native_1to1_mode) {
+    frame_row_map_initialised = false;
+    display_cache_valid = false;
+    memset(swap_row_hash, 0, sizeof(swap_row_hash));
+    last_native_1to1_mode = native_1to1;
+  }
 
   if(stretch != last_stretch_mode) {
     display_cache_valid = false;
@@ -6385,40 +6403,55 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
 #endif
 
   if(!frame_row_map_initialised) {
-    constexpr float scale = static_cast<float>(LCD_HEIGHT) / static_cast<float>(DEST_H);
-    const float max_src = static_cast<float>(LCD_HEIGHT - 1);
-    for(unsigned int j = 0; j < DEST_H; j++) {
-      float src_y = (static_cast<float>(j) + 0.5f) * scale - 0.5f;
-      if(src_y < 0.0f) {
-        src_y = 0.0f;
-      } else if(src_y > max_src) {
-        src_y = max_src;
+    if(native_1to1) {
+      // For 1:1 rendering, direct 1:1 mapping (no scaling)
+      for(unsigned int j = 0; j < LCD_HEIGHT; j++) {
+        frame_row_map[j] = static_cast<uint8_t>(j);
+        frame_row_weight[j] = 0; // No blending needed
       }
-
-      int y0 = static_cast<int>(floorf(src_y));
-      if(y0 < 0) {
-        y0 = 0;
+      // For any remaining rows beyond LCD_HEIGHT, map to last row
+      for(unsigned int j = LCD_HEIGHT; j < DEST_H; j++) {
+        frame_row_map[j] = static_cast<uint8_t>(LCD_HEIGHT - 1);
+        frame_row_weight[j] = 0;
       }
+    } else {
+      constexpr float scale = static_cast<float>(LCD_HEIGHT) / static_cast<float>(DEST_H);
+      const float max_src = static_cast<float>(LCD_HEIGHT - 1);
+      for(unsigned int j = 0; j < DEST_H; j++) {
+        float src_y = (static_cast<float>(j) + 0.5f) * scale - 0.5f;
+        if(src_y < 0.0f) {
+          src_y = 0.0f;
+        } else if(src_y > max_src) {
+          src_y = max_src;
+        }
 
-      float frac = src_y - static_cast<float>(y0);
-      if(y0 >= static_cast<int>(LCD_HEIGHT - 1)) {
-        y0 = LCD_HEIGHT - 1;
-        frac = 0.0f;
+        int y0 = static_cast<int>(floorf(src_y));
+        if(y0 < 0) {
+          y0 = 0;
+        }
+
+        float frac = src_y - static_cast<float>(y0);
+        if(y0 >= static_cast<int>(LCD_HEIGHT - 1)) {
+          y0 = LCD_HEIGHT - 1;
+          frac = 0.0f;
+        }
+
+        uint16_t weight = static_cast<uint16_t>(frac * 256.0f + 0.5f);
+        if(weight > 256) {
+          weight = 256;
+        }
+
+        frame_row_map[j] = static_cast<uint8_t>(y0);
+        frame_row_weight[j] = weight;
       }
-
-      uint16_t weight = static_cast<uint16_t>(frac * 256.0f + 0.5f);
-      if(weight > 256) {
-        weight = 256;
-      }
-
-      frame_row_map[j] = static_cast<uint8_t>(y0);
-      frame_row_weight[j] = weight;
     }
     frame_row_map_initialised = true;
   }
 
-  const uint16_t output_width = stretch ? static_cast<uint16_t>(STRETCH_OUTPUT_W) : LCD_WIDTH;
-  const int32_t x_offset = stretch ? STRETCH_X_OFFSET : DISPLAY_CENTER(0);
+  // For 1:1 native rendering, use exact Game Boy resolution (160x144)
+  const uint16_t output_width = native_1to1 ? LCD_WIDTH : (stretch ? static_cast<uint16_t>(STRETCH_OUTPUT_W) : LCD_WIDTH);
+  const int32_t x_offset = native_1to1 ? display_center_offset : (stretch ? STRETCH_X_OFFSET : DISPLAY_CENTER(0));
+  const int32_t y_offset = native_1to1 ? static_cast<int32_t>((DISPLAY_NATIVE_H - LCD_HEIGHT) / 2) : 0;
   const size_t row_bytes = output_width * sizeof(uint16_t);
   const bool cache_was_valid = display_cache_valid;
   const bool apply_letterbox = stretch && (STRETCH_X_OFFSET > 0);
@@ -6529,6 +6562,104 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
 
   const bool use_full_cache = swap_fb_enabled && swap_fb_psram_backed && swap_fb != nullptr && row_hash != nullptr;
 
+  // Handle 1:1 native rendering (160x144, no scaling)
+  if(native_1to1) {
+    // Clear letterbox areas (top/bottom and sides)
+    if(!cache_was_valid) {
+      M5Cardputer.Display.fillRect(0, 0, DISPLAY_NATIVE_W, y_offset, FALLBACK_COLOUR_RGB565);
+      M5Cardputer.Display.fillRect(0, y_offset + LCD_HEIGHT, DISPLAY_NATIVE_W, DISPLAY_NATIVE_H - (y_offset + LCD_HEIGHT), FALLBACK_COLOUR_RGB565);
+      M5Cardputer.Display.fillRect(0, y_offset, x_offset, LCD_HEIGHT, FALLBACK_COLOUR_RGB565);
+      M5Cardputer.Display.fillRect(x_offset + LCD_WIDTH, y_offset, DISPLAY_NATIVE_W - (x_offset + LCD_WIDTH), LCD_HEIGHT, FALLBACK_COLOUR_RGB565);
+    }
+
+    // Direct 1:1 rendering - no scaling, just copy rows
+    unsigned int segment_rows = 0;
+    unsigned int segment_start = 0;
+    bool any_change = false;
+
+    auto flush_segment_1to1 = [&](unsigned int count) {
+      if(count == 0) {
+        return;
+      }
+      if(!any_change) {
+        M5Cardputer.Display.startWrite();
+        any_change = true;
+      }
+      if(M5Cardputer.Display.dmaBusy()) {
+        M5Cardputer.Display.waitDMA();
+      }
+      const int32_t y = y_offset + segment_start;
+      M5Cardputer.Display.setAddrWindow(x_offset, y, LCD_WIDTH, count);
+      // Always use the buffered segment (already copied from framebuffer)
+      M5Cardputer.Display.writePixelsDMA(fallback_segment_buffer,
+                                         LCD_WIDTH * count,
+                                         true);
+#if ENABLE_PROFILING
+      rows_written += count;
+      segments_flushed++;
+#endif
+      segment_rows = 0;
+    };
+
+    // Render exactly 144 rows (LCD_HEIGHT) at 1:1
+    for(unsigned int j = 0; j < LCD_HEIGHT; j++) {
+      const bool dirty_hint = (row_dirty != nullptr) ? (row_dirty[j] != 0) : true;
+      
+      if(display_cache_valid && row_hash != nullptr && !dirty_hint) {
+        // Check if row actually changed using hash
+        uint32_t expected_hash = row_hash[j];
+        if(expected_hash != 0 && swap_row_hash[j] == expected_hash) {
+          flush_segment_1to1(segment_rows);
+          continue;
+        }
+      }
+
+      // Row needs rendering - direct copy for 1:1
+      const uint16_t *src_row = fb + (j * LCD_WIDTH);
+      if(segment_rows == 0) {
+        segment_start = j;
+      }
+      memcpy(fallback_segment_buffer + (segment_rows * LCD_WIDTH), src_row, LCD_WIDTH * sizeof(uint16_t));
+      
+      // Update hash
+      if(row_hash != nullptr) {
+        swap_row_hash[j] = row_hash[j];
+      } else {
+        // Compute hash if not available
+        uint32_t hash = 2166136261u;
+        for(unsigned int x = 0; x < LCD_WIDTH; ++x) {
+          hash = framebuffer_hash_step(hash, src_row[x]);
+        }
+        swap_row_hash[j] = hash;
+      }
+      
+      segment_rows++;
+      if(segment_rows == FALLBACK_SEGMENT_ROWS) {
+        flush_segment_1to1(segment_rows);
+      }
+    }
+
+    flush_segment_1to1(segment_rows);
+
+    if(any_change) {
+      M5Cardputer.Display.waitDMA();
+      M5Cardputer.Display.endWrite();
+      display_cache_valid = true;
+    }
+
+    if(row_dirty != nullptr) {
+      memset(row_dirty, 0, LCD_HEIGHT * sizeof(uint8_t));
+    }
+
+#if ENABLE_PROFILING
+    profiler_add_render_sample(micros64() - render_start, rows_written, segments_flushed);
+#endif
+
+    mark_last_display_frame(fb);
+    render_status_message_overlay();
+    return;
+  }
+
   if(apply_letterbox && !cache_was_valid) {
     if(STRETCH_X_OFFSET > 0) {
       M5Cardputer.Display.fillRect(0, 0, STRETCH_X_OFFSET, DEST_H, FALLBACK_COLOUR_RGB565);
@@ -6557,7 +6688,8 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
       if(M5Cardputer.Display.dmaBusy()) {
         M5Cardputer.Display.waitDMA();
       }
-      M5Cardputer.Display.setAddrWindow(x_offset, segment_start, output_width, count);
+      const int32_t y = native_1to1 ? (y_offset + segment_start) : segment_start;
+      M5Cardputer.Display.setAddrWindow(x_offset, y, output_width, count);
       M5Cardputer.Display.writePixelsDMA(fallback_segment_buffer,
                                          output_width * count,
                                          true);
@@ -6687,7 +6819,8 @@ void fit_frame(const uint16_t *fb, const uint32_t *row_hash, uint8_t *row_dirty)
     if(M5Cardputer.Display.dmaBusy()) {
       M5Cardputer.Display.waitDMA();
     }
-    M5Cardputer.Display.setAddrWindow(x_offset, start, output_width, count);
+    const int32_t y = native_1to1 ? (y_offset + start) : start;
+    M5Cardputer.Display.setAddrWindow(x_offset, y, output_width, count);
     M5Cardputer.Display.writePixelsDMA(swap_fb + (start * output_width),
                                        output_width * count,
                                        swap_fb_dma_capable);
@@ -7321,16 +7454,17 @@ static void show_options_menu() {
     OPTION_AUDIO = 0,
     OPTION_BOOTSTRAP = 1,
     OPTION_STRETCH = 2,
-    OPTION_CACHE = 3,
-    OPTION_VOLUME = 4,
-    OPTION_FRAME_SKIP = 5,
+    OPTION_NATIVE_1TO1 = 3,
+    OPTION_CACHE = 4,
+    OPTION_VOLUME = 5,
+    OPTION_FRAME_SKIP = 6,
 #if ENABLE_BLUETOOTH_CONTROLLERS
-    OPTION_BLUETOOTH = 6,
+    OPTION_BLUETOOTH = 7,
+    OPTION_KEYMAP = 8,
+    OPTION_DONE = 9,
+#else
     OPTION_KEYMAP = 7,
     OPTION_DONE = 8,
-#else
-    OPTION_KEYMAP = 6,
-    OPTION_DONE = 7,
 #endif
     OPTION_COUNT
   };
@@ -7365,6 +7499,9 @@ static void show_options_menu() {
   draw_option(OPTION_STRETCH,
       "Stretch display",
       g_settings.stretch_display ? "On" : "Off");
+  draw_option(OPTION_NATIVE_1TO1,
+      "1:1 native render",
+      g_settings.native_1to1_render ? "On" : "Off");
   draw_option(OPTION_CACHE, "ROM cache banks", String(g_settings.rom_cache_banks));
   draw_option(OPTION_VOLUME, "Volume", String(g_settings.master_volume));
   draw_option(OPTION_FRAME_SKIP,
@@ -7414,9 +7551,31 @@ static void show_options_menu() {
           break;
         case OPTION_STRETCH:
           g_settings.stretch_display = !g_settings.stretch_display;
+          // Disable native 1:1 when enabling stretch
+          if(g_settings.stretch_display) {
+            g_settings.native_1to1_render = false;
+          }
           settings_changed = true;
           display_cache_valid = false;
           memset(swap_row_hash, 0, sizeof(swap_row_hash));
+          redraw = true;
+          break;
+        case OPTION_NATIVE_1TO1:
+          g_settings.native_1to1_render = !g_settings.native_1to1_render;
+          // Disable stretch when enabling native 1:1
+          if(g_settings.native_1to1_render) {
+            g_settings.stretch_display = false;
+          }
+          settings_changed = true;
+          display_cache_valid = false;
+          memset(swap_row_hash, 0, sizeof(swap_row_hash));
+          // Invalidate all framebuffer rows to force re-render
+          if(priv.framebuffers[0] != nullptr) {
+            memset(priv.framebuffer_row_dirty[0], 1, sizeof(priv.framebuffer_row_dirty[0]));
+          }
+          if(priv.framebuffers[1] != nullptr) {
+            memset(priv.framebuffer_row_dirty[1], 1, sizeof(priv.framebuffer_row_dirty[1]));
+          }
           redraw = true;
           break;
         case OPTION_CACHE:

@@ -432,13 +432,13 @@ void Keyboard_Class::update() {
     }
 
     const bool matrix_changed = !have_last_matrix_ || column_state != last_matrix_;
-    if(debug_config_.log_raw_matrix && matrix_changed) {
-      Serial.print("[T-Deck][Keyboard] matrix:");
-      for(size_t col = 0; col < col_index; ++col) {
-        Serial.printf(" c%u=0x%02X", static_cast<unsigned>(col), column_state[col]);
-      }
-      Serial.println();
-    }
+    // if(debug_config_.log_raw_matrix && matrix_changed) {
+    //   Serial.print("[T-Deck][Keyboard] matrix:");
+    //   for(size_t col = 0; col < col_index; ++col) {
+    //     Serial.printf(" c%u=0x%02X", static_cast<unsigned>(col), column_state[col]);
+    //   }
+    //   Serial.println();
+    // }
 
     last_matrix_ = column_state;
     have_last_matrix_ = true;
@@ -531,9 +531,9 @@ void Keyboard_Class::update() {
 
     if(enter_active) {
       append_char('\n');
-      if(debug_config_.log_decoded_keys) {
-        Serial.println("[T-Deck][Keyboard] key: Enter (0x0A)");
-      }
+      // if(debug_config_.log_decoded_keys) {
+      //   Serial.println("[T-Deck][Keyboard] key: Enter (0x0A)");
+      // }
     }
     if(backspace_active) {
       append_char('\b');
@@ -603,11 +603,11 @@ void Keyboard_Class::update() {
       }
       if(debug_config_.log_decoded_keys) {
         const bool printable = (ch >= 32 && ch <= 126);
-        Serial.printf("[T-Deck][Keyboard] key: passthrough 0x%02X", static_cast<uint8_t>(ch));
-        if(printable) {
-          Serial.printf(" ('%c')", ch);
-        }
-        Serial.println();
+        // Serial.printf("[T-Deck][Keyboard] key: passthrough 0x%02X", static_cast<uint8_t>(ch));
+        // if(printable) {
+        //   Serial.printf(" ('%c')", ch);
+        // }
+        // Serial.println();
       }
       ++index;
     }
@@ -644,7 +644,7 @@ bool Keyboard_Class::isKeyPressed(char key) const {
 
 void Keyboard_Class::setLayout(const tdeck::keyboard::KeyboardLayout &layout) {
   if(layout.columns != kMatrixCols || layout.rows != kMatrixRows) {
-    Serial.println("[T-Deck][Keyboard] Ignoring layout change (dimension mismatch)");
+    // Serial.println("[T-Deck][Keyboard] Ignoring layout change (dimension mismatch)");
     return;
   }
   layout_ = &layout;
