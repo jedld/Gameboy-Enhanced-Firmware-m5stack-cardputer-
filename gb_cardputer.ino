@@ -1187,11 +1187,6 @@ static inline uint16_t rgb888_to_rgb565(uint32_t colour) {
   uint16_t r = (colour >> 16) & 0xFF;
   uint16_t g = (colour >> 8) & 0xFF;
   uint16_t b = colour & 0xFF;
-#ifdef TARGET_LILYGO_TDECK
-  const uint16_t tmp = r;
-  r = b;
-  b = tmp;
-#endif
   return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 
