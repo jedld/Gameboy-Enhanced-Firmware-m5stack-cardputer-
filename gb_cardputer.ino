@@ -259,10 +259,19 @@ static constexpr int32_t STRETCH_X_OFFSET = 0;
 static constexpr size_t DEST_W = DISPLAY_NATIVE_W;
 static constexpr size_t DEST_H = DISPLAY_NATIVE_H;
 
+#ifdef TARGET_LILYGO_TDECK
+// T-Deck panels show pronounced tearing with alternating interlaced fields.
+static constexpr bool kPlatformSupportsInterlace = false;
+#else
+static constexpr bool kPlatformSupportsInterlace = true;
+#endif
+
 static_assert(STRETCH_OUTPUT_W <= DEST_W, "Stretch width must not exceed display width");
 
 static constexpr uint32_t RENDER_TASK_STACK_SIZE = 2048;
 static constexpr uint32_t AUDIO_TASK_STACK_SIZE = 2048;
+static constexpr uint32_t RENDER_TASK_IDLE_FRAME_INTERVAL = 8;
+static constexpr TickType_t RENDER_TASK_IDLE_DELAY_TICKS = pdMS_TO_TICKS(1);
 
 #define DEBUG_DELAY 0
 
@@ -739,7 +748,10 @@ static inline void updateAdaptiveFrameSkip(struct gb_s *gb, bool over_budget) {
                           (state.frames_since_toggle >= state.minimum_active_frames);
 
   AdaptiveInterlaceState &interlace = g_interlace_state;
-  const bool allow_interlace = (gb->cgb.enabled != 0) && swap_fb_enabled && swap_fb_psram_backed;
+  const bool allow_interlace = kPlatformSupportsInterlace &&
+                               (gb->cgb.enabled != 0) &&
+                               swap_fb_enabled &&
+                               swap_fb_psram_backed;
 
   if(allow_interlace) {
     if(over_budget) {
@@ -6703,6 +6715,7 @@ void draw_frame(const uint16_t *fb) {
 static void renderTask(void *param) {
   (void)param;
   uint8_t index = 0;
+  uint32_t frames_since_idle = 0;
   while(true) {
     if(priv.frame_queue != nullptr &&
        xQueueReceive(priv.frame_queue, &index, portMAX_DELAY) == pdTRUE) {
@@ -6714,6 +6727,15 @@ static void renderTask(void *param) {
       if(priv.frame_buffer_free[index] != nullptr) {
         xSemaphoreGive(priv.frame_buffer_free[index]);
       }
+
+      frames_since_idle++;
+      if(frames_since_idle >= RENDER_TASK_IDLE_FRAME_INTERVAL) {
+        frames_since_idle = 0;
+        // Allow the idle task to run periodically so it can feed the watchdog.
+        vTaskDelay(RENDER_TASK_IDLE_DELAY_TICKS);
+      }
+    } else {
+      vTaskDelay(RENDER_TASK_IDLE_DELAY_TICKS);
     }
   }
 }
