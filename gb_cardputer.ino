@@ -1289,7 +1289,7 @@ static void render_storage_mode_screen(bool usb_connected) {
   text += "\nConnect a PC to manage the SD card.\n";
   text += "Eject safely on the host before leaving.\n";
 #ifdef TARGET_LILYGO_TDECK
-  text += "\nPress the trackball to exit storage mode.";
+  text += "\nPress Backspace to exit storage mode.";
 #else
   text += "\nPress ESC to exit storage mode.";
 #endif
@@ -3194,17 +3194,17 @@ static void augment_keys_state(Keyboard_Class::KeysState &status) {
 }
 
 #ifdef TARGET_LILYGO_TDECK
+static inline bool trackball_is_clicked() {
+  // Trackball click (BOOT) pulls the line low when pressed.
+  return digitalRead(BOARD_BOOT_PIN) == LOW;
+}
+
 static void handle_trackball_click(Keyboard_Class::KeysState &status) {
-  // Trackball click is on BOARD_BOOT_PIN (GPIO 0)
-  // When clicked, it goes LOW (since it's configured with INPUT_PULLUP)
-  const bool trackball_clicked = (digitalRead(BOARD_BOOT_PIN) == LOW);
-  
-  // Inject ESC key (0x1B) into keyboard state while trackball is clicked
-  if(trackball_clicked) {
+  if(trackball_is_clicked()) {
     const char esc_char = 0x1B;
     if(!keys_word_contains(status.word, esc_char)) {
       keys_word_append_unique(status.word, esc_char);
-      // Also add to HID keys array for completeness
+      // Populate HID array as well so higher-level code sees a virtual ESC.
       for(size_t i = 0; i < status.hid_keys.size(); ++i) {
         if(status.hid_keys[i] == 0) {
           status.hid_keys[i] = 0x29;  // HID usage ID for Escape
@@ -5718,7 +5718,11 @@ static FlashPromptAction prompt_flash_rom(size_t rom_size, const char *rom_title
       if(help_y + help_line_height + 4 < dispH) {
         M5Cardputer.Display.setTextColor(M5Cardputer.Display.color565(150, 150, 150), background_colour);
         M5Cardputer.Display.setCursor(6, help_y);
+#ifdef TARGET_LILYGO_TDECK
+        M5Cardputer.Display.print("Enter=Select  Backspace=Back  W/S=Move");
+#else
         M5Cardputer.Display.print("Enter=Select  Esc=Back  W/S=Move");
+#endif
         help_y += help_line_height + 4;
       }
 
@@ -7642,6 +7646,10 @@ static bool is_escape_key_char(char key) {
     case '`':   // Cardputer ESC key reports backtick when unshifted
     case '~':   // Shifted variant of the same key
       return true;
+#ifdef TARGET_LILYGO_TDECK
+    case '\b': // Treat Backspace as Escape on T-Deck
+      return true;
+#endif
     default:
       return false;
   }
@@ -7659,6 +7667,11 @@ static bool keys_state_contains_escape(const Keyboard_Class::KeysState &status) 
       return true;
     }
   }
+#ifdef TARGET_LILYGO_TDECK
+  if(trackball_is_clicked()) {
+    return true;
+  }
+#endif
   return false;
 }
 
@@ -7987,7 +8000,11 @@ static void show_options_menu() {
       draw_option(OPTION_DONE, "Back", "");
 
   set_font_size(200);
+#ifdef TARGET_LILYGO_TDECK
+  M5Cardputer.Display.println("J/S=Down  K/W=Up  Backspace=Back");
+#else
   M5Cardputer.Display.println("J/S=Down  K/W=Up  ESC=Back");
+#endif
   M5Cardputer.Display.println("L/ENTER=Next  H=Prev  (cache/frame skip)");
     }
 
@@ -8238,8 +8255,12 @@ static void show_bluetooth_menu() {
         M5Cardputer.Display.println(line);
       }
 
-      M5Cardputer.Display.println();
-      M5Cardputer.Display.println("ESC=Back  L=Select  H=Prev");
+  M5Cardputer.Display.println();
+#ifdef TARGET_LILYGO_TDECK
+  M5Cardputer.Display.println("Backspace=Back  L=Select  H=Prev");
+#else
+  M5Cardputer.Display.println("ESC=Back  L=Select  H=Prev");
+#endif
     }
 
     M5Cardputer.update();
