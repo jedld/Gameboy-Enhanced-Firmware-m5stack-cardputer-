@@ -81,6 +81,15 @@
 #include "mbc7_cardputer.h"
 #include "embedded_rom.h"
 
+#if defined(CONFIG_TINYUSB_ENABLED) && CONFIG_TINYUSB_ENABLED && \
+  defined(CONFIG_TINYUSB_MSC_ENABLED) && CONFIG_TINYUSB_MSC_ENABLED
+#define STORAGE_MODE_SUPPORTED 1
+#include "USB.h"
+#include "USBMSC.h"
+#else
+#define STORAGE_MODE_SUPPORTED 0
+#endif
+
 struct PaletteState;
 
 static constexpr const char *FIRMWARE_NAME = "m5gbcemu";
@@ -243,6 +252,16 @@ struct CacheRecoveryState {
 };
 
 static CacheRecoveryState g_cache_recovery = {false, 0, 0};
+
+#if STORAGE_MODE_SUPPORTED
+static USBMSC g_usb_msc;
+static bool g_usb_stack_started = false;
+static bool g_storage_mode_active = false;
+static volatile bool g_storage_mode_stop_requested = false;
+static uint32_t g_storage_block_size = 512;
+static uint32_t g_storage_block_count = 0;
+static uint8_t *g_storage_sector_buffer = nullptr;
+#endif
 
 #ifdef TARGET_LILYGO_TDECK
 static constexpr size_t DISPLAY_NATIVE_W = 320;
@@ -654,6 +673,7 @@ static bool keys_state_contains_escape(const Keyboard_Class::KeysState &status);
 static void handle_volume_keys(const Keyboard_Class::KeysState &status);
 static void adjust_master_volume(int delta, bool persist, bool announce);
 static void configure_performance_profile();
+static inline uint16_t rgb888_to_rgb565(uint32_t colour);
 static const char *save_state_slot_label(size_t index);
 static void save_state_free_slot(SaveStateSlot &slot);
 static void save_state_clear_all(struct priv_t *priv);
@@ -669,6 +689,10 @@ static bool handle_save_state_shortcuts(const Keyboard_Class::KeysState &status)
 static void gb_printer_serial_tx(struct gb_s *gb, const uint8_t tx);
 static void request_cache_recovery(bool restore_display, size_t desired_rom_banks);
 static void process_cache_recovery();
+static void augment_keys_state(Keyboard_Class::KeysState &status);
+#ifdef TARGET_LILYGO_TDECK
+static void handle_trackball_click(Keyboard_Class::KeysState &status);
+#endif
 
 #if ENABLE_SOUND
 static void apply_speaker_volume();
@@ -976,6 +1000,7 @@ static void wait_for_keyboard_release();
 static void show_home_menu();
 static void show_boot_splash();
 static void show_options_menu();
+static void show_storage_mode_dialog();
 static void show_boot_splash();
 static void show_keymap_menu();
 static void render_home_menu(uint8_t selection);
@@ -1135,6 +1160,322 @@ static void draw_text_block(const String &text,
   }
   M5Cardputer.Display.endWrite();
 }
+
+#if STORAGE_MODE_SUPPORTED
+static int32_t storage_mode_read_cb(uint32_t lba,
+                                    uint32_t offset,
+                                    void *buffer,
+                                    uint32_t bufsize);
+static int32_t storage_mode_write_cb(uint32_t lba,
+                                     uint32_t offset,
+                                     uint8_t *buffer,
+                                     uint32_t bufsize);
+static bool storage_mode_start_stop_cb(uint8_t power_condition, bool start, bool load_eject);
+
+static bool start_storage_mode() {
+  if(!g_sd_mounted && !ensure_sd_card(true)) {
+    Serial.println("Storage mode: SD mount failed");
+    return false;
+  }
+
+  size_t raw_block_count = SD.numSectors();
+  size_t raw_block_size = SD.sectorSize();
+  if(raw_block_count == 0) {
+    Serial.println("Storage mode: no sectors reported by SD");
+    return false;
+  }
+  if(raw_block_size == 0) {
+    raw_block_size = 512;
+  }
+
+  if(g_storage_sector_buffer != nullptr) {
+    heap_caps_free(g_storage_sector_buffer);
+    g_storage_sector_buffer = nullptr;
+  }
+
+  g_storage_sector_buffer = (uint8_t *)heap_caps_malloc(raw_block_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if(g_storage_sector_buffer == nullptr) {
+    g_storage_sector_buffer = (uint8_t *)heap_caps_malloc(raw_block_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  if(g_storage_sector_buffer == nullptr) {
+    Serial.println("Storage mode: sector buffer allocation failed");
+    return false;
+  }
+
+  g_storage_block_size = static_cast<uint32_t>(raw_block_size);
+  g_storage_block_count = static_cast<uint32_t>(raw_block_count);
+  g_storage_mode_stop_requested = false;
+
+  g_usb_msc.onStartStop(storage_mode_start_stop_cb);
+  g_usb_msc.onRead(storage_mode_read_cb);
+  g_usb_msc.onWrite(storage_mode_write_cb);
+  g_usb_msc.vendorID("M5Stack");
+  g_usb_msc.productID("Cardputer SD");
+  g_usb_msc.productRevision("1.0");
+  g_usb_msc.mediaPresent(true);
+
+  if(!g_usb_msc.begin(g_storage_block_count, g_storage_block_size)) {
+    Serial.println("Storage mode: MSC begin failed");
+    heap_caps_free(g_storage_sector_buffer);
+    g_storage_sector_buffer = nullptr;
+    return false;
+  }
+
+  if(!g_usb_stack_started) {
+    USB.productName("Cardputer Storage");
+    USB.manufacturerName("M5Stack");
+    USB.serialNumber("__MAC__");
+  }
+
+  if(!USB.begin()) {
+    Serial.println("Storage mode: USB begin failed");
+    g_usb_msc.end();
+    heap_caps_free(g_storage_sector_buffer);
+    g_storage_sector_buffer = nullptr;
+    return false;
+  }
+
+  g_usb_stack_started = true;
+  g_storage_mode_active = true;
+  Serial.printf("Storage mode: ready (block_size=%u, blocks=%u)\n",
+                static_cast<unsigned>(g_storage_block_size),
+                static_cast<unsigned>(g_storage_block_count));
+  return true;
+}
+
+static void stop_storage_mode() {
+  if(!g_storage_mode_active) {
+    return;
+  }
+
+  Serial.println("Storage mode: shutting down");
+  g_usb_msc.mediaPresent(false);
+  g_usb_msc.end();
+  if(g_storage_sector_buffer != nullptr) {
+    heap_caps_free(g_storage_sector_buffer);
+    g_storage_sector_buffer = nullptr;
+  }
+  g_storage_mode_active = false;
+  g_storage_mode_stop_requested = false;
+  g_storage_block_size = 512;
+  g_storage_block_count = 0;
+}
+
+static void render_storage_mode_screen(bool usb_connected) {
+  const uint16_t bg = rgb888_to_rgb565(0x101010);
+  String text;
+  text.reserve(256);
+  text += "USB storage mode\n\n";
+  text += "Status: ";
+  text += usb_connected ? "Connected" : "Waiting for host";
+  text += "\n";
+
+  uint64_t capacity_bytes = static_cast<uint64_t>(g_storage_block_size) *
+                             static_cast<uint64_t>(g_storage_block_count);
+  char line[64];
+  if(capacity_bytes >= (1ULL << 30)) {
+    const double capacity_gib = capacity_bytes / (1024.0 * 1024.0 * 1024.0);
+    snprintf(line, sizeof(line), "Capacity: %.2f GiB\n", capacity_gib);
+  } else {
+    const double capacity_mib = capacity_bytes / (1024.0 * 1024.0);
+    snprintf(line, sizeof(line), "Capacity: %.2f MiB\n", capacity_mib);
+  }
+  text += line;
+  snprintf(line,
+           sizeof(line),
+           "Block size: %u bytes\n",
+           static_cast<unsigned>(g_storage_block_size));
+  text += line;
+  text += "\nConnect a PC to manage the SD card.\n";
+  text += "Eject safely on the host before leaving.\n";
+#ifdef TARGET_LILYGO_TDECK
+  text += "\nPress the trackball to exit storage mode.";
+#else
+  text += "\nPress ESC to exit storage mode.";
+#endif
+
+  draw_text_block(text, 1, 0xFFFF, bg);
+}
+
+static bool storage_mode_start_stop_cb(uint8_t power_condition, bool start, bool load_eject) {
+  (void)power_condition;
+  if(!start && load_eject) {
+    g_storage_mode_stop_requested = true;
+  }
+  return true;
+}
+
+static int32_t storage_mode_read_cb(uint32_t lba,
+                                    uint32_t offset,
+                                    void *buffer,
+                                    uint32_t bufsize) {
+  if(g_storage_sector_buffer == nullptr || buffer == nullptr) {
+    return -1;
+  }
+
+  uint8_t *dst = static_cast<uint8_t *>(buffer);
+  uint32_t total = 0;
+  uint32_t sector = lba;
+  uint32_t offset_in_sector = offset;
+
+  while(total < bufsize && sector < g_storage_block_count) {
+    const uint32_t remaining = bufsize - total;
+    if(offset_in_sector == 0 && remaining >= g_storage_block_size) {
+      if(!SD.readRAW(dst + total, sector)) {
+        Serial.println("Storage mode: readRAW failed");
+        return -1;
+      }
+      total += g_storage_block_size;
+      sector++;
+    } else {
+      if(!SD.readRAW(g_storage_sector_buffer, sector)) {
+        Serial.println("Storage mode: readRAW (partial) failed");
+        return -1;
+      }
+      const uint32_t chunk = std::min<uint32_t>(g_storage_block_size - offset_in_sector, remaining);
+      memcpy(dst + total, g_storage_sector_buffer + offset_in_sector, chunk);
+      total += chunk;
+      offset_in_sector += chunk;
+      if(offset_in_sector >= g_storage_block_size) {
+        offset_in_sector = 0;
+        sector++;
+      }
+    }
+  }
+
+  return static_cast<int32_t>(total);
+}
+
+static int32_t storage_mode_write_cb(uint32_t lba,
+                                     uint32_t offset,
+                                     uint8_t *buffer,
+                                     uint32_t bufsize) {
+  if(g_storage_sector_buffer == nullptr || buffer == nullptr) {
+    return -1;
+  }
+
+  uint32_t total = 0;
+  uint32_t sector = lba;
+  uint32_t offset_in_sector = offset;
+
+  while(total < bufsize && sector < g_storage_block_count) {
+    const uint32_t remaining = bufsize - total;
+    if(offset_in_sector == 0 && remaining >= g_storage_block_size) {
+      if(!SD.writeRAW(buffer + total, sector)) {
+        Serial.println("Storage mode: writeRAW failed");
+        return -1;
+      }
+      total += g_storage_block_size;
+      sector++;
+    } else {
+      if(!SD.readRAW(g_storage_sector_buffer, sector)) {
+        Serial.println("Storage mode: pre-read for partial write failed");
+        return -1;
+      }
+      const uint32_t chunk = std::min<uint32_t>(g_storage_block_size - offset_in_sector, remaining);
+      memcpy(g_storage_sector_buffer + offset_in_sector, buffer + total, chunk);
+      if(!SD.writeRAW(g_storage_sector_buffer, sector)) {
+        Serial.println("Storage mode: writeRAW (partial) failed");
+        return -1;
+      }
+      total += chunk;
+      offset_in_sector += chunk;
+      if(offset_in_sector >= g_storage_block_size) {
+        offset_in_sector = 0;
+        sector++;
+      }
+    }
+  }
+
+  return static_cast<int32_t>(total);
+}
+
+static void show_storage_mode_dialog() {
+  wait_for_keyboard_release();
+
+  if(!g_sd_mounted && !ensure_sd_card(true)) {
+    const uint16_t bg = rgb888_to_rgb565(0x101010);
+    draw_text_block("Storage mode needs the SD card.\nInsert a card and try again.", 1, 0xFFFF, bg);
+    delay(1600);
+    return;
+  }
+
+  const uint16_t bg = rgb888_to_rgb565(0x101010);
+  draw_text_block("Preparing USB storage mode...", 1, 0xFFFF, bg);
+
+  if(!start_storage_mode()) {
+    draw_text_block("Unable to start storage mode.\nCheck SD card and USB settings.", 1, 0xFFFF, bg);
+    delay(2000);
+    return;
+  }
+
+  bool last_connected = USB;
+  uint32_t last_render_ms = 0;
+  render_storage_mode_screen(last_connected);
+  last_render_ms = millis();
+
+  bool exit_requested = false;
+  while(!exit_requested) {
+    M5Cardputer.update();
+
+    Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    augment_keys_state(status);
+#ifdef TARGET_LILYGO_TDECK
+    handle_trackball_click(status);
+#endif
+    if(keys_state_contains_escape(status)) {
+      exit_requested = true;
+    }
+
+    if(g_storage_mode_stop_requested) {
+      exit_requested = true;
+    }
+
+    const bool connected = USB;
+    const uint32_t now = millis();
+    if(connected != last_connected || (now - last_render_ms) >= 1000) {
+      render_storage_mode_screen(connected);
+      last_connected = connected;
+      last_render_ms = now;
+    }
+
+    if(!exit_requested) {
+      delay(50);
+    }
+  }
+
+  const bool host_requested_stop = g_storage_mode_stop_requested;
+  wait_for_keyboard_release();
+  stop_storage_mode();
+
+  if(host_requested_stop) {
+    draw_text_block("Host ejected storage.\nRemounting SD card...", 1, 0xFFFF, bg);
+  } else {
+    draw_text_block("Exiting storage mode...\nRemounting SD card...", 1, 0xFFFF, bg);
+  }
+
+  SD.end();
+  g_sd_mounted = false;
+
+  if(ensure_sd_card(true)) {
+    rom_storage_refresh_metadata();
+    draw_text_block("SD card ready.", 1, 0xFFFF, bg);
+    delay(700);
+  } else {
+    draw_text_block("SD card remount failed.\nReconnect the card.", 1, 0xFFFF, bg);
+    delay(2000);
+  }
+
+  wait_for_keyboard_release();
+}
+
+#else
+static void show_storage_mode_dialog() {
+  const uint16_t bg = rgb888_to_rgb565(0x101010);
+  draw_text_block("Storage mode is unavailable.\nRebuild with TinyUSB MSC enabled.", 1, 0xFFFF, bg);
+  delay(2000);
+}
+#endif
 
 // Prints debug info to the display.
 void debugPrint(const char* str) {
@@ -3736,6 +4077,12 @@ static void wait_for_keyboard_release() {
     M5Cardputer.update();
     delay(30);
   }
+#ifdef TARGET_LILYGO_TDECK
+  while(digitalRead(BOARD_BOOT_PIN) == LOW) {
+    M5Cardputer.update();
+    delay(30);
+  }
+#endif
 }
 
 static inline size_t rom_source_size(const struct priv_t *priv) {
@@ -7285,6 +7632,7 @@ void set_font_size(int size) {
   if(textsize <= 0) {
     textsize = 1;
   }
+  M5Cardputer.Display.setTextFont(1);
   M5Cardputer.Display.setTextSize(textsize);
 }
 
@@ -7569,22 +7917,22 @@ static void show_options_menu() {
   }
 
   enum Option : uint8_t {
-    OPTION_AUDIO = 0,
-    OPTION_BOOTSTRAP = 1,
-    OPTION_STRETCH = 2,
-    OPTION_NATIVE_1TO1 = 3,
-    OPTION_CACHE = 4,
-    OPTION_VOLUME = 5,
-    OPTION_FRAME_SKIP = 6,
+  OPTION_AUDIO = 0,
+  OPTION_BOOTSTRAP,
+  OPTION_STRETCH,
+  OPTION_NATIVE_1TO1,
+  OPTION_CACHE,
+  OPTION_VOLUME,
+  OPTION_FRAME_SKIP,
 #if ENABLE_BLUETOOTH_CONTROLLERS
-    OPTION_BLUETOOTH = 7,
-    OPTION_KEYMAP = 8,
-    OPTION_DONE = 9,
-#else
-    OPTION_KEYMAP = 7,
-    OPTION_DONE = 8,
+  OPTION_BLUETOOTH,
 #endif
-    OPTION_COUNT
+  OPTION_KEYMAP,
+#if STORAGE_MODE_SUPPORTED
+  OPTION_STORAGE_MODE,
+#endif
+  OPTION_DONE,
+  OPTION_COUNT
   };
 
   uint8_t selection = OPTION_AUDIO;
@@ -7631,6 +7979,11 @@ static void show_options_menu() {
       BluetoothManager::instance().isReady() ? "" : "(off)" );
 #endif
       draw_option(OPTION_KEYMAP, "Configure buttons", "");
+#if STORAGE_MODE_SUPPORTED
+  draw_option(OPTION_STORAGE_MODE,
+      "USB storage mode",
+      g_storage_mode_active ? "(active)" : "");
+#endif
       draw_option(OPTION_DONE, "Back", "");
 
   set_font_size(200);
@@ -7732,6 +8085,13 @@ static void show_options_menu() {
           show_keymap_menu();
           redraw = true;
           break;
+#if STORAGE_MODE_SUPPORTED
+        case OPTION_STORAGE_MODE:
+          wait_for_keyboard_release();
+          show_storage_mode_dialog();
+          redraw = true;
+          break;
+#endif
         case OPTION_DONE:
           wait_for_keyboard_release();
           done = true;
@@ -8047,8 +8407,8 @@ static void render_home_menu(uint8_t selection) {
   menu += "  Esc opens in-game menu\n";
 
   const uint16_t menu_bg = rgb888_to_rgb565(0x101010);
-  Serial.printf("render_home_menu: colours fg=0x%04X bg=0x%04X\n", 0xFFFF, menu_bg);
-  Serial.println("render_home_menu content:\n" + menu);
+  // Serial.printf("render_home_menu: colours fg=0x%04X bg=0x%04X\n", 0xFFFF, menu_bg);
+  // Serial.println("render_home_menu content:\n" + menu);
   M5Cardputer.Display.startWrite();
   M5Cardputer.Display.fillScreen(menu_bg);
   M5Cardputer.Display.endWrite();
