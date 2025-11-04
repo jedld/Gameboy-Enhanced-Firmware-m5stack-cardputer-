@@ -9420,6 +9420,176 @@ static void audioTeardown() {
   }
 }
 
+static bool audio_configure_for_rate(uint32_t sample_rate,
+                                     uint32_t requested_rate) {
+  audioCoreInit(sample_rate);
+
+  auto base_cfg = M5Cardputer.Speaker.config();
+  auto cfg = base_cfg;
+  cfg.sample_rate = sample_rate;
+  cfg.stereo = true;
+  audio_set_sample_rate(sample_rate);
+  Serial.printf("audioSetup: attempting sample rate %u Hz (requested=%u, psram=%s)\n",
+                (unsigned)sample_rate,
+                (unsigned)requested_rate,
+                g_psram_available ? "yes" : "no");
+
+  size_t dma_len = audio_samples_per_buffer();
+  if(dma_len > 1024) {
+    dma_len = 1024;
+  }
+  if(!g_psram_available && dma_len > 512) {
+    dma_len = 512;
+    cfg.dma_buf_count = 4;
+  }
+  dma_len &= ~1u;
+  cfg.dma_buf_len = dma_len;
+  if(g_psram_available) {
+    cfg.dma_buf_count = 12;
+  }
+
+#ifdef TARGET_LILYGO_TDECK
+  const size_t orig_dma_len = cfg.dma_buf_len;
+  const size_t orig_dma_count = cfg.dma_buf_count;
+  constexpr size_t kTDeckMaxDmaLen = 512;
+  constexpr size_t kTDeckMaxDmaCount = 8;
+  if(cfg.dma_buf_len > kTDeckMaxDmaLen) {
+    cfg.dma_buf_len = kTDeckMaxDmaLen;
+  }
+  if(cfg.dma_buf_count > kTDeckMaxDmaCount) {
+    cfg.dma_buf_count = kTDeckMaxDmaCount;
+  }
+  if(orig_dma_len != cfg.dma_buf_len || orig_dma_count != cfg.dma_buf_count) {
+    Serial.printf("audioSetup: T-Deck DMA clamp len %u->%u count %u->%u\n",
+                  (unsigned)orig_dma_len,
+                  (unsigned)cfg.dma_buf_len,
+                  (unsigned)orig_dma_count,
+                  (unsigned)cfg.dma_buf_count);
+  }
+#endif
+
+#ifdef TARGET_LILYGO_TDECK
+  cfg.pin_data_out = BOARD_I2S_DOUT;
+  cfg.pin_bck = BOARD_I2S_BCK;
+  cfg.pin_ws = BOARD_I2S_WS;
+  cfg.i2s_port = I2S_NUM_0;
+#else
+  cfg.magnification = 8;
+  cfg.task_priority = tskIDLE_PRIORITY + 4;
+  cfg.task_pinned_core = 0;
+  cfg.use_dac = false;
+  cfg.pin_data_out = 42;
+  cfg.pin_bck = 41;
+  cfg.pin_ws = 43;
+  cfg.pin_mck = -1;
+#endif
+
+  M5Cardputer.Speaker.end();
+  M5Cardputer.Speaker.config(cfg);
+  audio_initialised = M5Cardputer.Speaker.begin();
+  Serial.printf(
+#ifdef TARGET_LILYGO_TDECK
+                "Speaker.begin (stereo) data_out=%d bck=%d ws=%d -> %s\n",
+#else
+                "Speaker.begin (stereo) data_out=%d bck=%d ws=%d mck=%d -> %s\n",
+#endif
+                cfg.pin_data_out,
+                cfg.pin_bck,
+                cfg.pin_ws,
+#ifdef TARGET_LILYGO_TDECK
+                audio_initialised ? "OK" : "FAIL"
+#else
+                cfg.pin_mck,
+                audio_initialised ? "OK" : "FAIL"
+#endif
+                );
+
+  if(!audio_initialised) {
+#ifdef TARGET_LILYGO_TDECK
+    cfg.stereo = false;
+#else
+    cfg.pin_data_out = 42;
+    cfg.stereo = false;
+#endif
+    M5Cardputer.Speaker.end();
+    M5Cardputer.Speaker.config(cfg);
+    audio_initialised = M5Cardputer.Speaker.begin();
+    Serial.printf(
+#ifdef TARGET_LILYGO_TDECK
+                  "Speaker.begin retry mono data_out=%d bck=%d ws=%d -> %s\n",
+#else
+                  "Speaker.begin retry mono data_out=%d bck=%d ws=%d mck=%d -> %s\n",
+#endif
+                  cfg.pin_data_out,
+                  cfg.pin_bck,
+                  cfg.pin_ws,
+#ifdef TARGET_LILYGO_TDECK
+                  audio_initialised ? "OK" : "FAIL"
+#else
+                  cfg.pin_mck,
+                  audio_initialised ? "OK" : "FAIL"
+#endif
+                  );
+  }
+
+  if(!audio_initialised) {
+    Serial.println("Speaker.begin() failed; restoring default config");
+    M5Cardputer.Speaker.config(base_cfg);
+    return false;
+  }
+
+  const uint32_t actual_sample_rate = M5Cardputer.Speaker.config().sample_rate;
+  if(actual_sample_rate != audio_get_sample_rate()) {
+    Serial.printf("audioSetup: speaker adjusted sample rate %u -> %u\n",
+                  (unsigned)audio_get_sample_rate(),
+                  (unsigned)actual_sample_rate);
+    audio_set_sample_rate(actual_sample_rate);
+  }
+
+  const size_t interleaved_samples = audio_samples_per_buffer();
+  const size_t buffer_bytes = interleaved_samples * sizeof(int16_t);
+  const size_t required_total = buffer_bytes * AUDIO_BUFFER_COUNT;
+  bool buffer_ok = true;
+  Serial.printf("Audio memory (before alloc): internal DMA=%u bytes, psram DMA=%u bytes\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+  for(size_t i = 0; i < AUDIO_BUFFER_COUNT; ++i) {
+    audio_buffers[i] = audio_alloc_dma_buffer(buffer_bytes);
+    if(audio_buffers[i] == nullptr) {
+      buffer_ok = false;
+      break;
+    }
+    memset(audio_buffers[i], 0, buffer_bytes);
+    audio_buffer_state[i] = 0;
+  }
+
+  if(!buffer_ok) {
+    Serial.printf("Audio buffer allocation failed (wanted %u bytes); releasing resources\n",
+                  (unsigned)required_total);
+    audio_reset_buffers();
+    M5Cardputer.Speaker.end();
+    M5Cardputer.Speaker.config(base_cfg);
+    audio_initialised = false;
+    return false;
+  }
+
+  M5Cardputer.Speaker.setVolume(255);
+  M5Cardputer.Speaker.setAllChannelVolume(255);
+
+  Serial.printf("audioSetup: init=%d sample_rate=%u stereo=%d dma_len=%u dma_count=%u frames=%u\n",
+                (int)audio_initialised,
+                (unsigned)M5Cardputer.Speaker.config().sample_rate,
+                (int)M5Cardputer.Speaker.config().stereo,
+                (unsigned)M5Cardputer.Speaker.config().dma_buf_len,
+                (unsigned)M5Cardputer.Speaker.config().dma_buf_count,
+                (unsigned)audio_samples_per_frame());
+
+  audio_release_finished();
+  audioPump();
+  apply_speaker_volume();
+  return true;
+}
+
 static void audio_release_finished() {
   const size_t playing = M5Cardputer.Speaker.isPlaying(0);
   while(audio_queue_count > playing) {
@@ -9486,150 +9656,52 @@ static void apply_speaker_volume() {
 }
 
 static void audioSetup() {
-  audioTeardown();
-
   const uint32_t requested_rate = audio_select_sample_rate();
-  audioCoreInit(requested_rate);
+  const uint32_t candidate_rates[] = {
+    requested_rate,
+    32768u,
+    32000u,
+    24000u,
+    22050u,
+    16384u
+  };
 
-  auto base_cfg = M5Cardputer.Speaker.config();
-  auto cfg = base_cfg;
-  cfg.sample_rate = requested_rate;
-  cfg.stereo = true;
-  audio_set_sample_rate(requested_rate);
-  Serial.printf("audioSetup: requested sample rate %u Hz (psram=%s)\n",
-                (unsigned)requested_rate,
-                g_psram_available ? "yes" : "no");
-  size_t dma_len = audio_samples_per_buffer();
-  if(dma_len > 1024) {
-    dma_len = 1024;
-  }
-  if(!g_psram_available) {
-    if(dma_len > 512) {
-      dma_len = 512;
+  bool success = false;
+  uint32_t chosen_rate = 0;
+  const size_t candidate_count = sizeof(candidate_rates) / sizeof(candidate_rates[0]);
+  for(size_t i = 0; i < candidate_count; ++i) {
+    const uint32_t rate = candidate_rates[i];
+    if(rate == 0) {
+      continue;
     }
-    cfg.dma_buf_count = 4;
-  }
-  dma_len &= ~1u; // must be even
-  cfg.dma_buf_len = dma_len;
-  if(g_psram_available) {
-    cfg.dma_buf_count = 12;
-  }
+    bool duplicate = false;
+    for(size_t j = 0; j < i; ++j) {
+      if(candidate_rates[j] == rate) {
+        duplicate = true;
+        break;
+      }
+    }
+    if(duplicate) {
+      continue;
+    }
 
-#ifdef TARGET_LILYGO_TDECK
-  cfg.pin_data_out = BOARD_I2S_DOUT;
-  cfg.pin_bck = BOARD_I2S_BCK;
-  cfg.pin_ws = BOARD_I2S_WS;
-  cfg.i2s_port = I2S_NUM_0;
-#else
-  cfg.magnification = 8;
-  cfg.task_priority = tskIDLE_PRIORITY + 4;
-  cfg.task_pinned_core = 0;
-  cfg.use_dac = false;
-  cfg.pin_data_out = 42;   // SDOUT
-  cfg.pin_bck = 41;        // BCLK
-  cfg.pin_ws = 43;         // LRCLK
-  cfg.pin_mck = -1;
-#endif
-
-  M5Cardputer.Speaker.end();
-  M5Cardputer.Speaker.config(cfg);
-  audio_initialised = M5Cardputer.Speaker.begin();
-  Serial.printf(
-#ifdef TARGET_LILYGO_TDECK
-                "Speaker.begin (stereo) data_out=%d bck=%d ws=%d -> %s\n",
-#else
-                "Speaker.begin (stereo) data_out=%d bck=%d ws=%d mck=%d -> %s\n",
-#endif
-                cfg.pin_data_out,
-                cfg.pin_bck,
-                cfg.pin_ws,
-#ifdef TARGET_LILYGO_TDECK
-                audio_initialised ? "OK" : "FAIL"
-#else
-                cfg.pin_mck,
-                audio_initialised ? "OK" : "FAIL"
-#endif
-                );
-
-  if(!audio_initialised) {
-#ifdef TARGET_LILYGO_TDECK
-    cfg.stereo = false;
-#else
-    cfg.pin_data_out = 42;
-    cfg.stereo = false;
-#endif
-    M5Cardputer.Speaker.end();
-    M5Cardputer.Speaker.config(cfg);
-    audio_initialised = M5Cardputer.Speaker.begin();
-    Serial.printf(
-#ifdef TARGET_LILYGO_TDECK
-                  "Speaker.begin retry mono data_out=%d bck=%d ws=%d -> %s\n",
-#else
-                  "Speaker.begin retry mono data_out=%d bck=%d ws=%d mck=%d -> %s\n",
-#endif
-                  cfg.pin_data_out,
-                  cfg.pin_bck,
-                  cfg.pin_ws,
-#ifdef TARGET_LILYGO_TDECK
-                  audio_initialised ? "OK" : "FAIL"
-#else
-                  cfg.pin_mck,
-                  audio_initialised ? "OK" : "FAIL"
-#endif
-                  );
-  }
-
-  if(!audio_initialised) {
-    Serial.println("Speaker.begin() failed; restoring default config and disabling audio");
-    M5Cardputer.Speaker.config(base_cfg);
     audioTeardown();
-    return;
-  }
-
-  const uint32_t actual_sample_rate = M5Cardputer.Speaker.config().sample_rate;
-  if(actual_sample_rate != audio_get_sample_rate()) {
-    Serial.printf("audioSetup: speaker adjusted sample rate %u -> %u\n",
-                  (unsigned)audio_get_sample_rate(),
-                  (unsigned)actual_sample_rate);
-    audio_set_sample_rate(actual_sample_rate);
-  }
-
-  const size_t interleaved_samples = audio_samples_per_buffer();
-  const size_t buffer_bytes = interleaved_samples * sizeof(int16_t);
-  bool buffer_ok = true;
-  Serial.printf("Audio memory (before alloc): internal DMA=%u bytes, psram DMA=%u bytes\n",
-                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT),
-                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
-  for(size_t i = 0; i < AUDIO_BUFFER_COUNT; ++i) {
-    audio_buffers[i] = audio_alloc_dma_buffer(buffer_bytes);
-    if(audio_buffers[i] == nullptr) {
-      buffer_ok = false;
+    if(audio_configure_for_rate(rate, requested_rate)) {
+      success = true;
+      chosen_rate = rate;
       break;
     }
-    memset(audio_buffers[i], 0, buffer_bytes);
-    audio_buffer_state[i] = 0;
   }
 
-  if(!buffer_ok) {
-    Serial.println("Audio buffer allocation failed; disabling audio");
+  if(!success) {
     audioTeardown();
+    Serial.println("audioSetup: all sample rate attempts failed; audio disabled");
     return;
   }
 
-  M5Cardputer.Speaker.setVolume(255);
-  M5Cardputer.Speaker.setAllChannelVolume(255);
-
-  Serial.printf("audioSetup: init=%d sample_rate=%u stereo=%d dma_len=%u dma_count=%u frames=%u\n",
-                (int)audio_initialised,
-                (unsigned)M5Cardputer.Speaker.config().sample_rate,
-                (int)M5Cardputer.Speaker.config().stereo,
-                (unsigned)M5Cardputer.Speaker.config().dma_buf_len,
-                (unsigned)M5Cardputer.Speaker.config().dma_buf_count,
-                (unsigned)audio_samples_per_frame());
-
-  audio_release_finished();
-  audioPump();
-  apply_speaker_volume();
+  if(chosen_rate != requested_rate) {
+    Serial.printf("audioSetup: using fallback sample rate %u Hz\n", (unsigned)chosen_rate);
+  }
 }
 
 static void audioPump() {
