@@ -8053,7 +8053,7 @@ static void render_home_menu(uint8_t selection) {
   M5Cardputer.Display.fillScreen(menu_bg);
   M5Cardputer.Display.endWrite();
   delay(500);
-  draw_text_block(menu, 2, 0xFFFF, menu_bg);
+  draw_text_block(menu, 1, 0xFFFF, menu_bg);
 }
 
 static void show_home_menu() {
@@ -9591,13 +9591,13 @@ void setup() {
     priv.rom_cgb_flag = 0;
     priv.rom_cache.bank_count = g_settings.rom_cache_banks;
     rom_cache_reset(&priv.rom_cache);
-    debugPrint("postInit");
+    // debugPrint("postInit");
 
     reset_save_state(&priv);
 
-    debugPrint("Before filepick");
-  Serial.printf("setup stack avail (before file picker loop): %u bytes\n",
-          (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
+    // debugPrint("Before filepick");
+  // Serial.printf("setup stack avail (before file picker loop): %u bytes\n",
+  //         (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
 
     bool rom_ready = false;
     rom_cache_close(&priv.rom_cache);
@@ -9657,10 +9657,10 @@ void setup() {
                    (unsigned)(rom_size / 1024));
           debugPrint(info);
           delay(250);
-          if(priv.rom_is_cgb_only) {
-            debugPrint("CGB-only ROM support is experimental");
-            delay(500);
-          }
+          // if(priv.rom_is_cgb_only) {
+          //   debugPrint("CGB-only ROM support is experimental");
+          //   delay(500);
+          // }
           save_state_refresh_metadata(&priv);
           rom_ready = true;
           continue;
