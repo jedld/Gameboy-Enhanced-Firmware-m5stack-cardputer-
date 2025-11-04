@@ -9929,7 +9929,7 @@ void setup() {
       continue;
     }
 
-    debugPrint("After filepick");
+    // debugPrint("After filepick");
 
 #if ENABLE_SOUND
     if(g_settings.audio_enabled) {
