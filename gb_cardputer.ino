@@ -147,7 +147,7 @@ static inline const char *file_sort_mode_label(FileSortMode mode) {
   }
 }
 
-static constexpr size_t ROM_FLASH_PROMPT_THRESHOLD = 65536;
+static constexpr size_t ROM_FLASH_PROMPT_THRESHOLD = 0;
 static constexpr size_t ROM_STORAGE_TITLE_MAX = 32;
 static constexpr uint32_t ROM_STORAGE_MAGIC = 0x4D355247; // "M5RG"
 static constexpr uint16_t ROM_STORAGE_VERSION = 1;
@@ -2406,15 +2406,23 @@ static int save_state_slot_from_key(char key) {
   switch(key) {
     case '1':
     case '!':
+    case 'q':
+    case 'Q':
       return 0;
     case '2':
     case '@':
+    case 'w':
+    case 'W':
       return 1;
     case '3':
     case '#':
+    case 'e':
+    case 'E':
       return 2;
     case '4':
     case '$':
+    case 'r':
+    case 'R':
       return 3;
     default:
       break;
@@ -2423,8 +2431,8 @@ static int save_state_slot_from_key(char key) {
 }
 
 static bool handle_save_state_shortcuts(const Keyboard_Class::KeysState &status) {
-  const bool save_mode = status.fn;
-  const bool load_mode = status.ctrl;
+  const bool save_mode = status.sym;
+  const bool load_mode = status.alt;
 
   if(!save_mode && !load_mode) {
     g_save_state_hotkey_mask = 0;
@@ -2762,7 +2770,7 @@ static bool handle_screenshot_shortcut(const Keyboard_Class::KeysState &status,
     }
   }
 
-  const bool modifier_active = status.fn;
+  const bool modifier_active = status.alt;
   if(out_consume_key != nullptr) {
     *out_consume_key = modifier_active && has_trigger_key;
   }
@@ -3693,8 +3701,8 @@ static void poll_keyboard() {
     }
   };
 
-  const bool save_hotkeys_active = status.fn;
-  const bool load_hotkeys_active = status.ctrl;
+  const bool save_hotkeys_active = status.sym;
+  const bool load_hotkeys_active = status.alt;
 
   if(local_keyboard_pressed) {
     for(auto key : status.word) {
@@ -8029,6 +8037,14 @@ static void render_home_menu(uint8_t selection) {
 
   menu += "J/S=Down  K/W=Up\n";
   menu += "L/ENTER=Select  H=Prev\n";
+  menu += "\n";
+  menu += "Default controls:\n";
+  menu += "  W/A/S/D -> D-pad\n";
+  menu += "  L=A  K=B\n";
+  menu += "  1/Enter=Start  2/Space=Select\n";
+  menu += "  Sym+QWER save  Alt+QWER load\n";
+  menu += "  Alt+P screenshot  +/- volume\n";
+  menu += "  Esc opens in-game menu\n";
 
   const uint16_t menu_bg = rgb888_to_rgb565(0x101010);
   Serial.printf("render_home_menu: colours fg=0x%04X bg=0x%04X\n", 0xFFFF, menu_bg);
@@ -9825,9 +9841,7 @@ void setup() {
         bool exit_requested = false;
         bool rom_pinned_to_psram = false;
 #ifdef TARGET_LILYGO_TDECK
-        if(priv.rom_is_cgb && rom_size > ROM_FLASH_PROMPT_THRESHOLD) {
-          rom_pinned_to_psram = pin_rom_to_psram(&priv);
-        }
+        rom_pinned_to_psram = pin_rom_to_psram(&priv);
 #endif
 
         if(!rom_pinned_to_psram && priv.rom_is_cgb && rom_size > ROM_FLASH_PROMPT_THRESHOLD && priv.sd_rom_path_valid && rom_storage_get_partition() != nullptr) {

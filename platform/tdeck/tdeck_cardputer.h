@@ -87,6 +87,8 @@ class Keyboard_Class {
     bool fn = false;
     bool ctrl = false;
     bool enter = false;
+    bool sym = false;
+    bool alt = false;
   };
 
   void begin();

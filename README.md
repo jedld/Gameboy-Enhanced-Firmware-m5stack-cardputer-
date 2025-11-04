@@ -9,15 +9,28 @@ The 0.1.1 refresh adds on a an auto flashing workflow to handle large ROMs by fl
 
 ### Quick save states & status overlay
 
-* Hold `Fn` and tap `1`–`4` to capture a snapshot into the matching slot.
-* Hold `Ctrl` and tap `1`–`4` to instantly load that slot.
+* Hold `Sym` (labelled `Fn` on some keyboards) and tap `1`–`4` to capture a snapshot into the matching slot.
+* Hold `Alt` and tap `1`–`4` to instantly load that slot.
 * Each action confirms with a colour-coded banner (green = saved, grey = empty slot, red = failure) rendered directly over the gameplay framebuffer.
 * Slots persist per cartridge and reload automatically after a reset or power cycle; switch to a different ROM to start with fresh slots. Battery-backed saves continue to flush automatically in the background.
 
 ### Screenshots
 
-* Hold `Fn` and tap `P` to capture the current gameplay frame.
+* Hold `Alt` and tap `P` to capture the current gameplay frame.
 * Screenshots are stored as 24-bit BMP files under `/screenshots/` on the SD card and are named `<rom>_<timestamp>.bmp` for easy sorting.
+
+### Default key bindings
+
+* `W` / `A` / `S` / `D` &mdash; Game Boy D-pad
+* `L` &mdash; Game Boy `A`
+* `K` &mdash; Game Boy `B`
+* `1` or `Enter` &mdash; `Start`
+* `2` or `Space` &mdash; `Select`
+* `Sym` + `Q`/`W`/`E`/`R` &mdash; Save states 1–4 (the `Sym` legend appears as `Fn` on the Cardputer)
+* `Alt` + `Q`/`W`/`E`/`R` &mdash; Load states 1–4
+* `Alt` + `P` &mdash; Capture a screenshot
+* `=` / `+` / `O` &mdash; Volume up, `-` / `_` / `I` &mdash; Volume down
+* `Esc` (or `` ` ``) &mdash; Open the in-game menu / return to the browser
 
 ## Compiling the firmware for the M5Stack Cardputer
 
@@ -80,6 +93,42 @@ The repository includes a convenience script that wraps the PlatformIO CLI:
 ```
 
 By default it builds and uploads the `m5stack_cardputer` environment. Pass `--no-upload` to compile without flashing, or `-e <env>` if you add more PlatformIO targets later. Set the `PIO_BIN` environment variable when PlatformIO is not available as `pio` on your `$PATH`.
+
+## Building for the LilyGo T-Deck
+
+The T-Deck port lives in the same repository and is driven by the `lilygo_tdeck` PlatformIO environment. The workflow mirrors the Cardputer build with a few device-specific tweaks.
+
+### Prerequisites
+
+* Visual Studio Code with the **PlatformIO IDE** extension (or the standalone PlatformIO CLI).
+* T-Deck USB-C data cable and access to the device path (for Linux this is usually `/dev/ttyACM*`; add your user to the `dialout` group if needed).
+* Git submodules initialised (`git submodule update --init --recursive`) so the bundled T-Deck libraries under `T-Deck/lib` are present.
+
+### Compile and upload with PlatformIO
+
+1. Open the repository folder in VS Code and let PlatformIO install the Espressif32 toolchain when prompted.
+2. In the PlatformIO project environment selector (status bar), switch to **lilygo_tdeck**. This picks up the T-Deck specific build flags (`TARGET_LILYGO_TDECK`, TFT_eSPI setup, SDK configuration).
+3. Plug in the T-Deck via USB-C and select the exposed serial port from the PlatformIO serial menu if it is not detected automatically.
+4. Click **Build** to compile, then **Upload** to flash. PlatformIO applies the `sdkconfig.defaults` settings automatically to enable PSRAM and QSPI timings for the T-Deck board support package.
+5. Use **Monitor** (115200 baud) to watch the boot log. You should see a message confirming when ROMs are pinned to PSRAM.
+
+Command-line equivalents:
+
+```bash
+pio run -e lilygo_tdeck
+pio run -e lilygo_tdeck -t upload --upload-port /dev/ttyACM0
+pio device monitor -b 115200
+```
+
+### One-command helper
+
+`scripts/flash_tdeck.sh` wraps the PlatformIO invocation:
+
+```bash
+./scripts/flash_tdeck.sh [-p /dev/ttyACM0]
+```
+
+Pass `--no-upload` to compile only, or `-e lilygo_tdeck` explicitly when you add more environments in the future. The script honours the `PIO_BIN` override just like the Cardputer helper.
 
 ## Bundling ROMs directly into the firmware (optional)
 
@@ -503,18 +552,7 @@ Mario 1/2/Wario Land/Balloon Kid/F1 Race/Tetris
 
 Yellow bars on either side of the display momentarily indicate that the cartridge ram has been backed up. The savegame format will not be changing, its a simple binary dump.
 
-Controls(in game):
-left/right use 'a' and 'd'
-up/down use 'w' and 's'
-A/B use 'l' and 'k'
-start/select use '1' and '2' (Enter and Space also work as Start/Select shortcuts)
-cycle palette in current mode use the ] square bracket
-cycle between classic gameboy,super gameboy & 12 color modes [
-force cart ram backup press '=' (if uncertain of gamesave use this)
-turn on super gameboy border at any time by pressing Fn+'['
-cycle through border options by pressing Fn+']'
-Display current FPS by holding Fn; it will appear in 1 second and update every second there after, can cause some slowdown but that is accounted for in the FPS count.
-Press `/esc in the main menu or during gameplay for settings menu
+Controls (in game): see [Default key bindings](#default-key-bindings) above for the current mappings and hotkeys.
 
 Have fun!
 

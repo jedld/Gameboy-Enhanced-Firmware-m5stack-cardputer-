@@ -419,6 +419,8 @@ void Keyboard_Class::update() {
   next.fn = false;
   next.ctrl = false;
   next.enter = false;
+  next.sym = false;
+  next.alt = false;
 
   const int available = Wire.requestFrom(LILYGO_KB_ADDRESS, static_cast<uint8_t>(KeysState::kMaxKeys));
   if(available >= static_cast<int>(kMatrixCols)) {
@@ -525,7 +527,9 @@ void Keyboard_Class::update() {
     const bool enter_active = is_active(layout_->enter_key);
     const bool backspace_active = is_active(layout_->backspace_key);
 
-    next.fn = alt_active;
+    next.sym = symbol_layer;
+    next.fn = symbol_layer;
+    next.alt = alt_active;
     next.ctrl = false;
     next.enter = enter_active;
 
